@@ -1,35 +1,54 @@
 //! One task per backup set: watches the sources, waits for changes to
 //! settle, then runs an incremental backup. Also rescans periodically (to
-//! catch anything the watcher missed) and retries with backoff on failure.
+//! catch anything the watcher missed), retries with backoff on failure, and
+//! runs maintenance (prune, verify) when due. Everything that touches the
+//! repository goes through this task, so operations never overlap.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use kinvault_core::{Backend, Index, LocalDirBackend, MasterKey, Repository};
 use kinvault_net::{Endpoint, EndpointAddr, EndpointId, RemoteBackend};
 use notify::event::{AccessKind, AccessMode};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::api::{BackupSummary, SetState};
+use crate::api::{BackupSummary, PruneSummary, SetState, VerifySummary};
 use crate::config::{SetConfig, StoredTarget, write_private};
 
 /// A burst of changes never delays a backup by more than this.
 const MAX_CHANGE_DELAY: Duration = Duration::from_secs(10 * 60);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30 * 60);
+const PRUNE_INTERVAL_SECS: i64 = 24 * 60 * 60;
+const VERIFY_INTERVAL_SECS: i64 = 7 * 24 * 60 * 60;
+/// Data downloaded per scheduled verification; runs rotate through all packs.
+pub(crate) const VERIFY_BUDGET_BYTES: u64 = 256 << 20;
 
-pub(crate) type BackupReply = oneshot::Sender<Result<BackupSummary, String>>;
+type Reply<T> = oneshot::Sender<Result<T, String>>;
 
 pub(crate) enum Trigger {
     Changed,
-    Now(BackupReply),
+    Now(Reply<BackupSummary>),
+    Prune(Reply<PruneSummary>),
+    Verify(u64, Reply<VerifySummary>),
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct Maintenance {
+    /// When maintenance scheduling started for this set; the first prune and
+    /// verify are due one interval after it, not straight after the first upload.
+    #[serde(default)]
+    pub since_unix: i64,
+    pub last_prune: Option<PruneSummary>,
+    pub last_verify: Option<VerifySummary>,
 }
 
 #[derive(Clone, Debug)]
@@ -37,6 +56,7 @@ pub(crate) struct RunStatus {
     pub state: SetState,
     pub last_backup: Option<BackupSummary>,
     pub last_error: Option<String>,
+    pub maintenance: Maintenance,
 }
 
 /// Everything needed to open a set's repository.
@@ -60,6 +80,13 @@ pub(crate) fn write_master_key(set_dir: &Path, key: &MasterKey) -> Result<()> {
     )
 }
 
+pub(crate) fn read_master_key(set_dir: &Path) -> Result<MasterKey> {
+    let text = fs::read_to_string(master_key_path(set_dir)).context("reading set key")?;
+    let mut bytes = [0u8; 32];
+    hex::decode_to_slice(text.trim(), &mut bytes).context("set key is corrupt")?;
+    Ok(MasterKey::from_bytes(bytes))
+}
+
 pub(crate) fn peer_addr(id: &str, addrs: &[std::net::SocketAddr]) -> Result<EndpointAddr> {
     let id = EndpointId::from_str(id).with_context(|| format!("invalid peer id {id:?}"))?;
     Ok(addrs
@@ -67,13 +94,17 @@ pub(crate) fn peer_addr(id: &str, addrs: &[std::net::SocketAddr]) -> Result<Endp
         .fold(EndpointAddr::new(id), |a, s| a.with_ip_addr(*s)))
 }
 
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
 impl SetEnv {
     /// Opens the set's repository. Blocking; call from a blocking context.
     pub fn open_repository(&self) -> Result<Repository<Box<dyn Backend>>> {
-        let text = fs::read_to_string(master_key_path(&self.set_dir)).context("reading set key")?;
-        let mut bytes = [0u8; 32];
-        hex::decode_to_slice(text.trim(), &mut bytes).context("set key is corrupt")?;
-        let master = MasterKey::from_bytes(bytes);
+        let master = read_master_key(&self.set_dir)?;
         let backend: Box<dyn Backend> = match &self.set.target {
             StoredTarget::Local { path } => Box::new(LocalDirBackend::open(path)?),
             StoredTarget::Peer { id, repo, addrs } => Box::new(
@@ -95,6 +126,14 @@ impl SetEnv {
     fn last_backup_path(&self) -> PathBuf {
         self.set_dir.join("last_backup.json")
     }
+
+    fn maintenance_path(&self) -> PathBuf {
+        self.set_dir.join("maintenance.json")
+    }
+}
+
+fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
+    serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
 }
 
 pub(crate) struct SetHandle {
@@ -107,16 +146,31 @@ pub(crate) struct SetHandle {
 
 impl SetHandle {
     pub fn start(env: SetEnv) -> Self {
-        let last_backup = fs::read_to_string(env.last_backup_path())
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok());
         let status = Arc::new(Mutex::new(RunStatus {
-            state: SetState::Idle,
-            last_backup,
+            state: if env.set.paused {
+                SetState::Paused
+            } else {
+                SetState::Idle
+            },
+            last_backup: read_json(&env.last_backup_path()),
             last_error: None,
+            maintenance: read_json(&env.maintenance_path()).unwrap_or_else(|| {
+                let m = Maintenance {
+                    since_unix: unix_now(),
+                    ..Default::default()
+                };
+                if let Ok(json) = serde_json::to_string(&m) {
+                    let _ = fs::write(env.maintenance_path(), json);
+                }
+                m
+            }),
         }));
         let (tx, rx) = mpsc::channel(64);
-        let watcher = start_watcher(&env, tx.clone());
+        let watcher = if env.set.paused {
+            None
+        } else {
+            start_watcher(&env, tx.clone())
+        };
         let task = tokio::spawn(run(env.clone(), status.clone(), rx));
         Self {
             env,
@@ -181,20 +235,173 @@ fn retry_delay(failures: u32) -> Duration {
         .min(MAX_RETRY_DELAY)
 }
 
+struct Worker {
+    env: SetEnv,
+    status: Arc<Mutex<RunStatus>>,
+    repo: Option<Repository<Box<dyn Backend>>>,
+}
+
+impl Worker {
+    /// Runs `f` on the repository in a blocking thread, opening it if needed.
+    async fn with_repo<T: Send + 'static>(
+        &mut self,
+        f: impl FnOnce(&mut Repository<Box<dyn Backend>>) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let existing = self.repo.take();
+        let env = self.env.clone();
+        let (repo, result) = tokio::task::spawn_blocking(move || {
+            let mut repo = match existing {
+                Some(r) => r,
+                None => match env.open_repository() {
+                    Ok(r) => r,
+                    Err(e) => return (None, Err(e)),
+                },
+            };
+            let result = f(&mut repo);
+            (Some(repo), result)
+        })
+        .await?;
+        self.repo = repo;
+        result
+    }
+
+    async fn backup(&mut self) -> Result<BackupSummary> {
+        if self.env.set.paused {
+            bail!(
+                "set {:?} is paused; resume it to back up",
+                self.env.set.name
+            );
+        }
+        let paths = self.env.set.paths.clone();
+        let (id, stats) = self
+            .with_repo(move |repo| {
+                let host = gethostname::gethostname().to_string_lossy().into_owned();
+                Ok(repo.backup(&paths, &host)?)
+            })
+            .await?;
+        Ok(BackupSummary {
+            snapshot: id.to_hex(),
+            time_ns: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as i64,
+            files: stats.files,
+            files_changed: stats.files_changed,
+            total_bytes: stats.total_bytes,
+            bytes_uploaded: stats.bytes_uploaded,
+            warnings: stats.warnings,
+        })
+    }
+
+    async fn prune(&mut self) -> Result<PruneSummary> {
+        let policy = self.env.set.retention;
+        let s = self.with_repo(move |repo| Ok(repo.prune(&policy)?)).await?;
+        let summary = PruneSummary {
+            time_unix: unix_now(),
+            snapshots_kept: s.snapshots_kept,
+            snapshots_removed: s.snapshots_removed,
+            packs_deleted: s.packs_deleted,
+            packs_repacked: s.packs_repacked,
+            bytes_deleted: s.bytes_deleted,
+            bytes_downloaded: s.bytes_downloaded,
+            bytes_uploaded: s.bytes_uploaded,
+        };
+        self.save_maintenance(|m| m.last_prune = Some(summary.clone()));
+        tracing::info!(set = %self.env.set.name, removed = s.snapshots_removed, freed = s.bytes_deleted, "prune complete");
+        Ok(summary)
+    }
+
+    async fn verify(&mut self, max_bytes: u64) -> Result<VerifySummary> {
+        let r = self
+            .with_repo(move |repo| Ok(repo.verify(max_bytes)?))
+            .await?;
+        let summary = VerifySummary {
+            time_unix: unix_now(),
+            ok: r.is_ok(),
+            snapshots: r.snapshots,
+            packs_checked: r.packs_checked,
+            bytes_checked: r.bytes_checked,
+            missing_chunks: r.missing_chunks,
+            damaged_packs: r.damaged_packs.len() as u64,
+            errors: r.errors,
+        };
+        self.save_maintenance(|m| m.last_verify = Some(summary.clone()));
+        if summary.ok {
+            tracing::info!(set = %self.env.set.name, checked = r.bytes_checked, "verification passed");
+        } else {
+            tracing::warn!(set = %self.env.set.name, "verification found problems: {:?}", summary.errors);
+        }
+        Ok(summary)
+    }
+
+    fn save_maintenance(&self, update: impl FnOnce(&mut Maintenance)) {
+        let mut st = self.status.lock().unwrap();
+        update(&mut st.maintenance);
+        if let Ok(json) = serde_json::to_string(&st.maintenance) {
+            let _ = fs::write(self.env.maintenance_path(), json);
+        }
+    }
+
+    /// Runs prune and verify if they are due. Returns true if a backup should
+    /// follow soon (verification removed damaged data that can be re-uploaded).
+    async fn maintenance_if_due(&mut self) -> bool {
+        let (last_prune, last_verify) = {
+            let st = self.status.lock().unwrap();
+            (
+                st.maintenance
+                    .last_prune
+                    .as_ref()
+                    .map_or(0, |p| p.time_unix)
+                    .max(st.maintenance.since_unix),
+                st.maintenance
+                    .last_verify
+                    .as_ref()
+                    .map_or(0, |v| v.time_unix)
+                    .max(st.maintenance.since_unix),
+            )
+        };
+        let now = unix_now();
+        let mut heal = false;
+        if now - last_prune >= PRUNE_INTERVAL_SECS
+            && let Err(e) = self.prune().await
+        {
+            tracing::warn!(set = %self.env.set.name, "prune failed: {e:#}");
+        }
+        if now - last_verify >= VERIFY_INTERVAL_SECS {
+            match self.verify(VERIFY_BUDGET_BYTES).await {
+                Ok(v) => heal = !v.ok,
+                Err(e) => {
+                    tracing::warn!(set = %self.env.set.name, "verification failed to run: {e:#}")
+                }
+            }
+        }
+        heal
+    }
+}
+
 async fn run(env: SetEnv, status: Arc<Mutex<RunStatus>>, mut rx: mpsc::Receiver<Trigger>) {
     let debounce = Duration::from_secs(env.set.debounce_secs);
     let rescan = Duration::from_secs(env.set.rescan_secs);
-    let mut repo = None;
-    let mut waiters: Vec<BackupReply> = Vec::new();
+    let paused = env.set.paused;
+    let mut worker = Worker {
+        env,
+        status: status.clone(),
+        repo: None,
+    };
+    let mut waiters: Vec<Reply<BackupSummary>> = Vec::new();
     let mut failures = 0u32;
     // Back up right away to pick up changes made while the daemon was stopped.
-    let mut scheduled = Instant::now();
+    // A paused set only acts on explicit requests.
+    let far = Instant::now() + Duration::from_secs(100 * 365 * 24 * 3600);
+    let mut scheduled = if paused { far } else { Instant::now() };
     let mut change_deadline: Option<Instant> = None;
     let mut first_change: Option<Instant> = None;
     let mut waiting_for_window = false;
 
     loop {
-        status.lock().unwrap().state = if change_deadline.is_some() {
+        status.lock().unwrap().state = if paused {
+            SetState::Paused
+        } else if change_deadline.is_some() {
             SetState::ChangesPending
         } else if waiting_for_window {
             SetState::WaitingForWindow
@@ -215,6 +422,20 @@ async fn run(env: SetEnv, status: Arc<Mutex<RunStatus>>, mut rx: mpsc::Receiver<
                     waiters.push(reply);
                     true
                 }
+                Some(Trigger::Prune(reply)) => {
+                    status.lock().unwrap().state = SetState::Running;
+                    let _ = reply.send(worker.prune().await.map_err(|e| format!("{e:#}")));
+                    false
+                }
+                Some(Trigger::Verify(max_bytes, reply)) => {
+                    status.lock().unwrap().state = SetState::Running;
+                    let result = worker.verify(max_bytes).await;
+                    if matches!(&result, Ok(v) if !v.ok) && !paused {
+                        scheduled = Instant::now();
+                    }
+                    let _ = reply.send(result.map_err(|e| format!("{e:#}")));
+                    false
+                }
             },
             _ = tokio::time::sleep_until(next) => true,
         };
@@ -225,7 +446,7 @@ async fn run(env: SetEnv, status: Arc<Mutex<RunStatus>>, mut rx: mpsc::Receiver<
         first_change = None;
         // Automatic runs wait for the window; explicit requests don't.
         if waiters.is_empty()
-            && let Some(window) = env.set.window
+            && let Some(window) = worker.env.set.window
         {
             let wait = window.until_open();
             if !wait.is_zero() {
@@ -237,76 +458,46 @@ async fn run(env: SetEnv, status: Arc<Mutex<RunStatus>>, mut rx: mpsc::Receiver<
         waiting_for_window = false;
         status.lock().unwrap().state = SetState::Running;
 
-        let result = backup(&env, &mut repo).await;
-        let mut st = status.lock().unwrap();
+        let result = worker.backup().await;
         match result {
             Ok(summary) => {
                 failures = 0;
-                scheduled = Instant::now() + rescan;
+                scheduled = if paused { far } else { Instant::now() + rescan };
                 tracing::info!(
-                    set = %env.set.name,
+                    set = %worker.env.set.name,
                     snapshot = %&summary.snapshot[..16],
                     changed = summary.files_changed,
                     uploaded = summary.bytes_uploaded,
                     "backup complete"
                 );
                 if let Ok(json) = serde_json::to_string(&summary) {
-                    let _ = fs::write(env.last_backup_path(), json);
+                    let _ = fs::write(worker.env.last_backup_path(), json);
                 }
-                st.last_backup = Some(summary.clone());
-                st.last_error = None;
+                {
+                    let mut st = status.lock().unwrap();
+                    st.last_backup = Some(summary.clone());
+                    st.last_error = None;
+                }
                 for w in waiters.drain(..) {
                     let _ = w.send(Ok(summary.clone()));
                 }
+                if worker.maintenance_if_due().await {
+                    scheduled = Instant::now();
+                }
             }
             Err(e) => {
-                failures += 1;
-                let delay = retry_delay(failures);
-                scheduled = Instant::now() + delay;
                 let msg = format!("{e:#}");
-                tracing::warn!(set = %env.set.name, "backup failed (retrying in {}s): {msg}", delay.as_secs());
-                st.last_error = Some(msg.clone());
+                if !paused {
+                    failures += 1;
+                    let delay = retry_delay(failures);
+                    scheduled = Instant::now() + delay;
+                    tracing::warn!(set = %worker.env.set.name, "backup failed (retrying in {}s): {msg}", delay.as_secs());
+                    status.lock().unwrap().last_error = Some(msg.clone());
+                }
                 for w in waiters.drain(..) {
                     let _ = w.send(Err(msg.clone()));
                 }
             }
         }
     }
-}
-
-async fn backup(
-    env: &SetEnv,
-    slot: &mut Option<Repository<Box<dyn Backend>>>,
-) -> Result<BackupSummary> {
-    let existing = slot.take();
-    let env2 = env.clone();
-    let (repo, result) = tokio::task::spawn_blocking(move || {
-        let mut repo = match existing {
-            Some(r) => r,
-            None => match env2.open_repository() {
-                Ok(r) => r,
-                Err(e) => return (None, Err(e)),
-            },
-        };
-        let host = gethostname::gethostname().to_string_lossy().into_owned();
-        let result = repo
-            .backup(&env2.set.paths, &host)
-            .map_err(anyhow::Error::from);
-        (Some(repo), result)
-    })
-    .await?;
-    *slot = repo;
-    let (id, stats) = result?;
-    Ok(BackupSummary {
-        snapshot: id.to_hex(),
-        time_ns: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as i64,
-        files: stats.files,
-        files_changed: stats.files_changed,
-        total_bytes: stats.total_bytes,
-        bytes_uploaded: stats.bytes_uploaded,
-        warnings: stats.warnings,
-    })
 }

@@ -70,6 +70,11 @@ pub struct SetConfig {
     pub upload_limit: Option<u64>,
     #[serde(default)]
     pub window: Option<api::TimeWindow>,
+    #[serde(default = "api::RetentionPolicy::recommended")]
+    pub retention: api::RetentionPolicy,
+    /// Paused sets don't back up automatically.
+    #[serde(default)]
+    pub paused: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

@@ -18,10 +18,12 @@ use tokio::task::JoinHandle;
 
 use crate::api::{self, GrantSpec, HostOffer, Reply, Request};
 use crate::config::{Config, PendingInvite, SetConfig, StoredTarget};
-use crate::worker::{SetEnv, SetHandle, Trigger, peer_addr, write_master_key};
+use crate::worker::{
+    SetEnv, SetHandle, Trigger, VERIFY_BUDGET_BYTES, peer_addr, read_master_key, write_master_key,
+};
 
-const DEFAULT_DEBOUNCE_SECS: u64 = 30;
-const DEFAULT_RESCAN_SECS: u64 = 6 * 60 * 60;
+pub(crate) const DEFAULT_DEBOUNCE_SECS: u64 = 30;
+pub(crate) const DEFAULT_RESCAN_SECS: u64 = 6 * 60 * 60;
 const DEFAULT_INVITE_SECS: u64 = 7 * 24 * 60 * 60;
 const TRASH_PURGE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
@@ -213,40 +215,75 @@ impl Daemon {
                 upload_limit,
                 window,
             } => {
-                let id = self.find_set(&set).await?.set.id;
-                let mut config = self.inner.config.lock().await;
-                let entry = config
-                    .sets
-                    .iter_mut()
-                    .find(|s| s.id == id)
-                    .ok_or_else(|| anyhow!("set was removed"))?;
-                entry.upload_limit = upload_limit;
-                entry.window = window;
-                let updated = entry.clone();
-                config.save(&self.config_path())?;
-                let mut sets = self.inner.sets.lock().await;
-                if let Some(old) = sets.remove(&id) {
-                    old.stop();
-                }
-                sets.insert(id, SetHandle::start(self.set_env(updated)));
-                Ok(Reply::Done)
+                self.update_set(&set, |s| {
+                    s.upload_limit = upload_limit;
+                    s.window = window;
+                    Ok(())
+                })
+                .await
+            }
+            Request::SetRetention { set, policy } => {
+                self.update_set(&set, |s| {
+                    s.retention = policy;
+                    Ok(())
+                })
+                .await
+            }
+            Request::PauseSet { set } => {
+                self.update_set(&set, |s| {
+                    s.paused = true;
+                    Ok(())
+                })
+                .await
+            }
+            Request::ResumeSet { set, paths } => {
+                let paths = match paths {
+                    Some(p) => Some(canonical_paths(&p)?),
+                    None => None,
+                };
+                self.update_set(&set, |s| {
+                    if let Some(paths) = paths {
+                        s.paths = paths;
+                    }
+                    for p in &s.paths {
+                        ensure!(
+                            p.exists(),
+                            "{} doesn't exist here; resume with the paths to back up",
+                            p.display()
+                        );
+                    }
+                    s.paused = false;
+                    Ok(())
+                })
+                .await
             }
             Request::BackupNow { set } => {
-                let env = self.find_set(&set).await?;
-                let tx = self
-                    .inner
-                    .sets
-                    .lock()
-                    .await
-                    .get(&env.set.id)
-                    .map(|s| s.tx.clone());
-                let tx = tx.ok_or_else(|| anyhow!("set was removed"))?;
-                let (reply, wait) = oneshot::channel();
-                tx.send(Trigger::Now(reply))
-                    .await
-                    .map_err(|_| anyhow!("set was removed"))?;
-                let summary = wait.await.map_err(|_| anyhow!("set was removed"))?;
-                Ok(Reply::Backup(summary.map_err(|e| anyhow!(e))?))
+                Ok(Reply::Backup(self.ask_worker(&set, Trigger::Now).await?))
+            }
+            Request::Prune { set } => {
+                Ok(Reply::Pruned(self.ask_worker(&set, Trigger::Prune).await?))
+            }
+            Request::Verify { set, max_bytes } => {
+                let budget = max_bytes.unwrap_or(VERIFY_BUDGET_BYTES);
+                let summary = self
+                    .ask_worker(&set, |reply| Trigger::Verify(budget, reply))
+                    .await?;
+                Ok(Reply::Verified(summary))
+            }
+            Request::ExportRecoveryKit { passphrase } => {
+                let config = self.inner.config.lock().await.clone();
+                let mut set_keys = Vec::new();
+                for set in &config.sets {
+                    set_keys.push((set.clone(), read_master_key(&self.set_dir(&set.id))?));
+                }
+                let identity = self.inner.endpoint.secret_key().clone();
+                let kit = blocking(move || {
+                    crate::recovery::build(&config, &identity, &set_keys, &passphrase)
+                })
+                .await?;
+                Ok(Reply::RecoveryKit {
+                    json: serde_json::to_string_pretty(&kit)?,
+                })
             }
             Request::ListSnapshots { set } => {
                 let env = self.find_set(&set).await?;
@@ -387,6 +424,48 @@ impl Daemon {
         }
     }
 
+    /// Sends a request to a set's worker and waits for its answer.
+    async fn ask_worker<T>(
+        &self,
+        set: &str,
+        make: impl FnOnce(oneshot::Sender<Result<T, String>>) -> Trigger,
+    ) -> Result<T> {
+        let id = self.find_set(set).await?.set.id;
+        let tx = self.inner.sets.lock().await.get(&id).map(|s| s.tx.clone());
+        let tx = tx.ok_or_else(|| anyhow!("set was removed"))?;
+        let (reply, wait) = oneshot::channel();
+        tx.send(make(reply))
+            .await
+            .map_err(|_| anyhow!("set was removed"))?;
+        wait.await
+            .map_err(|_| anyhow!("set was removed"))?
+            .map_err(|e| anyhow!(e))
+    }
+
+    /// Changes a set's configuration and restarts its worker with it.
+    async fn update_set(
+        &self,
+        key: &str,
+        change: impl FnOnce(&mut SetConfig) -> Result<()>,
+    ) -> Result<Reply> {
+        let id = self.find_set(key).await?.set.id;
+        let mut config = self.inner.config.lock().await;
+        let entry = config
+            .sets
+            .iter_mut()
+            .find(|s| s.id == id)
+            .ok_or_else(|| anyhow!("set was removed"))?;
+        change(entry)?;
+        let updated = entry.clone();
+        config.save(&self.config_path())?;
+        let mut sets = self.inner.sets.lock().await;
+        if let Some(old) = sets.remove(&id) {
+            old.stop();
+        }
+        sets.insert(id, SetHandle::start(self.set_env(updated)));
+        Ok(Reply::Done)
+    }
+
     fn parse_peer_id(&self, id: &str) -> Result<EndpointId> {
         let peer = EndpointId::from_str(id).with_context(|| format!("invalid peer id {id:?}"))?;
         ensure!(peer != self.id(), "that is this instance's own id");
@@ -407,9 +486,12 @@ impl Daemon {
                     target: h.env.set.target.to_api(),
                     upload_limit: h.env.set.upload_limit,
                     window: h.env.set.window,
+                    retention: h.env.set.retention,
                     state: st.state,
                     last_backup: st.last_backup,
                     last_error: st.last_error,
+                    last_prune: st.maintenance.last_prune,
+                    last_verify: st.maintenance.last_verify,
                 }
             })
             .collect();
@@ -434,11 +516,7 @@ impl Daemon {
             req.recovery_passphrase.chars().count() >= 8,
             "recovery passphrase must be at least 8 characters"
         );
-        let paths = req
-            .paths
-            .iter()
-            .map(|p| fs::canonicalize(p).with_context(|| format!("cannot back up {}", p.display())))
-            .collect::<Result<Vec<_>>>()?;
+        let paths = canonical_paths(&req.paths)?;
 
         let mut config = self.inner.config.lock().await;
         let target = match req.target {
@@ -470,6 +548,10 @@ impl Daemon {
             rescan_secs: req.rescan_secs.unwrap_or(DEFAULT_RESCAN_SECS),
             upload_limit: req.upload_limit,
             window: req.window,
+            retention: req
+                .retention
+                .unwrap_or_else(api::RetentionPolicy::recommended),
+            paused: false,
         };
 
         let set_dir = self.set_dir(&set.id);
@@ -647,6 +729,17 @@ fn resolve_peer(config: &Config, key: &str) -> Result<(String, Vec<SocketAddr>)>
         [] => bail!("no peer with id or name {key:?}"),
         _ => bail!("more than one peer is named {key:?}; use its id"),
     }
+}
+
+fn canonical_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    ensure!(
+        !paths.is_empty(),
+        "choose at least one file or folder to back up"
+    );
+    paths
+        .iter()
+        .map(|p| fs::canonicalize(p).with_context(|| format!("cannot back up {}", p.display())))
+        .collect()
 }
 
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {

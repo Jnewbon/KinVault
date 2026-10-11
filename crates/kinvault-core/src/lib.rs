@@ -9,6 +9,7 @@ pub mod ids;
 pub mod index;
 pub mod pack;
 pub mod repo;
+pub mod retention;
 pub mod snapshot;
 
 pub use backend::{Backend, LocalDirBackend};
@@ -16,5 +17,6 @@ pub use crypto::{KeyFile, Keys, MasterKey};
 pub use error::{Error, Result};
 pub use ids::{ChunkId, PackId, SnapshotId};
 pub use index::Index;
-pub use repo::{BackupStats, Repository, RestoreStats};
+pub use repo::{BackupStats, PruneStats, Repository, RestoreStats, VerifyReport};
+pub use retention::RetentionPolicy;
 pub use snapshot::Snapshot;

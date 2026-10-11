@@ -4,6 +4,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+pub use kinvault_core::RetentionPolicy;
 pub use kinvault_net::TimeWindow;
 use serde::{Deserialize, Serialize};
 
@@ -26,9 +27,38 @@ pub enum Request {
         upload_limit: Option<u64>,
         window: Option<TimeWindow>,
     },
+    /// Changes which snapshots a set keeps; takes effect at the next prune.
+    SetRetention {
+        set: String,
+        policy: RetentionPolicy,
+    },
+    /// Stops automatic backups of a set (restores still work).
+    PauseSet {
+        set: String,
+    },
+    /// Resumes automatic backups, optionally backing up different paths
+    /// (e.g. after restoring onto a new machine).
+    ResumeSet {
+        set: String,
+        paths: Option<Vec<PathBuf>>,
+    },
     /// Runs a backup now (ignoring the set's time window) and waits for it to finish.
     BackupNow {
         set: String,
+    },
+    /// Removes snapshots the retention policy doesn't keep and frees their space.
+    Prune {
+        set: String,
+    },
+    /// Checks the set's backups; downloads up to `max_bytes` of data to decrypt and check.
+    Verify {
+        set: String,
+        max_bytes: Option<u64>,
+    },
+    /// Everything needed to restore this instance's backups on a new machine,
+    /// with all keys encrypted under `passphrase`.
+    ExportRecoveryKit {
+        passphrase: String,
     },
     ListSnapshots {
         set: String,
@@ -86,6 +116,9 @@ pub struct CreateSet {
     /// Only back up automatically inside this daily window (local time).
     #[serde(default)]
     pub window: Option<TimeWindow>,
+    /// Which snapshots to keep (default: [`RetentionPolicy::recommended`]).
+    #[serde(default)]
+    pub retention: Option<RetentionPolicy>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -164,6 +197,11 @@ pub enum Reply {
         quota_bytes: Option<u64>,
         ask_reciprocal: bool,
     },
+    Pruned(PruneSummary),
+    Verified(VerifySummary),
+    RecoveryKit {
+        json: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -184,9 +222,12 @@ pub struct SetStatus {
     pub target: Target,
     pub upload_limit: Option<u64>,
     pub window: Option<TimeWindow>,
+    pub retention: RetentionPolicy,
     pub state: SetState,
     pub last_backup: Option<BackupSummary>,
     pub last_error: Option<String>,
+    pub last_prune: Option<PruneSummary>,
+    pub last_verify: Option<VerifySummary>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,7 +238,33 @@ pub enum SetState {
     ChangesPending,
     /// Outside the set's time window; will back up when it opens.
     WaitingForWindow,
+    /// Not backing up automatically (e.g. restored from a recovery kit).
+    Paused,
     Running,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PruneSummary {
+    pub time_unix: i64,
+    pub snapshots_kept: u64,
+    pub snapshots_removed: u64,
+    pub packs_deleted: u64,
+    pub packs_repacked: u64,
+    pub bytes_deleted: u64,
+    pub bytes_downloaded: u64,
+    pub bytes_uploaded: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VerifySummary {
+    pub time_unix: i64,
+    pub ok: bool,
+    pub snapshots: u64,
+    pub packs_checked: u64,
+    pub bytes_checked: u64,
+    pub missing_chunks: u64,
+    pub damaged_packs: u64,
+    pub errors: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

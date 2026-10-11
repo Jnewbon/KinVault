@@ -46,6 +46,19 @@ pub fn endpoint_name(state_dir: &Path) -> PathBuf {
     PathBuf::from(format!(r"\\.\pipe\kinvaultd-{hash:016x}"))
 }
 
+/// Whether a daemon is serving `state_dir` (blocking check).
+pub fn daemon_running(state_dir: &Path) -> bool {
+    let path = endpoint_name(state_dir);
+    #[cfg(unix)]
+    return std::os::unix::net::UnixStream::connect(path).is_ok();
+    #[cfg(windows)]
+    return std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .is_ok();
+}
+
 fn fnv1a(data: &[u8]) -> u64 {
     // FNV-1a; only needs to separate state directories, not resist attackers.
     data.iter().fold(0xcbf29ce484222325u64, |h, b| {

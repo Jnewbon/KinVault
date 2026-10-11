@@ -13,11 +13,14 @@ use crate::index::{CachedFile, Index};
 use crate::pack::{self, BlobKind, PackBuilder};
 use crate::snapshot::{self, Node, NodeKind, Snapshot, Tree};
 
+mod maintenance;
+pub use maintenance::{PruneStats, VerifyReport};
+
 const CHUNK_MIN: u32 = 256 * 1024;
 const CHUNK_AVG: u32 = 1024 * 1024;
 const CHUNK_MAX: u32 = 4 * 1024 * 1024;
 const DEFAULT_PACK_TARGET: usize = 32 * 1024 * 1024;
-const PACK_CACHE_SLOTS: usize = 2;
+const PACK_CACHE_SLOTS: usize = 4;
 
 #[derive(Debug, Default, Clone)]
 pub struct BackupStats {
@@ -111,7 +114,7 @@ impl<B: Backend> Repository<B> {
         self.sync_index()?;
         let mut run = BackupRun {
             repo: self,
-            pack: PackBuilder::new(),
+            writer: PackWriter::default(),
             stats: BackupStats::default(),
         };
 
@@ -301,9 +304,66 @@ struct RestoreCtx {
     stats: RestoreStats,
 }
 
+/// Buffers new blobs into packs and uploads them when full. Data and trees
+/// go into separate packs so that walking snapshots (prune, verify) only
+/// needs the small tree packs.
+#[derive(Default)]
+struct PackWriter {
+    data: PackBuilder,
+    tree: PackBuilder,
+    packs: u64,
+    bytes: u64,
+}
+
+impl PackWriter {
+    fn contains(&self, id: &ChunkId) -> bool {
+        self.data.contains(id) || self.tree.contains(id)
+    }
+
+    fn builder(&mut self, kind: BlobKind) -> &mut PackBuilder {
+        match kind {
+            BlobKind::Data => &mut self.data,
+            BlobKind::Tree => &mut self.tree,
+        }
+    }
+
+    fn add<B: Backend>(
+        &mut self,
+        repo: &mut Repository<B>,
+        id: ChunkId,
+        kind: BlobKind,
+        plaintext: &[u8],
+    ) -> Result<()> {
+        let builder = self.builder(kind);
+        builder.add(&repo.keys, id, kind, plaintext)?;
+        if builder.len() >= repo.pack_target {
+            self.flush_kind(repo, kind)?;
+        }
+        Ok(())
+    }
+
+    fn flush_kind<B: Backend>(&mut self, repo: &mut Repository<B>, kind: BlobKind) -> Result<()> {
+        let builder = std::mem::take(self.builder(kind));
+        if builder.is_empty() {
+            return Ok(());
+        }
+        let finished = builder.finish(&repo.keys)?;
+        repo.backend.put_pack(&finished.id, &finished.data)?;
+        repo.index.add_pack(&finished.id, &finished.entries)?;
+        self.packs += 1;
+        self.bytes += finished.data.len() as u64;
+        Ok(())
+    }
+
+    fn flush<B: Backend>(&mut self, repo: &mut Repository<B>) -> Result<()> {
+        self.flush_kind(repo, BlobKind::Data)?;
+        self.flush_kind(repo, BlobKind::Tree)
+    }
+}
+
 struct BackupRun<'a, B: Backend> {
     repo: &'a mut Repository<B>,
-    pack: PackBuilder,
+    writer: PackWriter,
     stats: BackupStats,
 }
 
@@ -316,14 +376,11 @@ impl<B: Backend> BackupRun<'_, B> {
 
     fn store_blob(&mut self, kind: BlobKind, data: &[u8]) -> Result<ChunkId> {
         let id = self.repo.keys.chunk_id(data);
-        if self.pack.contains(&id) || self.repo.index.has_chunk(&id)? {
+        if self.is_stored(&id)? {
             return Ok(id);
         }
-        self.pack.add(&self.repo.keys, id, kind, data)?;
+        self.writer.add(self.repo, id, kind, data)?;
         self.stats.new_chunks += 1;
-        if self.pack.len() >= self.repo.pack_target {
-            self.flush()?;
-        }
         Ok(id)
     }
 
@@ -332,19 +389,14 @@ impl<B: Backend> BackupRun<'_, B> {
     }
 
     fn flush(&mut self) -> Result<()> {
-        if self.pack.is_empty() {
-            return Ok(());
-        }
-        let finished = std::mem::take(&mut self.pack).finish(&self.repo.keys)?;
-        self.repo.backend.put_pack(&finished.id, &finished.data)?;
-        self.repo.index.add_pack(&finished.id, &finished.entries)?;
-        self.stats.packs_uploaded += 1;
-        self.stats.bytes_uploaded += finished.data.len() as u64;
+        self.writer.flush(self.repo)?;
+        self.stats.packs_uploaded = self.writer.packs;
+        self.stats.bytes_uploaded = self.writer.bytes;
         Ok(())
     }
 
     fn is_stored(&self, id: &ChunkId) -> Result<bool> {
-        Ok(self.pack.contains(id) || self.repo.index.has_chunk(id)?)
+        Ok(self.writer.contains(id) || self.repo.index.has_chunk(id)?)
     }
 
     /// Returns `None` for entries that are skipped (unreadable or special files).

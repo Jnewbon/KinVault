@@ -103,6 +103,7 @@ async fn daemon_backs_up_changes_to_peer() {
             rescan_secs: None,
             upload_limit: None,
             window: None,
+            retention: None,
         }),
     )
     .await;
@@ -230,7 +231,13 @@ async fn daemon_backs_up_changes_to_peer() {
 async fn second_daemon_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let path = ipc::endpoint_name(tmp.path());
-    let _first = ipc::Listener::bind(&path).await.unwrap();
+    assert!(!ipc::daemon_running(tmp.path()));
+    let first = ipc::Listener::bind(&path).await.unwrap();
+    let _serving = tokio::spawn(async move {
+        let _ = first;
+        std::future::pending::<()>().await
+    });
+    assert!(ipc::daemon_running(tmp.path()));
     let err = ipc::Listener::bind(&path)
         .await
         .err()
@@ -372,6 +379,7 @@ async fn friends_pair_with_an_invite_and_back_up_to_each_other() {
             rescan_secs: None,
             upload_limit: Some(10_000_000),
             window: None,
+            retention: None,
         }),
     )
     .await;
@@ -408,6 +416,7 @@ async fn friends_pair_with_an_invite_and_back_up_to_each_other() {
             rescan_secs: None,
             upload_limit: None,
             window: Some(closed),
+            retention: None,
         }),
     )
     .await;
@@ -485,4 +494,171 @@ async fn friends_pair_with_an_invite_and_back_up_to_each_other() {
 
     alice.shutdown().await;
     bob.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recovery_kit_restores_backups_on_a_new_machine() {
+    use kinvault_daemon::api::RetentionPolicy;
+    use kinvault_daemon::recovery;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let host = start(&tmp.path().join("host"), SecretKey::generate()).await;
+    let old_state = tmp.path().join("old-pc");
+    let pc = start(&old_state, SecretKey::generate()).await;
+    let pc_id = pc.id();
+    call(
+        &host,
+        Request::PeerAllow {
+            id: pc_id.to_string(),
+            name: None,
+            grant: GrantSpec::default(),
+        },
+    )
+    .await;
+
+    let src = tmp.path().join("documents");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("taxes.pdf"), b"2025 return").unwrap();
+    call(
+        &pc,
+        Request::CreateSet(CreateSet {
+            name: "docs".into(),
+            paths: vec![src.clone()],
+            target: Target::Peer {
+                id: host.id().to_string(),
+                addrs: host.endpoint().bound_sockets(),
+            },
+            recovery_passphrase: "set recovery phrase".into(),
+            debounce_secs: Some(60),
+            rescan_secs: None,
+            upload_limit: None,
+            window: None,
+            retention: None,
+        }),
+    )
+    .await;
+    wait_for_backup(&pc, None).await;
+    fs::write(src.join("taxes.pdf"), b"2025 return, amended").unwrap();
+    call(&pc, Request::BackupNow { set: "docs".into() }).await;
+
+    // Maintenance on demand: everything checks out, and pruning to the latest
+    // snapshot removes the older one.
+    let Reply::Verified(v) = call(
+        &pc,
+        Request::Verify {
+            set: "docs".into(),
+            max_bytes: None,
+        },
+    )
+    .await
+    else {
+        panic!()
+    };
+    assert!(v.ok && v.snapshots == 2 && v.packs_checked > 0, "{v:?}");
+    call(
+        &pc,
+        Request::SetRetention {
+            set: "docs".into(),
+            policy: RetentionPolicy {
+                last: Some(1),
+                ..Default::default()
+            },
+        },
+    )
+    .await;
+    let Reply::Pruned(p) = call(&pc, Request::Prune { set: "docs".into() }).await else {
+        panic!()
+    };
+    assert_eq!((p.snapshots_kept, p.snapshots_removed), (1, 1));
+    let st = set_status(&pc).await;
+    assert!(st.last_prune.is_some() && st.last_verify.unwrap().ok);
+
+    // Export a kit, then the PC is lost.
+    let Reply::RecoveryKit { json } = call(
+        &pc,
+        Request::ExportRecoveryKit {
+            passphrase: "kit passphrase!".into(),
+        },
+    )
+    .await
+    else {
+        panic!()
+    };
+    assert!(
+        !json.contains(&hex_master_key(&old_state)),
+        "set key must be encrypted in the kit"
+    );
+    pc.shutdown().await;
+    drop(pc);
+
+    // A new machine imports the kit.
+    let new_state = tmp.path().join("new-pc");
+    let err = recovery::import_offline(&new_state, &json, "wrong passphrase", false).unwrap_err();
+    assert!(format!("{err:#}").contains("wrong passphrase"), "{err:#}");
+    let summary = recovery::import_offline(&new_state, &json, "kit passphrase!", false).unwrap();
+    assert_eq!(summary.sets, vec!["docs".to_string()]);
+    assert_eq!(summary.instance_id, pc_id.to_string());
+    assert!(recovery::import_offline(&new_state, &json, "kit passphrase!", false).is_err());
+
+    // It comes back with the old identity, so the host recognises it.
+    let secret = kinvault_net::load_or_create_secret(&new_state.join("identity.key")).unwrap();
+    let new_pc = start(&new_state, secret).await;
+    assert_eq!(new_pc.id(), pc_id);
+    let st = set_status(&new_pc).await;
+    assert_eq!(st.state, SetState::Paused);
+    let err = new_pc
+        .handle(Request::BackupNow { set: "docs".into() })
+        .await
+        .unwrap_err();
+    assert!(err.contains("paused"), "{err}");
+
+    let out = tmp.path().join("restored");
+    call(
+        &new_pc,
+        Request::Restore {
+            set: "docs".into(),
+            snapshot: "latest".into(),
+            target: out.clone(),
+            include: None,
+        },
+    )
+    .await;
+    let restored = out.join(
+        fs::canonicalize(&src)
+            .unwrap()
+            .to_string_lossy()
+            .trim_start_matches('/'),
+    );
+    assert_eq!(
+        fs::read(restored.join("taxes.pdf")).unwrap(),
+        b"2025 return, amended"
+    );
+
+    // Resume backing up from the restored copy on the new machine.
+    call(
+        &new_pc,
+        Request::ResumeSet {
+            set: "docs".into(),
+            paths: Some(vec![restored.clone()]),
+        },
+    )
+    .await;
+    let b = wait_for_backup(&new_pc, None).await;
+    assert_eq!(b.files, 1);
+    assert_eq!(
+        set_status(&new_pc).await.paths,
+        vec![fs::canonicalize(&restored).unwrap()]
+    );
+
+    new_pc.shutdown().await;
+    host.shutdown().await;
+}
+
+fn hex_master_key(state: &Path) -> String {
+    let sets = state.join("sets");
+    let dir = fs::read_dir(&sets).unwrap().next().unwrap().unwrap().path();
+    fs::read_to_string(dir.join("master.key"))
+        .unwrap()
+        .trim()
+        .to_string()
 }

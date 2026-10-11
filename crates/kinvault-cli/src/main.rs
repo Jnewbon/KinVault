@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use kinvault_daemon::api::{
-    CreateInvite, CreateSet, GrantSpec, Reply, Request, SetState, Target, TimeWindow,
+    CreateInvite, CreateSet, GrantSpec, Reply, Request, RetentionPolicy, SetState, Target,
+    TimeWindow,
 };
 use kinvault_daemon::ipc::Client;
 
@@ -52,6 +53,21 @@ enum Command {
     },
     /// Show how much space a set uses on the host it backs up to.
     Usage { set: String },
+    /// Remove snapshots the set's retention policy doesn't keep, freeing space.
+    Prune { set: String },
+    /// Check that a set's backups are complete and can be decrypted.
+    Verify {
+        set: String,
+        /// How much data to download and check, e.g. 1G (default 256M).
+        #[arg(long, value_parser = parse_size, conflicts_with = "full")]
+        max: Option<u64>,
+        /// Download and check everything.
+        #[arg(long)]
+        full: bool,
+    },
+    /// Export or import a recovery kit for restoring on a new machine.
+    #[command(subcommand)]
+    Recovery(RecoveryCommand),
     /// Invite friends to store backups here, or accept their invites.
     #[command(subcommand)]
     Invite(InviteCommand),
@@ -82,7 +98,19 @@ enum SetCommand {
         debounce: Option<u64>,
         #[command(flatten)]
         limits: SetLimits,
+        #[command(flatten)]
+        retention: RetentionArgs,
     },
+    /// Change which snapshots a set keeps (applied at the next prune).
+    Retention {
+        set: String,
+        #[command(flatten)]
+        retention: RetentionArgs,
+    },
+    /// Stop backing up a set automatically (restores still work).
+    Pause { set: String },
+    /// Resume automatic backups, optionally of different paths (e.g. after recovery).
+    Resume { set: String, paths: Vec<PathBuf> },
     /// Change a set's upload limit and time window (omitted options are cleared).
     Limits {
         set: String,
@@ -91,6 +119,57 @@ enum SetCommand {
     },
     /// Stop backing up a set. Existing backups and the set's key are kept.
     Remove { set: String },
+}
+
+#[derive(Subcommand)]
+enum RecoveryCommand {
+    /// Write a recovery kit: this instance's identity and every set's key,
+    /// encrypted with a passphrase. Store it away from this machine.
+    Export { file: PathBuf },
+    /// Set up this machine from a recovery kit. Run before starting kinvaultd;
+    /// imported sets start paused so you can restore first.
+    Import {
+        file: PathBuf,
+        /// Replace this instance's identity even though it already has sets or peers.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Args)]
+struct RetentionArgs {
+    /// Keep the newest N snapshots.
+    #[arg(long)]
+    keep_last: Option<u32>,
+    /// Keep one snapshot for each of the last N hours.
+    #[arg(long)]
+    keep_hourly: Option<u32>,
+    #[arg(long)]
+    keep_daily: Option<u32>,
+    #[arg(long)]
+    keep_weekly: Option<u32>,
+    #[arg(long)]
+    keep_monthly: Option<u32>,
+    #[arg(long)]
+    keep_yearly: Option<u32>,
+    /// Never remove snapshots.
+    #[arg(long, conflicts_with_all = ["keep_last", "keep_hourly", "keep_daily", "keep_weekly", "keep_monthly", "keep_yearly"])]
+    keep_all: bool,
+}
+
+impl RetentionArgs {
+    /// `None` when no option was given.
+    fn policy(&self) -> Option<RetentionPolicy> {
+        let p = RetentionPolicy {
+            last: self.keep_last,
+            hourly: self.keep_hourly,
+            daily: self.keep_daily,
+            weekly: self.keep_weekly,
+            monthly: self.keep_monthly,
+            yearly: self.keep_yearly,
+        };
+        (self.keep_all || !p.keeps_everything()).then_some(p)
+    }
 }
 
 #[derive(Args)]
@@ -183,6 +262,21 @@ enum PeerCommand {
         peer: String,
     },
     List,
+}
+
+fn kit_passphrase(confirm: bool) -> Result<String> {
+    if let Ok(p) = std::env::var(PASSPHRASE_ENV) {
+        return Ok(p);
+    }
+    let p = rpassword::prompt_password("Recovery kit passphrase: ")?;
+    if confirm && rpassword::prompt_password("Repeat passphrase: ")? != p {
+        bail!("passphrases do not match");
+    }
+    Ok(p)
+}
+
+fn format_unix(secs: i64) -> String {
+    format_time(secs * 1_000_000_000)
 }
 
 fn recovery_passphrase() -> Result<String> {
@@ -290,6 +384,23 @@ async fn main() -> Result<()> {
         None => kinvault_daemon::default_state_dir()
             .context("could not determine a data directory; pass --state")?,
     };
+    // Importing a recovery kit happens before the daemon runs.
+    if let Command::Recovery(RecoveryCommand::Import { file, force }) = &cli.command {
+        let json =
+            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+        let summary = kinvault_daemon::recovery::import_offline(
+            &state,
+            &json,
+            &kit_passphrase(false)?,
+            *force,
+        )?;
+        println!("Recovered instance {}.", summary.instance_id);
+        println!("Imported sets (paused): {}", summary.sets.join(", "));
+        println!("\nNext: start kinvaultd, restore with `kinvault restore <set> latest <dir>`,");
+        println!("then continue backing up with `kinvault set resume <set> [paths]`.");
+        println!("Make sure the old machine is not running with this identity anymore.");
+        return Ok(());
+    }
     let mut client = Client::connect(&state).await?;
 
     match cli.command {
@@ -307,6 +418,7 @@ async fn main() -> Result<()> {
                     SetState::Idle => "up to date",
                     SetState::ChangesPending => "changes pending",
                     SetState::WaitingForWindow => "waiting for its time window",
+                    SetState::Paused => "paused",
                     SetState::Running => "backing up",
                 };
                 println!(
@@ -337,6 +449,28 @@ async fn main() -> Result<()> {
                 if let Some(e) = set.last_error {
                     println!("  last error: {e}");
                 }
+                println!("  keeps {}", set.retention);
+                if let Some(p) = set.last_prune {
+                    println!(
+                        "  last prune {}: removed {} snapshot(s), freed {}",
+                        format_unix(p.time_unix),
+                        p.snapshots_removed,
+                        format_bytes(p.bytes_deleted)
+                    );
+                }
+                if let Some(v) = set.last_verify {
+                    let result = if v.ok {
+                        "ok".to_string()
+                    } else {
+                        format!("PROBLEMS: {}", v.errors.join("; "))
+                    };
+                    println!(
+                        "  last check {}: {} ({} checked)",
+                        format_unix(v.time_unix),
+                        result,
+                        format_bytes(v.bytes_checked)
+                    );
+                }
             }
         }
         Command::Id => {
@@ -350,6 +484,7 @@ async fn main() -> Result<()> {
             println!("Name set.");
         }
         Command::Set(SetCommand::Create {
+            retention,
             name,
             paths,
             local,
@@ -375,14 +510,15 @@ async fn main() -> Result<()> {
                 rescan_secs: None,
                 upload_limit: limits.upload_limit,
                 window: limits.window,
+                retention: retention.policy(),
             });
             let Reply::SetCreated { id } = client.call(&req).await? else {
                 bail!("unexpected reply")
             };
             println!("Created set {name:?} ({id}); the first backup is starting.");
+            println!("To be able to restore if this machine is lost, export a recovery kit:");
             println!(
-                "Keep a copy of {} and your passphrase somewhere safe.",
-                state.join("sets").join(&id).join("keyfile.json").display()
+                "  kinvault recovery export <file>   (keep it somewhere other than this machine)"
             );
         }
         Command::Set(SetCommand::Limits { set, limits }) => {
@@ -393,6 +529,87 @@ async fn main() -> Result<()> {
             };
             client.call(&req).await?;
             println!("Limits updated.");
+        }
+        Command::Set(SetCommand::Retention { set, retention }) => {
+            let policy = retention
+                .policy()
+                .context("give at least one --keep-* option, or --keep-all")?;
+            client.call(&Request::SetRetention { set, policy }).await?;
+            println!("Retention set to: {policy}.");
+        }
+        Command::Set(SetCommand::Pause { set }) => {
+            client.call(&Request::PauseSet { set }).await?;
+            println!("Paused.");
+        }
+        Command::Set(SetCommand::Resume { set, paths }) => {
+            let paths = (!paths.is_empty()).then_some(paths);
+            client.call(&Request::ResumeSet { set, paths }).await?;
+            println!("Resumed; a backup is starting.");
+        }
+        Command::Prune { set } => {
+            let Reply::Pruned(p) = client.call(&Request::Prune { set }).await? else {
+                bail!("unexpected reply")
+            };
+            println!(
+                "kept {} snapshot(s), removed {}; deleted {} pack(s), rewrote {}; freed about {}",
+                p.snapshots_kept,
+                p.snapshots_removed,
+                p.packs_deleted,
+                p.packs_repacked,
+                format_bytes(p.bytes_deleted)
+            );
+            if p.bytes_deleted > 0 {
+                println!(
+                    "(a host keeps deleted data for its grace period before the space is free)"
+                );
+            }
+        }
+        Command::Verify { set, max, full } => {
+            let max_bytes = if full { Some(u64::MAX) } else { max };
+            let Reply::Verified(v) = client.call(&Request::Verify { set, max_bytes }).await? else {
+                bail!("unexpected reply")
+            };
+            println!(
+                "{} snapshot(s) complete check: {}; checked {} in {} pack(s)",
+                v.snapshots,
+                if v.missing_chunks == 0 {
+                    "ok"
+                } else {
+                    "MISSING DATA"
+                },
+                format_bytes(v.bytes_checked),
+                v.packs_checked
+            );
+            for e in &v.errors {
+                println!("  problem: {e}");
+            }
+            if v.ok {
+                println!("All good.");
+            } else {
+                println!(
+                    "Damaged data was removed; the next backup re-uploads whatever still exists here."
+                );
+                std::process::exit(1);
+            }
+        }
+        Command::Recovery(RecoveryCommand::Export { file }) => {
+            println!("Choose a passphrase for the recovery kit. You need it to use the kit.");
+            let passphrase = kit_passphrase(true)?;
+            let Reply::RecoveryKit { json } = client
+                .call(&Request::ExportRecoveryKit { passphrase })
+                .await?
+            else {
+                bail!("unexpected reply")
+            };
+            write_private_file(&file, json.as_bytes())?;
+            println!(
+                "Wrote {}. Keep it (and the passphrase) somewhere other than this machine.",
+                file.display()
+            );
+            println!("Export again after adding backup sets.");
+        }
+        Command::Recovery(RecoveryCommand::Import { .. }) => {
+            unreachable!("handled before connecting")
         }
         Command::Set(SetCommand::Remove { set }) => {
             client.call(&Request::RemoveSet { set }).await?;
@@ -604,6 +821,17 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn write_private_file(path: &std::path::Path, data: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    opts.open(path)
+        .and_then(|mut f| f.write_all(data))
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 #[cfg(test)]
