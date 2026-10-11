@@ -28,6 +28,15 @@ impl MasterKey {
         Ok(Self(random_bytes()?))
     }
 
+    pub fn from_bytes(bytes: [u8; KEY_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    /// Raw key material, for storing in a private local key file.
+    pub fn to_bytes(&self) -> [u8; KEY_LEN] {
+        self.0
+    }
+
     pub fn derive_keys(&self) -> Keys {
         Keys {
             chunk_id: blake3::derive_key("kinvault v1 chunk-id key", &self.0),

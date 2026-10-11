@@ -48,6 +48,7 @@ pub struct Repository<B: Backend> {
     keys: Keys,
     index: Index,
     pack_target: usize,
+    excludes: Vec<PathBuf>,
 }
 
 impl<B: Backend> Repository<B> {
@@ -57,11 +58,17 @@ impl<B: Backend> Repository<B> {
             keys: master.derive_keys(),
             index,
             pack_target: DEFAULT_PACK_TARGET,
+            excludes: Vec::new(),
         }
     }
 
     pub fn set_pack_target(&mut self, bytes: usize) {
         self.pack_target = bytes;
+    }
+
+    /// Absolute paths (and everything below them) to leave out of backups.
+    pub fn set_excludes(&mut self, excludes: Vec<PathBuf>) {
+        self.excludes = excludes;
     }
 
     pub fn backend(&self) -> &B {
@@ -343,6 +350,9 @@ impl<B: Backend> BackupRun<'_, B> {
     /// Returns `None` for entries that are skipped (unreadable or special files).
     /// Errors are only returned for failures that should abort the backup.
     fn store_path(&mut self, path: &Path, name: String) -> Result<Option<Node>> {
+        if self.repo.excludes.iter().any(|e| path.starts_with(e)) {
+            return Ok(None);
+        }
         let meta = match fs::symlink_metadata(path) {
             Ok(m) => m,
             Err(e) => {

@@ -14,6 +14,7 @@ use crate::pack::{BlobEntry, BlobKind};
 const SCHEMA: &str = "
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
+    PRAGMA busy_timeout = 30000;
     CREATE TABLE IF NOT EXISTS packs (id BLOB PRIMARY KEY);
     CREATE TABLE IF NOT EXISTS chunks (
         id BLOB PRIMARY KEY,

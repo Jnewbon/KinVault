@@ -9,6 +9,7 @@ edition = "2024"
 [workspace.dependencies]
 kinvault-core = { path = "crates/kinvault-core" }
 kinvault-net = { path = "crates/kinvault-net" }
+kinvault-daemon = { path = "crates/kinvault-daemon" }
 
 anyhow = "1"
 argon2 = "0.5"
@@ -21,6 +22,7 @@ gethostname = "1"
 getrandom = "0.3"
 hex = "0.4"
 iroh = "1.3"
+notify = "8"
 postcard = { version = "1.1", features = ["use-std"] }
 rpassword = "7"
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -28,7 +30,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "net", "io-util", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize = { version = "1", features = ["derive"] }

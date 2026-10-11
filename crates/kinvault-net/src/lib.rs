@@ -13,11 +13,11 @@ mod receiver;
 pub use client::{RemoteBackend, RemoteStatus};
 pub use error::NetError;
 pub use identity::load_or_create_secret;
+pub use iroh::protocol::Router;
 pub use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 pub use receiver::{Grant, Receiver};
 
 use iroh::endpoint::presets;
-use iroh::protocol::Router;
 
 /// Binds an endpoint with the default discovery and relay servers.
 pub async fn bind(secret: SecretKey) -> Result<Endpoint, NetError> {

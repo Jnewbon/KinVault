@@ -1,16 +1,12 @@
-//! `kinvault` command-line tool. For now it drives repositories directly;
-//! once the daemon exists this becomes a thin client of its IPC API.
+//! `kinvault` command-line tool: a thin client of the `kinvaultd` daemon.
 
-use std::fs;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::str::FromStr;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use kinvault_core::{Backend, Index, KeyFile, LocalDirBackend, MasterKey, Repository};
-use kinvault_net::{Endpoint, EndpointAddr, EndpointId, Grant, Receiver, RemoteBackend};
-use serde::{Deserialize, Serialize};
+use kinvault_daemon::api::{CreateSet, Reply, Request, SetState, Target};
+use kinvault_daemon::ipc::Client;
 
 const PASSPHRASE_ENV: &str = "KINVAULT_PASSPHRASE";
 
@@ -21,7 +17,7 @@ const PASSPHRASE_ENV: &str = "KINVAULT_PASSPHRASE";
     about = "Self-hosted encrypted backups between friends"
 )]
 struct Cli {
-    /// Directory holding this instance's identity, keys and index.
+    /// The daemon's state directory (defaults to the per-user data directory).
     #[arg(long, global = true, env = "KINVAULT_STATE")]
     state: Option<PathBuf>,
     #[command(subcommand)]
@@ -30,10 +26,41 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Show this instance's id and the state of every backup set.
+    Status,
     /// Print this instance's id (give it to hosts so they can allow you).
     Id,
-    /// Create a new encrypted backup set and generate its key.
-    Init {
+    /// Manage backup sets.
+    #[command(subcommand)]
+    Set(SetCommand),
+    /// Back up a set now and wait for it to finish.
+    Backup { set: String },
+    /// List a set's snapshots.
+    Snapshots { set: String },
+    /// Restore a snapshot (id prefix or "latest") into a target directory.
+    Restore {
+        set: String,
+        snapshot: String,
+        target: PathBuf,
+        /// Only restore this path (as stored in the snapshot, e.g. home/me/Documents).
+        #[arg(long)]
+        include: Option<String>,
+    },
+    /// Show how much space a set's owner uses on the host it backs up to.
+    Usage { set: String },
+    /// Manage which peers may store backups on this instance.
+    #[command(subcommand)]
+    Peer(PeerCommand),
+}
+
+#[derive(Subcommand)]
+enum SetCommand {
+    /// Create a backup set; it is backed up immediately and kept up to date.
+    Create {
+        name: String,
+        /// Files or folders to back up.
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
         /// Store backups in a local directory (external disk, NAS mount).
         #[arg(long, conflicts_with = "peer", required_unless_present = "peer")]
         local: Option<PathBuf>,
@@ -43,33 +70,12 @@ enum Command {
         /// Known direct address of the peer (optional; it is found by id otherwise).
         #[arg(long, requires = "peer")]
         peer_addr: Vec<SocketAddr>,
-    },
-    /// Back up files and directories into a new snapshot.
-    Backup {
-        #[arg(required = true)]
-        paths: Vec<PathBuf>,
-    },
-    /// List snapshots.
-    Snapshots,
-    /// Restore a snapshot (id prefix or "latest") into a target directory.
-    Restore {
-        snapshot: String,
-        target: PathBuf,
-        /// Only restore this path (as shown in the snapshot, e.g. home/me/Documents).
+        /// Seconds without changes before backing up.
         #[arg(long)]
-        include: Option<String>,
+        debounce: Option<u64>,
     },
-    /// Show storage used on the remote host.
-    Status,
-    /// Host backups for allowed peers until interrupted.
-    Serve {
-        /// Where peers' encrypted data is stored.
-        #[arg(long)]
-        store: PathBuf,
-    },
-    /// Manage which peers may store backups on this instance.
-    #[command(subcommand)]
-    Peer(PeerCommand),
+    /// Stop backing up a set. Existing backups and the set's key are kept.
+    Remove { set: String },
 }
 
 #[derive(Subcommand)]
@@ -83,128 +89,25 @@ enum PeerCommand {
         #[arg(long, value_parser = parse_size)]
         quota: Option<u64>,
     },
-    /// Stop accepting backups from a peer (stored data is kept).
+    /// Stop accepting backups from a peer (data already stored is kept).
     Revoke {
         id: String,
     },
     List,
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum Target {
-    Local {
-        path: PathBuf,
-    },
-    Peer {
-        id: String,
-        /// Random name for this set on the host, so it learns nothing from it.
-        repo: String,
-        #[serde(default)]
-        addrs: Vec<SocketAddr>,
-    },
-}
-
-#[derive(Serialize, Deserialize)]
-struct StateConfig {
-    target: Target,
-}
-
-#[derive(Serialize, Deserialize, Default)]
-struct Peers {
-    peers: Vec<PeerEntry>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct PeerEntry {
-    id: String,
-    name: Option<String>,
-    quota_bytes: Option<u64>,
-}
-
-struct State {
-    dir: PathBuf,
-}
-
-impl State {
-    fn path(&self, name: &str) -> PathBuf {
-        self.dir.join(name)
-    }
-
-    async fn endpoint(&self) -> Result<Endpoint> {
-        let secret = kinvault_net::load_or_create_secret(&self.path("identity.key"))?;
-        Ok(kinvault_net::bind(secret).await?)
-    }
-
-    fn config(&self) -> Result<StateConfig> {
-        read_json(&self.path("repo.json"))
-            .context("no backup set configured; run `kinvault init` first")
-    }
-
-    fn peers(&self) -> Result<Peers> {
-        let path = self.path("peers.json");
-        if !path.exists() {
-            return Ok(Peers::default());
-        }
-        read_json(&path)
-    }
-
-    fn save_peers(&self, peers: &Peers) -> Result<()> {
-        Ok(fs::write(
-            self.path("peers.json"),
-            serde_json::to_string_pretty(peers)?,
-        )?)
-    }
-
-    /// Opens the configured backup set. The returned endpoint (if any) should
-    /// be closed once the repository is no longer needed.
-    async fn open_repo(&self) -> Result<(Repository<Box<dyn Backend>>, Option<Endpoint>)> {
-        let config = self.config()?;
-        let keyfile: KeyFile = read_json(&self.path("keyfile.json"))?;
-        let master = keyfile.unlock(&passphrase(false)?)?;
-        let (backend, endpoint): (Box<dyn Backend>, _) = match config.target {
-            Target::Local { path } => (Box::new(LocalDirBackend::open(path)?), None),
-            Target::Peer { id, repo, addrs } => {
-                let endpoint = self.endpoint().await?;
-                let addr = peer_addr(&id, &addrs)?;
-                let remote = RemoteBackend::new(
-                    endpoint.clone(),
-                    addr,
-                    &repo,
-                    tokio::runtime::Handle::current(),
-                )?;
-                (Box::new(remote), Some(endpoint))
-            }
-        };
-        let index = Index::open(&self.path("index.db"))?;
-        Ok((Repository::open(backend, &master, index), endpoint))
-    }
-}
-
-fn peer_addr(id: &str, addrs: &[SocketAddr]) -> Result<EndpointAddr> {
-    let id = EndpointId::from_str(id).with_context(|| format!("invalid peer id {id:?}"))?;
-    Ok(addrs
-        .iter()
-        .fold(EndpointAddr::new(id), |a, s| a.with_ip_addr(*s)))
-}
-
-fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
-    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(serde_json::from_str(&text)?)
-}
-
-fn passphrase(confirm: bool) -> Result<String> {
+fn recovery_passphrase() -> Result<String> {
     if let Ok(p) = std::env::var(PASSPHRASE_ENV) {
         return Ok(p);
     }
-    let p = rpassword::prompt_password("Passphrase: ")?;
-    if confirm {
-        if p.len() < 8 {
-            bail!("passphrase must be at least 8 characters");
-        }
-        if rpassword::prompt_password("Repeat passphrase: ")? != p {
-            bail!("passphrases do not match");
-        }
+    println!("Choose a recovery passphrase. With it and the set's recovery file you can");
+    println!("restore on a new machine; without both, the backups can't be decrypted.");
+    let p = rpassword::prompt_password("Recovery passphrase: ")?;
+    if p.chars().count() < 8 {
+        bail!("passphrase must be at least 8 characters");
+    }
+    if rpassword::prompt_password("Repeat passphrase: ")? != p {
+        bail!("passphrases do not match");
     }
     Ok(p)
 }
@@ -246,230 +149,236 @@ fn format_bytes(n: u64) -> String {
     }
 }
 
-/// Runs blocking repository work off the async runtime.
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
-    tokio::task::spawn_blocking(f).await?
+/// Formats nanoseconds since the Unix epoch as a UTC date and time.
+fn format_time(time_ns: i64) -> String {
+    let secs = time_ns.div_euclid(1_000_000_000);
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Civil-from-days (Howard Hinnant).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02} UTC",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+fn describe_target(t: &Target) -> String {
+    match t {
+        Target::Local { path } => format!("local {}", path.display()),
+        Target::Peer { id, .. } => format!("peer {}…", &id[..id.len().min(16)]),
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "warn,iroh=error,kinvault_net=info".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
     let cli = Cli::parse();
-    let dir = match cli.state {
+    let state = match cli.state {
         Some(d) => d,
-        None => directories::ProjectDirs::from("", "", "KinVault")
-            .context("could not determine a data directory; pass --state")?
-            .data_dir()
-            .to_path_buf(),
+        None => kinvault_daemon::default_state_dir()
+            .context("could not determine a data directory; pass --state")?,
     };
-    fs::create_dir_all(&dir)?;
-    let state = State { dir };
+    let mut client = Client::connect(&state).await?;
 
     match cli.command {
-        Command::Id => {
-            let secret = kinvault_net::load_or_create_secret(&state.path("identity.key"))?;
-            println!("{}", secret.public());
+        Command::Status => {
+            let Reply::Status(s) = client.call(&Request::Status).await? else {
+                bail!("unexpected reply")
+            };
+            println!("instance {}", s.id);
+            println!("hosting store {}", s.hosting_store.display());
+            if s.sets.is_empty() {
+                println!("no backup sets; create one with `kinvault set create`");
+            }
+            for set in s.sets {
+                let state = match set.state {
+                    SetState::Idle => "up to date",
+                    SetState::ChangesPending => "changes pending",
+                    SetState::Running => "backing up",
+                };
+                println!(
+                    "\n{} ({state}) -> {}",
+                    set.name,
+                    describe_target(&set.target)
+                );
+                for p in &set.paths {
+                    println!("  {}", p.display());
+                }
+                match set.last_backup {
+                    Some(b) => println!(
+                        "  last backup {}: {} files ({}), {} changed, uploaded {}",
+                        format_time(b.time_ns),
+                        b.files,
+                        format_bytes(b.total_bytes),
+                        b.files_changed,
+                        format_bytes(b.bytes_uploaded)
+                    ),
+                    None => println!("  not backed up yet"),
+                }
+                if let Some(e) = set.last_error {
+                    println!("  last error: {e}");
+                }
+            }
         }
-        Command::Init {
+        Command::Id => {
+            let Reply::Status(s) = client.call(&Request::Status).await? else {
+                bail!("unexpected reply")
+            };
+            println!("{}", s.id);
+        }
+        Command::Set(SetCommand::Create {
+            name,
+            paths,
             local,
             peer,
-            peer_addr: addrs,
-        } => {
-            if state.path("keyfile.json").exists() {
-                bail!(
-                    "{} already holds a key; refusing to overwrite it",
-                    state.dir.display()
-                );
-            }
+            peer_addr,
+            debounce,
+        }) => {
             let target = match (local, peer) {
-                (Some(path), _) => {
-                    LocalDirBackend::create(&path)?;
-                    Target::Local {
-                        path: fs::canonicalize(&path)?,
-                    }
-                }
-                (None, Some(id)) => {
-                    self::peer_addr(&id, &addrs)?;
-                    let repo = hex::encode(kinvault_core::crypto::random_bytes::<12>()?);
-                    Target::Peer { id, repo, addrs }
-                }
+                (Some(path), _) => Target::Local { path },
+                (None, Some(id)) => Target::Peer {
+                    id,
+                    addrs: peer_addr,
+                },
                 (None, None) => unreachable!("clap requires --local or --peer"),
             };
-            let master = MasterKey::generate()?;
-            let keyfile = KeyFile::create(&master, &passphrase(true)?)?;
-            fs::write(
-                state.path("keyfile.json"),
-                serde_json::to_string_pretty(&keyfile)?,
-            )?;
-            fs::write(
-                state.path("repo.json"),
-                serde_json::to_string_pretty(&StateConfig { target })?,
-            )?;
-            println!("Initialised encrypted backup set.");
+            let req = Request::CreateSet(CreateSet {
+                name: name.clone(),
+                paths,
+                target,
+                recovery_passphrase: recovery_passphrase()?,
+                debounce_secs: debounce,
+                rescan_secs: None,
+            });
+            let Reply::SetCreated { id } = client.call(&req).await? else {
+                bail!("unexpected reply")
+            };
+            println!("Created set {name:?} ({id}); the first backup is starting.");
             println!(
-                "Keep a copy of {} and your passphrase: without both, backups cannot be restored.",
-                state.path("keyfile.json").display()
+                "Keep a copy of {} and your passphrase somewhere safe.",
+                state.join("sets").join(&id).join("keyfile.json").display()
             );
         }
-        Command::Backup { paths } => {
-            let (mut repo, endpoint) = state.open_repo().await?;
-            let host = gethostname::gethostname().to_string_lossy().into_owned();
-            let (id, stats) = blocking(move || Ok(repo.backup(&paths, &host)?)).await?;
-            for w in &stats.warnings {
+        Command::Set(SetCommand::Remove { set }) => {
+            client.call(&Request::RemoveSet { set }).await?;
+            println!("Set removed. Its backups and key were kept.");
+        }
+        Command::Backup { set } => {
+            let Reply::Backup(b) = client.call(&Request::BackupNow { set }).await? else {
+                bail!("unexpected reply")
+            };
+            for w in &b.warnings {
                 eprintln!("warning: {w}");
             }
-            println!("snapshot {}", &id.to_hex()[..16]);
+            println!("snapshot {}", &b.snapshot[..16]);
             println!(
-                "  {} files ({}), {} changed, read {}, uploaded {} in {} pack(s)",
-                stats.files,
-                format_bytes(stats.total_bytes),
-                stats.files_changed,
-                format_bytes(stats.bytes_read),
-                format_bytes(stats.bytes_uploaded),
-                stats.packs_uploaded
+                "  {} files ({}), {} changed, uploaded {}",
+                b.files,
+                format_bytes(b.total_bytes),
+                b.files_changed,
+                format_bytes(b.bytes_uploaded)
             );
-            close(endpoint).await;
         }
-        Command::Snapshots => {
-            let (repo, endpoint) = state.open_repo().await?;
-            let snapshots = blocking(move || Ok(repo.list_snapshots()?)).await?;
-            for (id, s) in snapshots {
+        Command::Snapshots { set } => {
+            let Reply::Snapshots(snaps) = client.call(&Request::ListSnapshots { set }).await?
+            else {
+                bail!("unexpected reply")
+            };
+            for s in snaps {
                 println!(
-                    "{}  t={}  {}  {} files  {}  {}",
-                    &id.to_hex()[..16],
-                    s.time_ns / 1_000_000_000,
+                    "{}  {}  {}  {} files  {}",
+                    &s.id[..16],
+                    format_time(s.time_ns),
                     s.hostname,
                     s.file_count,
-                    format_bytes(s.total_bytes),
-                    s.paths.join(", ")
+                    format_bytes(s.total_bytes)
                 );
             }
-            close(endpoint).await;
         }
         Command::Restore {
+            set,
             snapshot,
             target,
             include,
         } => {
-            let (mut repo, endpoint) = state.open_repo().await?;
             let shown = target.clone();
-            let stats = blocking(move || {
-                let id = repo.find_snapshot(&snapshot)?;
-                Ok(repo.restore(&id, &target, include.as_deref())?)
-            })
-            .await?;
+            let req = Request::Restore {
+                set,
+                snapshot,
+                target,
+                include,
+            };
+            let Reply::Restored(r) = client.call(&req).await? else {
+                bail!("unexpected reply")
+            };
             println!(
                 "restored {} files, {} dirs, {} symlinks ({}) to {}",
-                stats.files,
-                stats.dirs,
-                stats.symlinks,
-                format_bytes(stats.bytes),
+                r.files,
+                r.dirs,
+                r.symlinks,
+                format_bytes(r.bytes),
                 shown.display()
             );
-            close(endpoint).await;
         }
-        Command::Status => {
-            let Target::Peer { id, repo, addrs } = state.config()?.target else {
-                bail!("status is only available for backup sets stored on a peer");
+        Command::Usage { set } => {
+            let Reply::Usage {
+                used_bytes,
+                quota_bytes,
+            } = client.call(&Request::RemoteUsage { set }).await?
+            else {
+                bail!("unexpected reply")
             };
-            let endpoint = state.endpoint().await?;
-            let remote = RemoteBackend::new(
-                endpoint.clone(),
-                peer_addr(&id, &addrs)?,
-                &repo,
-                tokio::runtime::Handle::current(),
-            )?;
-            let status = remote.status().await?;
-            match status.quota_bytes {
-                Some(q) => println!(
-                    "using {} of {} on {id}",
-                    format_bytes(status.used_bytes),
-                    format_bytes(q)
-                ),
-                None => println!(
-                    "using {} on {id} (no quota)",
-                    format_bytes(status.used_bytes)
-                ),
+            match quota_bytes {
+                Some(q) => println!("using {} of {}", format_bytes(used_bytes), format_bytes(q)),
+                None => println!("using {} (no quota)", format_bytes(used_bytes)),
             }
-            close(Some(endpoint)).await;
         }
-        Command::Serve { store } => {
-            let receiver = Receiver::new(&store);
-            let peers = state.peers()?;
-            for p in &peers.peers {
-                receiver.allow(
-                    EndpointId::from_str(&p.id)?,
-                    Grant {
-                        quota_bytes: p.quota_bytes,
-                    },
+        Command::Peer(PeerCommand::Allow { id, name, quota }) => {
+            client
+                .call(&Request::PeerAllow {
+                    id,
+                    name,
+                    quota_bytes: quota,
+                })
+                .await?;
+            println!("Allowed.");
+        }
+        Command::Peer(PeerCommand::Revoke { id }) => {
+            client.call(&Request::PeerRevoke { id }).await?;
+            println!("Revoked. Data they already stored is kept.");
+        }
+        Command::Peer(PeerCommand::List) => {
+            let Reply::Peers(peers) = client.call(&Request::PeerList).await? else {
+                bail!("unexpected reply")
+            };
+            for p in peers {
+                let quota = p
+                    .quota_bytes
+                    .map(format_bytes)
+                    .unwrap_or_else(|| "no quota".into());
+                println!(
+                    "{}  {}  using {} of {quota}",
+                    p.id,
+                    p.name.as_deref().unwrap_or("-"),
+                    format_bytes(p.used_bytes)
                 );
-            }
-            let endpoint = state.endpoint().await?;
-            println!("Serving as {}", endpoint.id());
-            println!(
-                "Storing data for {} allowed peer(s) in {}",
-                peers.peers.len(),
-                store.display()
-            );
-            let router = kinvault_net::serve(endpoint, receiver);
-            tokio::signal::ctrl_c().await?;
-            router.shutdown().await?;
-        }
-        Command::Peer(cmd) => {
-            let mut peers = state.peers()?;
-            match cmd {
-                PeerCommand::Allow { id, name, quota } => {
-                    EndpointId::from_str(&id).with_context(|| format!("invalid peer id {id:?}"))?;
-                    peers.peers.retain(|p| p.id != id);
-                    peers.peers.push(PeerEntry {
-                        id,
-                        name,
-                        quota_bytes: quota,
-                    });
-                    state.save_peers(&peers)?;
-                    println!("Allowed. Restart `kinvault serve` to apply.");
-                }
-                PeerCommand::Revoke { id } => {
-                    let before = peers.peers.len();
-                    peers.peers.retain(|p| p.id != id);
-                    if peers.peers.len() == before {
-                        bail!("{id} is not an allowed peer");
-                    }
-                    state.save_peers(&peers)?;
-                    println!(
-                        "Revoked. Their stored data is kept. Restart `kinvault serve` to apply."
-                    );
-                }
-                PeerCommand::List => {
-                    for p in &peers.peers {
-                        let quota = p
-                            .quota_bytes
-                            .map(format_bytes)
-                            .unwrap_or_else(|| "no quota".into());
-                        println!("{}  {}  {quota}", p.id, p.name.as_deref().unwrap_or("-"));
-                    }
-                }
             }
         }
     }
     Ok(())
 }
 
-async fn close(endpoint: Option<Endpoint>) {
-    if let Some(ep) = endpoint {
-        ep.close().await;
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::parse_size;
+    use super::{format_time, parse_size};
 
     #[test]
     fn sizes() {
@@ -480,5 +389,18 @@ mod tests {
         assert_eq!(parse_size("3mb"), Ok(3 << 20));
         assert!(parse_size("1X").is_err());
         assert!(parse_size("G").is_err());
+    }
+
+    #[test]
+    fn times() {
+        assert_eq!(format_time(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(
+            format_time(951_782_400 * 1_000_000_000),
+            "2000-02-29 00:00:00 UTC"
+        );
+        assert_eq!(
+            format_time(1_791_743_056 * 1_000_000_000),
+            "2026-10-11 18:24:16 UTC"
+        );
     }
 }
