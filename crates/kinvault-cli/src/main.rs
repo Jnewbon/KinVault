@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use kinvault_daemon::api::{
-    CreateInvite, CreateSet, GrantSpec, Reply, Request, RetentionPolicy, SetState, Target,
-    TimeWindow,
+    CreateInvite, CreateSet, GrantSpec, HostAddr, NetworkInfo, NetworkSettings, Reply, Request,
+    RetentionPolicy, SetState, Target, TimeWindow,
 };
 use kinvault_daemon::ipc::Client;
 
@@ -79,6 +79,9 @@ enum Command {
     /// Manage peers: who may store backups here, and who stores ours.
     #[command(subcommand)]
     Peer(PeerCommand),
+    /// The port this instance listens on and the addresses invite codes include.
+    #[command(subcommand)]
+    Network(NetworkCommand),
 }
 
 #[derive(Subcommand)]
@@ -276,6 +279,79 @@ enum PeerCommand {
         peer: String,
     },
     List,
+}
+
+#[derive(Subcommand)]
+enum NetworkCommand {
+    /// Show the listening port and the addresses put in invite codes.
+    Show,
+    /// Listen on a fixed UDP port (to forward it on your router), or "auto".
+    Port {
+        #[arg(value_parser = parse_port)]
+        port: PortArg,
+    },
+    /// Add an IP address or domain name (optionally with :port) to invite codes.
+    Add { address: String },
+    /// Remove an address from invite codes.
+    Remove { address: String },
+}
+
+#[derive(Clone, Copy)]
+struct PortArg(Option<u16>);
+
+fn parse_port(s: &str) -> Result<PortArg, String> {
+    if s.eq_ignore_ascii_case("auto") {
+        return Ok(PortArg(None));
+    }
+    match s.parse::<u16>() {
+        Ok(p) if p > 0 => Ok(PortArg(Some(p))),
+        _ => Err("expected a port from 1 to 65535, or \"auto\"".into()),
+    }
+}
+
+fn print_network(info: &NetworkInfo) {
+    match info.settings.listen_port {
+        Some(port) => println!("listening port  {port} (UDP)"),
+        None => println!("listening port  random (set one with `kinvault network port <port>`)"),
+    }
+    let bound: Vec<String> = info.bound.iter().map(|a| a.to_string()).collect();
+    println!("listening on    {}", bound.join(", "));
+    if info.restart_required {
+        println!("                restart kinvaultd to use the new port");
+    }
+    if info.settings.public_hosts.is_empty() {
+        println!("invite codes    automatic addresses only");
+    } else {
+        println!("invite codes    automatic addresses, plus:");
+        for host in &info.settings.public_hosts {
+            println!("  {host}");
+        }
+        let portless = info
+            .settings
+            .public_hosts
+            .iter()
+            .any(|h| h.parse::<HostAddr>().is_ok_and(|h| h.port().is_none()));
+        if portless && info.settings.listen_port.is_none() {
+            println!(
+                "\nAddresses without a port use the listening port, which changes when\n\
+                 kinvaultd restarts. Set a fixed one with `kinvault network port <port>`."
+            );
+        }
+    }
+}
+
+async fn get_network(client: &mut Client) -> Result<NetworkInfo> {
+    match client.call(&Request::GetNetwork).await? {
+        Reply::Network(info) => Ok(info),
+        _ => bail!("unexpected reply"),
+    }
+}
+
+async fn set_network(client: &mut Client, settings: NetworkSettings) -> Result<NetworkInfo> {
+    match client.call(&Request::SetNetwork(settings)).await? {
+        Reply::Network(info) => Ok(info),
+        _ => bail!("unexpected reply"),
+    }
 }
 
 fn kit_passphrase(confirm: bool) -> Result<String> {
@@ -695,6 +771,7 @@ async fn main() -> Result<()> {
                     }
                     Event::SetsChanged => println!("(backup sets changed)"),
                     Event::PeersChanged => println!("(peers changed)"),
+                    Event::NetworkChanged => println!("(network settings changed)"),
                 }
             }
             println!("kinvaultd stopped");
@@ -906,6 +983,29 @@ async fn main() -> Result<()> {
                     println!("  hosts our backups: {space}");
                 }
             }
+        }
+        Command::Network(NetworkCommand::Show) => {
+            print_network(&get_network(&mut client).await?);
+        }
+        Command::Network(NetworkCommand::Port { port }) => {
+            let mut settings = get_network(&mut client).await?.settings;
+            settings.listen_port = port.0;
+            print_network(&set_network(&mut client, settings).await?);
+        }
+        Command::Network(NetworkCommand::Add { address }) => {
+            let mut settings = get_network(&mut client).await?.settings;
+            settings.public_hosts.push(address);
+            print_network(&set_network(&mut client, settings).await?);
+        }
+        Command::Network(NetworkCommand::Remove { address }) => {
+            let address = address.parse::<HostAddr>()?.to_string();
+            let mut settings = get_network(&mut client).await?.settings;
+            let before = settings.public_hosts.len();
+            settings.public_hosts.retain(|h| *h != address);
+            if settings.public_hosts.len() == before {
+                bail!("{address} is not in the list; see `kinvault network show`");
+            }
+            print_network(&set_network(&mut client, settings).await?);
         }
     }
     Ok(())

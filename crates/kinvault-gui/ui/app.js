@@ -14,6 +14,7 @@ const state = {
   status: null, // DaemonStatus
   peers: [],
   invites: [],
+  network: null, // NetworkInfo
   progress: {}, // set id -> latest Progress event
   autostart: false,
   restoreSet: null,
@@ -291,6 +292,16 @@ async function refreshPeers() {
     return;
   }
   render();
+}
+
+async function refreshNetwork() {
+  if (!state.connected) return;
+  try {
+    state.network = await call("get_network");
+  } catch (e) {
+    return;
+  }
+  if (state.page === "settings") render();
 }
 
 let refreshTimer = null;
@@ -767,6 +778,21 @@ function renderSettings() {
       el("div", { class: "muted" }, "Version"), el("div", {}, s.version)));
   }
 
+  const n = state.network;
+  if (n) {
+    const hosts = n.public_hosts.length
+      ? el("div", {}, ...n.public_hosts.map((h) => el("div", { class: "mono" }, h)))
+      : el("div", { class: "muted" }, "None (only addresses found automatically)");
+    const port = el("div", {},
+      n.listen_port ? `${n.listen_port} (UDP)` : "Random",
+      el("div", { class: "muted small" }, `Listening on ${n.bound.join(", ")}`),
+      n.restart_required ? el("div", { class: "muted small" }, "The new port is used once the background service restarts.") : null);
+    page.append(el("h2", {}, "Network"), el("div", { class: "card kv" },
+      el("div", { class: "muted" }, "Listening port"), port,
+      el("div", { class: "muted" }, "Addresses in invite codes"), hosts,
+      el("div", {}), el("div", { class: "actions" }, el("button", { class: "btn small", onclick: networkDialog }, "Change…"))));
+  }
+
   page.append(el("h2", {}, "Recovery"));
   const exportBtn = el("button", { class: "btn primary", disabled: !state.connected, onclick: exportKit }, "Export recovery kit…");
   const importBtn = el("button", { class: "btn", disabled: state.connected, onclick: importKit }, "Import recovery kit…");
@@ -777,6 +803,41 @@ function renderSettings() {
     el("div", { class: "actions" }, exportBtn, importBtn),
     state.connected ? el("div", { class: "muted small", style: "margin-top:8px" },
       "To import a kit on a new computer, do it before the background service first starts (stop it if it's running).") : null));
+}
+
+async function networkDialog() {
+  const n = state.network;
+  const v = await form({
+    title: "Network",
+    intro: "Invite codes include the addresses KinVault finds by itself. If friends can reach this computer some other way, " +
+      "such as a static IP or a dynamic DNS name with a port forwarded on your router, add it here.",
+    fields: [
+      { name: "port", label: "Listening port (UDP)", type: "number", min: "1", step: "1", placeholder: "Random", value: n.listen_port ?? "",
+        hint: "Pick a fixed port to forward it on your router. Takes effect when the background service restarts." },
+      { name: "hosts", label: "Extra addresses, one per line", type: "textarea", placeholder: "home.example.org\n203.0.113.7:4433", value: n.public_hosts.join("\n"),
+        hint: "IP addresses or domain names, optionally with :port (the listening port is used otherwise). Domains are looked up on every connection, so dynamic DNS works." },
+    ],
+    ok: "Save",
+    validate: (v) => {
+      if (v.port === "") return null;
+      const p = Number(v.port);
+      return Number.isInteger(p) && p >= 1 && p <= 65535 ? null : "The port must be a whole number from 1 to 65535.";
+    },
+    onSubmit: async (v) => {
+      state.network = await call("set_network", {
+        listen_port: v.port === "" ? null : Number(v.port),
+        public_hosts: v.hosts.split("\n").map((h) => h.trim()).filter(Boolean),
+      });
+    },
+  });
+  if (v) {
+    const hasPort = (h) => /^\[.*\]:\d+$/.test(h) || (/:\d+$/.test(h) && h.split(":").length === 2);
+    const portless = state.network.public_hosts.some((h) => !hasPort(h));
+    toast(portless && !state.network.listen_port
+      ? "Saved. Addresses without a port use the listening port, which is random until you set one."
+      : "Network settings saved.");
+    render();
+  }
 }
 
 async function exportKit() {
@@ -819,6 +880,7 @@ function go(page) {
   state.page = page;
   for (const b of document.querySelectorAll(".nav-item")) b.classList.toggle("active", b.dataset.page === page);
   if (page === "friends" || page === "backups") refreshPeers();
+  if (page === "settings") refreshNetwork();
   render();
   document.getElementById("main").scrollTop = 0;
 }
@@ -828,9 +890,10 @@ for (const b of document.querySelectorAll(".nav-item")) b.addEventListener("clic
 async function setConnected(connected) {
   state.connected = connected;
   if (connected) {
-    await Promise.all([refreshStatus(), refreshPeers()]);
+    await Promise.all([refreshStatus(), refreshPeers(), refreshNetwork()]);
   } else {
     state.status = null;
+    state.network = null;
     state.progress = {};
   }
   render();
@@ -860,6 +923,9 @@ listen("daemon-event", (e) => {
     }
     case "peers_changed":
       refreshPeers();
+      break;
+    case "network_changed":
+      refreshNetwork();
       break;
     default:
       refreshSoon();

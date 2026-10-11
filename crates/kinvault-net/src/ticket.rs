@@ -10,6 +10,8 @@ const PREFIX: &str = "kvinvite1";
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct InviteTicket {
     pub host: EndpointAddr,
+    /// Addresses the host's owner configured (IPs or domain names, with ports).
+    pub hosts: Vec<String>,
     pub host_name: String,
     /// One-time secret; the host only stores its hash.
     pub token: [u8; 16],
@@ -51,6 +53,7 @@ mod tests {
             .with_ip_addr("192.0.2.1:4433".parse().unwrap());
         let t = InviteTicket {
             host: addr,
+            hosts: vec!["backup.example.org:4433".into()],
             host_name: "alice-nas".into(),
             token: [7; 16],
             quota_bytes: Some(1 << 40),

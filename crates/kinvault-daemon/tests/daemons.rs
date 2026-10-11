@@ -7,8 +7,8 @@ use std::time::Duration;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, SecretKey};
 use kinvault_daemon::api::{
-    BackupSummary, CreateInvite, CreateSet, GrantSpec, HostOffer, Reply, Request, SetState,
-    SetStatus, Target, TimeWindow,
+    BackupSummary, CreateInvite, CreateSet, GrantSpec, HostOffer, NetworkSettings, Reply, Request,
+    SetState, SetStatus, Target, TimeWindow,
 };
 use kinvault_daemon::{Daemon, DaemonOptions, ipc};
 
@@ -730,4 +730,121 @@ async fn subscribers_see_state_changes_and_results() {
 
     server.abort();
     daemon.shutdown().await;
+}
+
+fn peer_hosts(state: &Path, id: &str) -> serde_json::Value {
+    let config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(state.join("config.json")).unwrap()).unwrap();
+    let peer = config["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == id)
+        .unwrap_or_else(|| panic!("no peer {id} in {config}"));
+    peer["hosts"].clone()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn configured_addresses_travel_in_invites() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (alice_state, bob_state) = (tmp.path().join("alice"), tmp.path().join("bob"));
+    let alice = start(&alice_state, SecretKey::generate()).await;
+    let bob = start(&bob_state, SecretKey::generate()).await;
+    let network = |reply| match reply {
+        Reply::Network(info) => info,
+        other => panic!("{other:?}"),
+    };
+
+    let info = network(call(&alice, Request::GetNetwork).await);
+    assert_eq!(info.settings, NetworkSettings::default());
+    assert!(!info.restart_required);
+    let port = info.bound[0].port();
+
+    for bad in ["not a host!", "example.org:0", "2001:db8::1:4433:x"] {
+        let err = alice
+            .handle(Request::SetNetwork(NetworkSettings {
+                listen_port: None,
+                public_hosts: vec![bad.into()],
+            }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("invalid address"), "{bad}: {err}");
+    }
+
+    // Entries are normalised and deduplicated; a new port needs a restart.
+    let info = network(
+        call(
+            &alice,
+            Request::SetNetwork(NetworkSettings {
+                listen_port: Some(4567),
+                public_hosts: vec![
+                    "LOCALHOST".into(),
+                    "198.51.100.4:7000".into(),
+                    "localhost".into(),
+                ],
+            }),
+        )
+        .await,
+    );
+    assert_eq!(
+        info.settings.public_hosts,
+        ["localhost", "198.51.100.4:7000"]
+    );
+    assert!(info.restart_required);
+    let info = network(
+        call(
+            &alice,
+            Request::SetNetwork(NetworkSettings {
+                listen_port: None,
+                ..info.settings
+            }),
+        )
+        .await,
+    );
+    assert!(!info.restart_required);
+    call(
+        &bob,
+        Request::SetNetwork(NetworkSettings {
+            listen_port: None,
+            public_hosts: vec!["192.0.2.10:9000".into()],
+        }),
+    )
+    .await;
+
+    // The invite carries Alice's addresses, with her listening port filled in.
+    let Reply::Invite { ticket, .. } = call(
+        &alice,
+        Request::CreateInvite(CreateInvite {
+            ask_reciprocal: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    else {
+        panic!()
+    };
+    let decoded = kinvault_net::InviteTicket::decode(&ticket).unwrap();
+    let alice_hosts = vec![format!("localhost:{port}"), "198.51.100.4:7000".to_string()];
+    assert_eq!(decoded.hosts, alice_hosts);
+
+    call(
+        &bob,
+        Request::RedeemInvite {
+            ticket,
+            name: None,
+            offer: Some(GrantSpec::default()),
+        },
+    )
+    .await;
+    // Each side remembers the other's addresses.
+    assert_eq!(
+        peer_hosts(&bob_state, &alice.id().to_string()),
+        serde_json::json!(alice_hosts)
+    );
+    assert_eq!(
+        peer_hosts(&alice_state, &bob.id().to_string()),
+        serde_json::json!(["192.0.2.10:9000"])
+    );
+    alice.shutdown().await;
+    bob.shutdown().await;
 }

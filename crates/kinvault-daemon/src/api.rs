@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 pub use kinvault_core::RetentionPolicy;
-pub use kinvault_net::TimeWindow;
+pub use kinvault_net::{HostAddr, TimeWindow};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -93,6 +93,10 @@ pub enum Request {
     CancelInvite {
         id: String,
     },
+    /// This instance's listening port and the addresses it puts in invites.
+    GetNetwork,
+    /// Changes them. A new port takes effect when the daemon restarts.
+    SetNetwork(NetworkSettings),
     /// Redeems a friend's invite code, optionally offering them storage in return.
     RedeemInvite {
         ticket: String,
@@ -173,6 +177,25 @@ pub enum Target {
     },
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkSettings {
+    /// Fixed UDP port to listen on; `None` picks a random free port at start.
+    pub listen_port: Option<u16>,
+    /// IPs or domain names, each with an optional `:port` (default: the
+    /// listening port), that invite codes tell friends to try.
+    pub public_hosts: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct NetworkInfo {
+    #[serde(flatten)]
+    pub settings: NetworkSettings,
+    /// Local addresses the daemon is listening on right now.
+    pub bound: Vec<SocketAddr>,
+    /// The listening port was changed; restart the daemon to use it.
+    pub restart_required: bool,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Reply {
     Status(DaemonStatus),
@@ -206,6 +229,7 @@ pub enum Reply {
         json: String,
     },
     Subscribed,
+    Network(NetworkInfo),
 }
 
 /// Something changed in the daemon; streamed to subscribers.
@@ -235,6 +259,8 @@ pub enum Event {
     SetsChanged,
     /// Peers or invites changed.
     PeersChanged,
+    /// The listening port or public addresses changed.
+    NetworkChanged,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

@@ -259,6 +259,7 @@ async fn invites_grant_access_once() {
             }
             *used = true;
             assert_eq!(r.name.as_deref(), Some("bob"));
+            assert_eq!(r.hosts, ["bob.example.org:4433"]);
             assert_eq!(
                 r.offer,
                 Some(Offer {
@@ -280,8 +281,11 @@ async fn invites_grant_access_once() {
     });
     host.receiver.set_invite_handler(handler);
 
+    // Only the configured host name says where the host is.
+    let port = host.router.endpoint().bound_sockets()[0].port();
     let mut ticket = InviteTicket {
-        host: host.addr(),
+        host: EndpointAddr::new(host.router.endpoint().id()),
+        hosts: vec![format!("localhost:{port}")],
         host_name: "alice".into(),
         token: [0; 16],
         quota_bytes: Some(1 << 20),
@@ -294,7 +298,7 @@ async fn invites_grant_access_once() {
     });
 
     // Wrong token: refused, and still no access.
-    let err = redeem_invite(&ep, &ticket, Some("bob".into()), offer)
+    let err = redeem_invite(&ep, &ticket, Some("bob".into()), offer, bob_hosts())
         .await
         .unwrap_err();
     assert!(matches!(err, NetError::Denied(_)), "{err}");
@@ -304,7 +308,7 @@ async fn invites_grant_access_once() {
     ));
 
     ticket.token = token;
-    let accepted = redeem_invite(&ep, &ticket, Some("bob".into()), offer)
+    let accepted = redeem_invite(&ep, &ticket, Some("bob".into()), offer, bob_hosts())
         .await
         .unwrap();
     assert_eq!(accepted.host_name, "alice");
@@ -312,11 +316,15 @@ async fn invites_grant_access_once() {
 
     // Single use.
     assert!(
-        redeem_invite(&ep, &ticket, Some("bob".into()), offer)
+        redeem_invite(&ep, &ticket, Some("bob".into()), offer, bob_hosts())
             .await
             .is_err()
     );
     host.router.shutdown().await.unwrap();
+}
+
+fn bob_hosts() -> Vec<String> {
+    vec!["bob.example.org:4433".into()]
 }
 
 #[tokio::test(flavor = "multi_thread")]

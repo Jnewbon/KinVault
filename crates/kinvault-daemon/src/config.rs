@@ -19,6 +19,12 @@ pub struct Config {
     /// Days that data a peer deletes is kept before it is really removed.
     #[serde(default = "default_grace_days")]
     pub trash_grace_days: u64,
+    /// Fixed UDP port to listen on (random if unset), for port forwarding.
+    #[serde(default)]
+    pub listen_port: Option<u16>,
+    /// Addresses (IPs or domain names, optional port) put in invite codes.
+    #[serde(default)]
+    pub public_hosts: Vec<String>,
     #[serde(default)]
     pub peers: Vec<PeerEntry>,
     #[serde(default)]
@@ -39,6 +45,9 @@ pub struct PeerEntry {
     /// Known direct addresses (from an invite); discovery is used otherwise.
     #[serde(default)]
     pub addrs: Vec<SocketAddr>,
+    /// Addresses its owner configured (`host:port`), resolved at each connection.
+    #[serde(default)]
+    pub hosts: Vec<String>,
     /// Set if this peer may store backups here.
     #[serde(default)]
     pub grant: Option<api::GrantSpec>,
@@ -89,6 +98,8 @@ pub enum StoredTarget {
         repo: String,
         #[serde(default)]
         addrs: Vec<SocketAddr>,
+        #[serde(default)]
+        hosts: Vec<String>,
     },
 }
 
@@ -113,6 +124,7 @@ impl Config {
                     id: id.to_string(),
                     name: None,
                     addrs: Vec::new(),
+                    hosts: Vec::new(),
                     grant: None,
                     hosts_us: None,
                 });

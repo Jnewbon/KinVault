@@ -9,8 +9,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use kinvault_core::{KeyFile, LocalDirBackend, MasterKey};
 use kinvault_net::{
-    Endpoint, EndpointId, InviteAccepted, InviteRedemption, InviteTicket, Offer, Receiver,
-    RemoteBackend,
+    Endpoint, EndpointId, HostAddr, InviteAccepted, InviteRedemption, InviteTicket, Offer,
+    Receiver, RemoteBackend,
 };
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex, broadcast, oneshot};
@@ -45,6 +45,8 @@ struct Inner {
     router: kinvault_net::Router,
     receiver: Receiver,
     hosting_store: PathBuf,
+    /// The `listen_port` the endpoint was bound with.
+    listen_port: Option<u16>,
     runtime: Handle,
     // Lock order: config, then sets.
     config: Mutex<Config>,
@@ -69,7 +71,7 @@ impl Daemon {
             Some(ep) => ep,
             None => {
                 let secret = kinvault_net::load_or_create_secret(&state_dir.join("identity.key"))?;
-                kinvault_net::bind(secret).await?
+                kinvault_net::bind(secret, config.listen_port).await?
             }
         };
 
@@ -96,6 +98,7 @@ impl Daemon {
                 router,
                 receiver,
                 hosting_store,
+                listen_port: config.listen_port,
                 runtime: Handle::current(),
                 sets: Mutex::new(HashMap::new()),
                 config: Mutex::new(config.clone()),
@@ -210,6 +213,7 @@ impl Daemon {
             | Request::CreateInvite(_)
             | Request::CancelInvite { .. }
             | Request::RedeemInvite { .. } => Some(Event::PeersChanged),
+            Request::SetNetwork(_) => Some(Event::NetworkChanged),
             _ => None,
         };
         let result = self.dispatch(req).await.map_err(|e| format!("{e:#}"));
@@ -350,7 +354,13 @@ impl Daemon {
             }
             Request::RemoteUsage { set } => {
                 let env = self.find_set(&set).await?;
-                let StoredTarget::Peer { id, repo, addrs } = &env.set.target else {
+                let StoredTarget::Peer {
+                    id,
+                    repo,
+                    addrs,
+                    hosts,
+                } = &env.set.target
+                else {
                     bail!("set {:?} is stored locally, not on a peer", env.set.name);
                 };
                 let remote = RemoteBackend::new(
@@ -358,7 +368,8 @@ impl Daemon {
                     peer_addr(id, addrs)?,
                     repo,
                     env.runtime.clone(),
-                )?;
+                )?
+                .with_hosts(hosts.clone());
                 let status = remote.status().await?;
                 Ok(Reply::Usage {
                     used_bytes: status.used_bytes,
@@ -440,6 +451,27 @@ impl Daemon {
                 ensure!(config.invites.len() < before, "no invite with id {id:?}");
                 config.save(&self.config_path())?;
                 Ok(Reply::Done)
+            }
+            Request::GetNetwork => self.network().await,
+            Request::SetNetwork(mut settings) => {
+                ensure!(
+                    settings.listen_port != Some(0),
+                    "the port must be from 1 to 65535"
+                );
+                let mut hosts = Vec::new();
+                for entry in &settings.public_hosts {
+                    let host = entry.parse::<HostAddr>()?.to_string();
+                    if !hosts.contains(&host) {
+                        hosts.push(host);
+                    }
+                }
+                settings.public_hosts = hosts;
+                let mut config = self.inner.config.lock().await;
+                config.listen_port = settings.listen_port;
+                config.public_hosts = settings.public_hosts;
+                config.save(&self.config_path())?;
+                drop(config);
+                self.network().await
             }
             Request::RedeemInvite {
                 ticket,
@@ -539,6 +571,39 @@ impl Daemon {
         }))
     }
 
+    async fn network(&self) -> Result<Reply> {
+        let config = self.inner.config.lock().await;
+        Ok(Reply::Network(api::NetworkInfo {
+            settings: api::NetworkSettings {
+                listen_port: config.listen_port,
+                public_hosts: config.public_hosts.clone(),
+            },
+            bound: self.inner.endpoint.bound_sockets(),
+            restart_required: config.listen_port != self.inner.listen_port,
+        }))
+    }
+
+    /// The configured public addresses, with the port this instance is
+    /// actually listening on filled in where none was given.
+    fn public_hosts(&self, config: &Config) -> Vec<String> {
+        let bound = self.inner.endpoint.bound_sockets();
+        let port = bound
+            .iter()
+            .find(|a| a.is_ipv4())
+            .or(bound.first())
+            .map(|a| a.port());
+        config
+            .public_hosts
+            .iter()
+            .filter_map(|h| h.parse::<HostAddr>().ok())
+            .filter_map(|h| match (h.port(), port) {
+                (Some(_), _) => Some(h.to_string()),
+                (None, Some(port)) => Some(h.or_port(port).to_string()),
+                (None, None) => None,
+            })
+            .collect()
+    }
+
     async fn create_set(&self, req: api::CreateSet) -> Result<Reply> {
         let name = req.name.trim().to_string();
         ensure!(!name.is_empty(), "set name must not be empty");
@@ -562,11 +627,22 @@ impl Daemon {
             }
             api::Target::Peer { id, addrs } => {
                 let (id, known) = resolve_peer(&config, &id)?;
+                let hosts = config
+                    .peers
+                    .iter()
+                    .find(|p| p.id == id)
+                    .map(|p| p.hosts.clone())
+                    .unwrap_or_default();
                 self.parse_peer_id(&id)
                     .context("a set can't be stored on this same instance")?;
                 let addrs = if addrs.is_empty() { known } else { addrs };
                 let repo = hex::encode(kinvault_core::crypto::random_bytes::<12>()?);
-                StoredTarget::Peer { id, repo, addrs }
+                StoredTarget::Peer {
+                    id,
+                    repo,
+                    addrs,
+                    hosts,
+                }
             }
         };
         ensure!(
@@ -634,6 +710,7 @@ impl Daemon {
         let mut config = self.inner.config.lock().await;
         let ticket = InviteTicket {
             host: self.inner.endpoint.addr(),
+            hosts: self.public_hosts(&config),
             host_name: Self::instance_name(&config),
             token,
             quota_bytes: req.grant.quota_bytes,
@@ -674,6 +751,9 @@ impl Daemon {
         let entry = config.peer_mut(&peer_id);
         entry.grant = Some(invite.grant);
         entry.name = invite.name.clone().or(r.name.clone()).or(entry.name.take());
+        if !r.hosts.is_empty() {
+            entry.hosts = r.hosts.clone();
+        }
         if let Some(offer) = r.offer {
             entry.hosts_us = Some(HostOffer {
                 quota_bytes: offer.quota_bytes,
@@ -707,7 +787,10 @@ impl Daemon {
             ticket.host.id != self.id(),
             "this invite was created by this instance"
         );
-        let my_name = Self::instance_name(&*self.inner.config.lock().await);
+        let (my_name, my_hosts) = {
+            let config = self.inner.config.lock().await;
+            (Self::instance_name(&config), self.public_hosts(&config))
+        };
         let accepted = kinvault_net::redeem_invite(
             &self.inner.endpoint,
             &ticket,
@@ -715,6 +798,7 @@ impl Daemon {
             offer.map(|g| Offer {
                 quota_bytes: g.quota_bytes,
             }),
+            my_hosts,
         )
         .await?;
 
@@ -723,6 +807,7 @@ impl Daemon {
         let entry = config.peer_mut(&host_id);
         entry.name = name.or(Some(accepted.host_name.clone()));
         entry.addrs = ticket.host.ip_addrs().copied().collect();
+        entry.hosts = ticket.hosts.clone();
         entry.hosts_us = Some(HostOffer {
             quota_bytes: accepted.quota_bytes,
         });

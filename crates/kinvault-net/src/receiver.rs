@@ -38,6 +38,7 @@ pub struct InviteRedemption {
     pub token: [u8; 16],
     pub name: Option<String>,
     pub offer: Option<Offer>,
+    pub hosts: Vec<String>,
 }
 
 /// What the host tells a peer whose invite was accepted.
@@ -226,13 +227,20 @@ impl Receiver {
         req: Request,
         recv: &mut RecvStream,
     ) -> Result<Reply, Failure> {
-        if let Op::RedeemInvite { token, name, offer } = req.op {
+        if let Op::RedeemInvite {
+            token,
+            name,
+            offer,
+            hosts,
+        } = req.op
+        {
             return self
                 .redeem(InviteRedemption {
                     peer,
                     token,
                     name,
                     offer,
+                    hosts,
                 })
                 .await;
         }

@@ -8,6 +8,7 @@ use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 
 use crate::error::{NetError, transport};
+use crate::hosts::with_hosts;
 use crate::limits::RateLimiter;
 use crate::protocol::{
     ALPN, MAX_OBJECT_LEN, Offer, Op, Request, Response, read_msg, read_payload, valid_repo_name,
@@ -32,6 +33,7 @@ pub struct RemoteBackend {
     addr: EndpointAddr,
     repo: String,
     runtime: Handle,
+    hosts: Vec<String>,
     conn: Mutex<Option<Connection>>,
     upload_limit: Option<Arc<RateLimiter>>,
 }
@@ -53,6 +55,7 @@ impl RemoteBackend {
             addr: addr.into(),
             repo: repo.to_string(),
             runtime,
+            hosts: Vec::new(),
             conn: Mutex::new(None),
             upload_limit: None,
         })
@@ -61,6 +64,13 @@ impl RemoteBackend {
     /// Paces uploads to at most `bytes_per_sec`.
     pub fn with_upload_limit(mut self, bytes_per_sec: Option<u64>) -> Self {
         self.upload_limit = bytes_per_sec.map(|r| Arc::new(RateLimiter::new(r)));
+        self
+    }
+
+    /// Also dials these configured addresses (see [`crate::HostAddr`]),
+    /// resolved afresh for every connection.
+    pub fn with_hosts(mut self, hosts: Vec<String>) -> Self {
+        self.hosts = hosts;
         self
     }
 
@@ -86,7 +96,7 @@ impl RemoteBackend {
         }
         let conn = self
             .endpoint
-            .connect(self.addr.clone(), ALPN)
+            .connect(with_hosts(self.addr.clone(), &self.hosts).await, ALPN)
             .await
             .map_err(transport)?;
         *guard = Some(conn.clone());
@@ -169,15 +179,16 @@ async fn call_once(
 }
 
 /// Claims an invite on the host it was issued by. On success this peer may
-/// store backups there.
+/// store backups there. `hosts` are this peer's configured addresses.
 pub async fn redeem_invite(
     endpoint: &Endpoint,
     ticket: &InviteTicket,
     name: Option<String>,
     offer: Option<Offer>,
+    hosts: Vec<String>,
 ) -> Result<InviteAccepted, NetError> {
     let conn = endpoint
-        .connect(ticket.host.clone(), ALPN)
+        .connect(with_hosts(ticket.host.clone(), &ticket.hosts).await, ALPN)
         .await
         .map_err(transport)?;
     let req = Request {
@@ -186,6 +197,7 @@ pub async fn redeem_invite(
             token: ticket.token,
             name,
             offer,
+            hosts,
         },
     };
     let result = call_once(&conn, &req, None, None).await;

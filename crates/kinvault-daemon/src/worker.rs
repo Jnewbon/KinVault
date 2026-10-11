@@ -108,14 +108,20 @@ impl SetEnv {
         let master = read_master_key(&self.set_dir)?;
         let backend: Box<dyn Backend> = match &self.set.target {
             StoredTarget::Local { path } => Box::new(LocalDirBackend::open(path)?),
-            StoredTarget::Peer { id, repo, addrs } => Box::new(
+            StoredTarget::Peer {
+                id,
+                repo,
+                addrs,
+                hosts,
+            } => Box::new(
                 RemoteBackend::new(
                     self.endpoint.clone(),
                     peer_addr(id, addrs)?,
                     repo,
                     self.runtime.clone(),
                 )?
-                .with_upload_limit(self.set.upload_limit),
+                .with_upload_limit(self.set.upload_limit)
+                .with_hosts(hosts.clone()),
             ),
         };
         let index = Index::open(&self.set_dir.join("index.db"))?;

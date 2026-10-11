@@ -61,6 +61,9 @@ pub enum Op {
         name: Option<String>,
         /// Storage the redeeming peer offers the host in return.
         offer: Option<Offer>,
+        /// Addresses the redeeming peer's owner configured, so the host can
+        /// reach it for reciprocal backups.
+        hosts: Vec<String>,
     },
 }
 

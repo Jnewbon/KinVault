@@ -97,6 +97,23 @@ kinvault status
 kinvault recovery export ~/kinvault-recovery.json   # keep this off this machine
 ```
 
+### Reaching your instance at your own address
+
+Invite codes include the addresses an instance finds by itself. If friends can
+reach it some other way, such as a static IP or a (dynamic) DNS name with a
+port forwarded on your router, add that address so invite codes include it too:
+
+```sh
+kinvault network port 47123             # listen on a fixed UDP port (restart kinvaultd)
+kinvault network add home.example.org   # uses the listening port
+kinvault network add 203.0.113.7:4433   # or give a port explicitly
+kinvault network show
+```
+
+Friends who redeem the code remember these addresses and look domain names up
+again on every connection, so a dynamic DNS name keeps working when your IP
+changes. The same settings are under Settings → Network in the desktop app.
+
 Restoring: `kinvault snapshots documents`, then
 `kinvault restore documents latest ~/restored`. On a new machine, run
 `kinvault recovery import <kit>` before starting `kinvaultd`; imported sets
