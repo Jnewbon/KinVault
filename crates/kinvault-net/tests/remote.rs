@@ -149,11 +149,7 @@ async fn backup_and_restore_through_remote_host() {
     .await
     .unwrap();
 
-    let root = fs::canonicalize(&src)
-        .unwrap()
-        .to_string_lossy()
-        .trim_start_matches('/')
-        .to_string();
+    let root = kinvault_core::snapshot_root_name(&fs::canonicalize(&src).unwrap());
     assert_eq!(
         fs::read(out.join(&root).join("diary.txt")).unwrap(),
         MARKER.repeat(500)

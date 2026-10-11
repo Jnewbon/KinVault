@@ -112,12 +112,9 @@ fn prune_removes_old_snapshots_and_frees_their_data() {
     assert_eq!(fresh.list_snapshots().unwrap().len(), 1);
     let out = tmp.path().join("out");
     fresh.restore(&latest, &out, None).unwrap();
-    let root = out.join(
-        fs::canonicalize(&src)
-            .unwrap()
-            .to_string_lossy()
-            .trim_start_matches('/'),
-    );
+    let root = out.join(kinvault_core::snapshot_root_name(
+        &fs::canonicalize(&src).unwrap(),
+    ));
     assert_eq!(fs::read(root.join("notes.txt")).unwrap(), b"v2");
     assert_eq!(fs::read(root.join("new.txt")).unwrap(), b"new");
     assert!(!root.join("big.bin").exists());
@@ -147,12 +144,9 @@ fn prune_rewrites_mostly_dead_packs() {
 
     let out = tmp.path().join("out");
     repo.restore(&latest, &out, None).unwrap();
-    let root = out.join(
-        fs::canonicalize(&src)
-            .unwrap()
-            .to_string_lossy()
-            .trim_start_matches('/'),
-    );
+    let root = out.join(kinvault_core::snapshot_root_name(
+        &fs::canonicalize(&src).unwrap(),
+    ));
     assert_eq!(
         fs::read(root.join("keep.bin")).unwrap(),
         random(100 << 10, "keep")

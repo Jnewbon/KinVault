@@ -162,12 +162,9 @@ async fn daemon_backs_up_changes_to_peer() {
         },
     )
     .await;
-    let restored = out.join(
-        fs::canonicalize(&src)
-            .unwrap()
-            .to_string_lossy()
-            .trim_start_matches('/'),
-    );
+    let restored = out.join(kinvault_core::snapshot_root_name(
+        &fs::canonicalize(&src).unwrap(),
+    ));
     assert_eq!(
         fs::read(restored.join("notes.md")).unwrap(),
         b"# notes\nmore"
@@ -623,12 +620,9 @@ async fn recovery_kit_restores_backups_on_a_new_machine() {
         },
     )
     .await;
-    let restored = out.join(
-        fs::canonicalize(&src)
-            .unwrap()
-            .to_string_lossy()
-            .trim_start_matches('/'),
-    );
+    let restored = out.join(kinvault_core::snapshot_root_name(
+        &fs::canonicalize(&src).unwrap(),
+    ));
     assert_eq!(
         fs::read(restored.join("taxes.pdf")).unwrap(),
         b"2025 return, amended"

@@ -61,6 +61,21 @@ three in `/usr/bin`). The sidecars are built by `scripts/sidecars.mjs`, which
 `tauri.bundle.conf.json` runs before bundling; plain `cargo build` doesn't need
 them.
 
+### Releases
+
+GitHub Actions builds installers for every platform (`.github/workflows/release.yml`):
+
+1. Bump `version` in the root `Cargo.toml` and commit.
+2. Tag and push: `git tag v0.2.0 && git push origin v0.2.0`.
+3. A **draft** release appears with the Linux, macOS (Apple Silicon and Intel)
+   and Windows installers attached. Check it, then publish it.
+
+The tag must match the `Cargo.toml` version or the build stops. Running the
+workflow by hand from the Actions tab builds everything as downloadable
+artifacts without creating a release. `.github/workflows/ci.yml` runs
+formatting, clippy and the tests on Linux, macOS and Windows for every push
+and pull request.
+
 When run from an AppImage, the app copies `kinvaultd` to
 `~/.local/share/KinVault/bin/` before starting it or registering it to run at
 login, because the AppImage's own files disappear when the app exits.

@@ -189,11 +189,7 @@ fn backup_restore_incremental_and_opaque() {
     // Restore the latest snapshot and compare.
     let out = tmp.path().join("restore");
     repo.restore(&snap3, &out, None).unwrap();
-    let root_name = fs::canonicalize(&src)
-        .unwrap()
-        .to_string_lossy()
-        .trim_start_matches('/')
-        .to_string();
+    let root_name = kinvault_core::snapshot_root_name(&fs::canonicalize(&src).unwrap());
     assert_same(&src, &out.join(&root_name));
 
     // Fresh machine: only the master key and the store, with an empty index.

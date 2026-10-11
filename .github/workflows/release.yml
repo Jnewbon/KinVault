@@ -1,0 +1,93 @@
+name: Release
+
+# Push a tag like v0.2.0 (matching the version in Cargo.toml) to build
+# installers for every platform and attach them to a draft GitHub release.
+# Running it by hand builds everything and keeps the bundles as workflow
+# artifacts, without touching releases.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bundle:
+    name: Bundle (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Oldest supported Ubuntu runner, so the packages work on older glibc.
+          - name: Linux x86_64
+            platform: ubuntu-22.04
+            args: ''
+          - name: macOS Apple Silicon
+            platform: macos-latest
+            args: '--target aarch64-apple-darwin'
+          - name: macOS Intel
+            platform: macos-latest
+            args: '--target x86_64-apple-darwin'
+          - name: Windows x86_64
+            platform: windows-latest
+            args: ''
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check that the tag matches the version
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version} (expected v${version})"
+            exit 1
+          fi
+
+      - name: Install WebKitGTK and friends
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.args }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: crates/kinvault-gui/package-lock.json
+
+      - name: Install the Tauri CLI
+        working-directory: crates/kinvault-gui
+        run: npm ci
+
+      # tauri.bundle.conf.json builds kinvaultd and the kinvault CLI and ships
+      # them inside each bundle, next to the app.
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: crates/kinvault-gui
+          tauriScript: npx tauri
+          args: --config tauri.bundle.conf.json ${{ matrix.args }}
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          releaseName: KinVault ${{ github.ref_name }}
+          releaseBody: |
+            Installers for Linux (.deb, .rpm, AppImage), macOS (.dmg, Apple Silicon and Intel) and Windows (.msi, setup.exe).
+            Each installs the desktop app together with the kinvaultd background service and the kinvault command-line tool.
+            These builds are not code-signed yet: macOS and Windows will warn about an unidentified developer.
+          releaseDraft: true
+          uploadWorkflowArtifacts: true
+          workflowArtifactNamePattern: '[platform]-[arch]-[bundle]'

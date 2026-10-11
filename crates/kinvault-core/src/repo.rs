@@ -142,7 +142,7 @@ impl<B: Backend> Repository<B> {
         for src in sources {
             let abs = fs::canonicalize(src)
                 .map_err(|e| Error::NotFound(format!("backup source {}: {e}", src.display())))?;
-            let name = root_name(&abs);
+            let name = snapshot_root_name(&abs);
             if nodes.iter().any(|n| n.name == name) {
                 continue;
             }
@@ -555,8 +555,9 @@ impl<B: Backend> BackupRun<'_, B> {
 }
 
 /// Name of a source in the snapshot root: its absolute path without the
-/// leading separator, with Windows prefixes/drive colons flattened.
-fn root_name(abs: &Path) -> String {
+/// leading separator, with Windows prefixes/drive colons flattened. Restores
+/// recreate each source under this relative path.
+pub fn snapshot_root_name(abs: &Path) -> String {
     let s = abs.to_string_lossy().replace('\\', "/");
     let s = s.strip_prefix("//?/").unwrap_or(&s).replace(':', "");
     let s = s.trim_matches('/');
@@ -650,9 +651,15 @@ mod tests {
 
     #[test]
     fn root_names() {
-        assert_eq!(root_name(Path::new("/home/me/Docs")), "home/me/Docs");
-        assert_eq!(root_name(Path::new("/")), "root");
-        assert_eq!(root_name(Path::new(r"\\?\C:\Users\me")), "C/Users/me");
+        assert_eq!(
+            snapshot_root_name(Path::new("/home/me/Docs")),
+            "home/me/Docs"
+        );
+        assert_eq!(snapshot_root_name(Path::new("/")), "root");
+        assert_eq!(
+            snapshot_root_name(Path::new(r"\\?\C:\Users\me")),
+            "C/Users/me"
+        );
     }
 
     #[test]
