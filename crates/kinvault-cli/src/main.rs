@@ -4,8 +4,10 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
-use kinvault_daemon::api::{CreateSet, Reply, Request, SetState, Target};
+use clap::{Args, Parser, Subcommand};
+use kinvault_daemon::api::{
+    CreateInvite, CreateSet, GrantSpec, Reply, Request, SetState, Target, TimeWindow,
+};
 use kinvault_daemon::ipc::Client;
 
 const PASSPHRASE_ENV: &str = "KINVAULT_PASSPHRASE";
@@ -26,14 +28,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Show this instance's id and the state of every backup set.
+    /// Show this instance and the state of every backup set.
     Status,
-    /// Print this instance's id (give it to hosts so they can allow you).
+    /// Print this instance's id.
     Id,
+    /// Set the name friends see for this instance.
+    Name { name: String },
     /// Manage backup sets.
     #[command(subcommand)]
     Set(SetCommand),
-    /// Back up a set now and wait for it to finish.
+    /// Back up a set now (even outside its time window) and wait for it.
     Backup { set: String },
     /// List a set's snapshots.
     Snapshots { set: String },
@@ -46,9 +50,12 @@ enum Command {
         #[arg(long)]
         include: Option<String>,
     },
-    /// Show how much space a set's owner uses on the host it backs up to.
+    /// Show how much space a set uses on the host it backs up to.
     Usage { set: String },
-    /// Manage which peers may store backups on this instance.
+    /// Invite friends to store backups here, or accept their invites.
+    #[command(subcommand)]
+    Invite(InviteCommand),
+    /// Manage peers: who may store backups here, and who stores ours.
     #[command(subcommand)]
     Peer(PeerCommand),
 }
@@ -64,34 +71,116 @@ enum SetCommand {
         /// Store backups in a local directory (external disk, NAS mount).
         #[arg(long, conflicts_with = "peer", required_unless_present = "peer")]
         local: Option<PathBuf>,
-        /// Store backups on another KinVault instance, by its id.
+        /// Store backups on another instance: a peer's name or id.
         #[arg(long)]
         peer: Option<String>,
-        /// Known direct address of the peer (optional; it is found by id otherwise).
+        /// Known direct address of the peer (optional).
         #[arg(long, requires = "peer")]
         peer_addr: Vec<SocketAddr>,
         /// Seconds without changes before backing up.
         #[arg(long)]
         debounce: Option<u64>,
+        #[command(flatten)]
+        limits: SetLimits,
+    },
+    /// Change a set's upload limit and time window (omitted options are cleared).
+    Limits {
+        set: String,
+        #[command(flatten)]
+        limits: SetLimits,
     },
     /// Stop backing up a set. Existing backups and the set's key are kept.
     Remove { set: String },
 }
 
+#[derive(Args)]
+struct SetLimits {
+    /// Maximum upload speed per second, e.g. 2M.
+    #[arg(long, value_parser = parse_size)]
+    upload_limit: Option<u64>,
+    /// Only back up automatically during these hours, e.g. 01:00-07:00.
+    #[arg(long, value_parser = TimeWindow::parse)]
+    window: Option<TimeWindow>,
+}
+
+#[derive(Args)]
+struct GrantArgs {
+    /// Storage limit, e.g. 500G or 2T.
+    #[arg(long, value_parser = parse_size)]
+    quota: Option<u64>,
+    /// Maximum upload speed per second they may use, e.g. 5M.
+    #[arg(long, value_parser = parse_size)]
+    upload_limit: Option<u64>,
+    /// Only accept their uploads during these hours, e.g. 01:00-07:00.
+    #[arg(long, value_parser = TimeWindow::parse)]
+    window: Option<TimeWindow>,
+}
+
+impl GrantArgs {
+    fn spec(&self) -> GrantSpec {
+        GrantSpec {
+            quota_bytes: self.quota,
+            upload_limit: self.upload_limit,
+            window: self.window,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum InviteCommand {
+    /// Create a one-time invite code for a friend to store backups here.
+    Create {
+        /// What to call the friend once they join.
+        #[arg(long)]
+        name: Option<String>,
+        #[command(flatten)]
+        grant: GrantArgs,
+        /// Ask the friend to store your backups in return.
+        #[arg(long)]
+        ask_reciprocal: bool,
+        /// Days until the code expires.
+        #[arg(long, default_value_t = 7)]
+        expires_days: u64,
+    },
+    /// List invites that haven't been used yet.
+    List,
+    Cancel {
+        id: String,
+    },
+    /// Accept a friend's invite code so you can store backups with them.
+    Redeem {
+        code: String,
+        /// What to call this friend locally.
+        #[arg(long)]
+        name: Option<String>,
+        /// Offer them this much storage here in return, e.g. 500G.
+        #[arg(long, value_parser = parse_size)]
+        offer: Option<u64>,
+        /// Offer them unlimited storage here in return.
+        #[arg(long, conflicts_with = "offer")]
+        offer_unlimited: bool,
+        /// Maximum upload speed per second for their backups here.
+        #[arg(long, value_parser = parse_size)]
+        offer_upload_limit: Option<u64>,
+        /// Only accept their uploads during these hours.
+        #[arg(long, value_parser = TimeWindow::parse)]
+        offer_window: Option<TimeWindow>,
+    },
+}
+
 #[derive(Subcommand)]
 enum PeerCommand {
-    /// Allow a peer to store backups here.
+    /// Allow a peer (name or id) to store backups here, or change its limits.
     Allow {
         id: String,
         #[arg(long)]
         name: Option<String>,
-        /// Storage limit, e.g. 500G or 2T.
-        #[arg(long, value_parser = parse_size)]
-        quota: Option<u64>,
+        #[command(flatten)]
+        grant: GrantArgs,
     },
-    /// Stop accepting backups from a peer (data already stored is kept).
+    /// Stop accepting backups from a peer (name or id); what it stored is kept.
     Revoke {
-        id: String,
+        peer: String,
     },
     List,
 }
@@ -178,6 +267,21 @@ fn describe_target(t: &Target) -> String {
     }
 }
 
+fn describe_grant(g: &GrantSpec) -> String {
+    let mut parts = vec![
+        g.quota_bytes
+            .map(format_bytes)
+            .unwrap_or_else(|| "unlimited".into()),
+    ];
+    if let Some(rate) = g.upload_limit {
+        parts.push(format!("max {}/s", format_bytes(rate)));
+    }
+    if let Some(w) = g.window {
+        parts.push(format!("uploads {w}"));
+    }
+    parts.join(", ")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -193,7 +297,7 @@ async fn main() -> Result<()> {
             let Reply::Status(s) = client.call(&Request::Status).await? else {
                 bail!("unexpected reply")
             };
-            println!("instance {}", s.id);
+            println!("instance {} ({})", s.name, s.id);
             println!("hosting store {}", s.hosting_store.display());
             if s.sets.is_empty() {
                 println!("no backup sets; create one with `kinvault set create`");
@@ -202,6 +306,7 @@ async fn main() -> Result<()> {
                 let state = match set.state {
                     SetState::Idle => "up to date",
                     SetState::ChangesPending => "changes pending",
+                    SetState::WaitingForWindow => "waiting for its time window",
                     SetState::Running => "backing up",
                 };
                 println!(
@@ -211,6 +316,12 @@ async fn main() -> Result<()> {
                 );
                 for p in &set.paths {
                     println!("  {}", p.display());
+                }
+                if let Some(rate) = set.upload_limit {
+                    println!("  upload limit {}/s", format_bytes(rate));
+                }
+                if let Some(w) = set.window {
+                    println!("  backs up automatically during {w}");
                 }
                 match set.last_backup {
                     Some(b) => println!(
@@ -234,6 +345,10 @@ async fn main() -> Result<()> {
             };
             println!("{}", s.id);
         }
+        Command::Name { name } => {
+            client.call(&Request::SetInstanceName { name }).await?;
+            println!("Name set.");
+        }
         Command::Set(SetCommand::Create {
             name,
             paths,
@@ -241,6 +356,7 @@ async fn main() -> Result<()> {
             peer,
             peer_addr,
             debounce,
+            limits,
         }) => {
             let target = match (local, peer) {
                 (Some(path), _) => Target::Local { path },
@@ -257,6 +373,8 @@ async fn main() -> Result<()> {
                 recovery_passphrase: recovery_passphrase()?,
                 debounce_secs: debounce,
                 rescan_secs: None,
+                upload_limit: limits.upload_limit,
+                window: limits.window,
             });
             let Reply::SetCreated { id } = client.call(&req).await? else {
                 bail!("unexpected reply")
@@ -266,6 +384,15 @@ async fn main() -> Result<()> {
                 "Keep a copy of {} and your passphrase somewhere safe.",
                 state.join("sets").join(&id).join("keyfile.json").display()
             );
+        }
+        Command::Set(SetCommand::Limits { set, limits }) => {
+            let req = Request::SetLimits {
+                set,
+                upload_limit: limits.upload_limit,
+                window: limits.window,
+            };
+            client.call(&req).await?;
+            println!("Limits updated.");
         }
         Command::Set(SetCommand::Remove { set }) => {
             client.call(&Request::RemoveSet { set }).await?;
@@ -341,35 +468,138 @@ async fn main() -> Result<()> {
                 None => println!("using {} (no quota)", format_bytes(used_bytes)),
             }
         }
-        Command::Peer(PeerCommand::Allow { id, name, quota }) => {
+        Command::Invite(InviteCommand::Create {
+            name,
+            grant,
+            ask_reciprocal,
+            expires_days,
+        }) => {
+            let req = Request::CreateInvite(CreateInvite {
+                name,
+                grant: grant.spec(),
+                ask_reciprocal,
+                expires_secs: Some(expires_days * 24 * 60 * 60),
+            });
+            let Reply::Invite {
+                ticket,
+                expires_unix,
+                ..
+            } = client.call(&req).await?
+            else {
+                bail!("unexpected reply")
+            };
+            println!(
+                "Send this code to your friend (valid until {}, single use):\n",
+                format_time(expires_unix * 1_000_000_000)
+            );
+            println!("{ticket}\n");
+            println!("They accept it with: kinvault invite redeem <code>");
+        }
+        Command::Invite(InviteCommand::List) => {
+            let Reply::Invites(invites) = client.call(&Request::ListInvites).await? else {
+                bail!("unexpected reply")
+            };
+            if invites.is_empty() {
+                println!("no open invites");
+            }
+            for i in invites {
+                println!(
+                    "{}  {}  {}{}  expires {}",
+                    i.id,
+                    i.name.as_deref().unwrap_or("-"),
+                    describe_grant(&i.grant),
+                    if i.ask_reciprocal {
+                        ", asks for storage back"
+                    } else {
+                        ""
+                    },
+                    format_time(i.expires_unix * 1_000_000_000)
+                );
+            }
+        }
+        Command::Invite(InviteCommand::Cancel { id }) => {
+            client.call(&Request::CancelInvite { id }).await?;
+            println!("Invite cancelled.");
+        }
+        Command::Invite(InviteCommand::Redeem {
+            code,
+            name,
+            offer,
+            offer_unlimited,
+            offer_upload_limit,
+            offer_window,
+        }) => {
+            let offer = (offer.is_some() || offer_unlimited).then_some(GrantSpec {
+                quota_bytes: offer,
+                upload_limit: offer_upload_limit,
+                window: offer_window,
+            });
+            let offered = offer.is_some();
+            let Reply::Redeemed {
+                host_name,
+                quota_bytes,
+                ask_reciprocal,
+                ..
+            } = client
+                .call(&Request::RedeemInvite {
+                    ticket: code,
+                    name,
+                    offer,
+                })
+                .await?
+            else {
+                bail!("unexpected reply")
+            };
+            let space = quota_bytes
+                .map(format_bytes)
+                .unwrap_or_else(|| "unlimited space".into());
+            println!("Joined {host_name}: you can store {space} there.");
+            println!("Back up to it with: kinvault set create <name> <paths> --peer {host_name}");
+            if ask_reciprocal && !offered {
+                println!("\n{host_name} asked you to store their backups too. To agree, run:");
+                println!("  kinvault peer allow {host_name} --quota <size>");
+            } else if offered {
+                println!("{host_name} can now store backups here too.");
+            }
+        }
+        Command::Peer(PeerCommand::Allow { id, name, grant }) => {
             client
                 .call(&Request::PeerAllow {
                     id,
                     name,
-                    quota_bytes: quota,
+                    grant: grant.spec(),
                 })
                 .await?;
             println!("Allowed.");
         }
-        Command::Peer(PeerCommand::Revoke { id }) => {
-            client.call(&Request::PeerRevoke { id }).await?;
+        Command::Peer(PeerCommand::Revoke { peer }) => {
+            client.call(&Request::PeerRevoke { id: peer }).await?;
             println!("Revoked. Data they already stored is kept.");
         }
         Command::Peer(PeerCommand::List) => {
             let Reply::Peers(peers) = client.call(&Request::PeerList).await? else {
                 bail!("unexpected reply")
             };
+            if peers.is_empty() {
+                println!("no peers yet; invite a friend with `kinvault invite create`");
+            }
             for p in peers {
-                let quota = p
-                    .quota_bytes
-                    .map(format_bytes)
-                    .unwrap_or_else(|| "no quota".into());
-                println!(
-                    "{}  {}  using {} of {quota}",
-                    p.id,
-                    p.name.as_deref().unwrap_or("-"),
-                    format_bytes(p.used_bytes)
-                );
+                println!("{}  {}", p.name.as_deref().unwrap_or("(unnamed)"), p.id);
+                match p.grant {
+                    Some(g) => println!(
+                        "  stores here: using {} of {}",
+                        format_bytes(p.used_bytes),
+                        describe_grant(&g)
+                    ),
+                    None => println!("  may not store backups here"),
+                }
+                if let Some(h) = p.hosts_us {
+                    let space = h
+                        .quota_bytes
+                        .map(format_bytes)
+                        .unwrap_or_else(|| "unlimited".into());
+                    println!("  hosts our backups: {space}");
+                }
             }
         }
     }

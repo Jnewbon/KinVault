@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::sync::Arc;
 
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr};
@@ -7,9 +8,13 @@ use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 
 use crate::error::{NetError, transport};
+use crate::limits::RateLimiter;
 use crate::protocol::{
-    ALPN, MAX_OBJECT_LEN, Op, Request, Response, read_msg, read_payload, valid_repo_name, write_msg,
+    ALPN, MAX_OBJECT_LEN, Offer, Op, Request, Response, read_msg, read_payload, valid_repo_name,
+    write_msg, write_payload,
 };
+use crate::receiver::InviteAccepted;
+use crate::ticket::InviteTicket;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RemoteStatus {
@@ -28,6 +33,7 @@ pub struct RemoteBackend {
     repo: String,
     runtime: Handle,
     conn: Mutex<Option<Connection>>,
+    upload_limit: Option<Arc<RateLimiter>>,
 }
 
 impl RemoteBackend {
@@ -48,7 +54,14 @@ impl RemoteBackend {
             repo: repo.to_string(),
             runtime,
             conn: Mutex::new(None),
+            upload_limit: None,
         })
+    }
+
+    /// Paces uploads to at most `bytes_per_sec`.
+    pub fn with_upload_limit(mut self, bytes_per_sec: Option<u64>) -> Self {
+        self.upload_limit = bytes_per_sec.map(|r| Arc::new(RateLimiter::new(r)));
+        self
     }
 
     pub async fn status(&self) -> Result<RemoteStatus, NetError> {
@@ -92,7 +105,7 @@ impl RemoteBackend {
         let mut attempt = 0;
         loop {
             let conn = self.connection().await?;
-            match call_once(&conn, &req, payload).await {
+            match call_once(&conn, &req, payload, self.upload_limit.as_deref()).await {
                 // The cached connection went away (idle timeout, network change): reconnect once.
                 Err(NetError::Transport(_)) if attempt == 0 && conn.close_reason().is_some() => {
                     attempt += 1;
@@ -129,12 +142,13 @@ async fn call_once(
     conn: &Connection,
     req: &Request,
     payload: Option<&[u8]>,
+    limiter: Option<&RateLimiter>,
 ) -> Result<(Response, Option<Vec<u8>>), NetError> {
     let (mut send, mut recv) = conn.open_bi().await.map_err(transport)?;
     let sent = async {
         write_msg(&mut send, req).await?;
         if let Some(data) = payload {
-            send.write_all(data).await.map_err(transport)?;
+            write_payload(&mut send, data, limiter).await?;
         }
         send.finish().map_err(transport)
     }
@@ -147,11 +161,46 @@ async fn call_once(
     };
     let data = match resp {
         Response::Data { len } | Response::Tail { len, .. } => {
-            Some(read_payload(&mut recv, len).await?)
+            Some(read_payload(&mut recv, len, None).await?)
         }
         _ => None,
     };
     Ok((resp, data))
+}
+
+/// Claims an invite on the host it was issued by. On success this peer may
+/// store backups there.
+pub async fn redeem_invite(
+    endpoint: &Endpoint,
+    ticket: &InviteTicket,
+    name: Option<String>,
+    offer: Option<Offer>,
+) -> Result<InviteAccepted, NetError> {
+    let conn = endpoint
+        .connect(ticket.host.clone(), ALPN)
+        .await
+        .map_err(transport)?;
+    let req = Request {
+        repo: "invite".into(),
+        op: Op::RedeemInvite {
+            token: ticket.token,
+            name,
+            offer,
+        },
+    };
+    let result = call_once(&conn, &req, None, None).await;
+    conn.close(0u32.into(), b"done");
+    match result?.0 {
+        Response::Redeemed {
+            host_name,
+            quota_bytes,
+        } => Ok(InviteAccepted {
+            host_name,
+            quota_bytes,
+        }),
+        Response::Error { code, message } => Err(NetError::from_code(code, message)),
+        other => Err(unexpected(&other)),
+    }
 }
 
 fn unexpected(resp: &Response) -> NetError {

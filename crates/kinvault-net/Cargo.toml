@@ -6,8 +6,10 @@ edition.workspace = true
 [dependencies]
 kinvault-core.workspace = true
 blake3.workspace = true
+data-encoding.workspace = true
 hex.workspace = true
 iroh.workspace = true
+jiff.workspace = true
 postcard.workspace = true
 serde.workspace = true
 thiserror.workspace = true
@@ -15,4 +17,6 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+jiff.workspace = true
 tempfile.workspace = true

@@ -6,7 +6,10 @@ use std::time::Duration;
 
 use iroh::endpoint::presets;
 use iroh::{Endpoint, SecretKey};
-use kinvault_daemon::api::{BackupSummary, CreateSet, Reply, Request, SetState, SetStatus, Target};
+use kinvault_daemon::api::{
+    BackupSummary, CreateInvite, CreateSet, GrantSpec, HostOffer, Reply, Request, SetState,
+    SetStatus, Target, TimeWindow,
+};
 use kinvault_daemon::{Daemon, DaemonOptions, ipc};
 
 async fn local_endpoint(secret: SecretKey) -> Endpoint {
@@ -78,7 +81,10 @@ async fn daemon_backs_up_changes_to_peer() {
         Request::PeerAllow {
             id: pc.id().to_string(),
             name: Some("pc".into()),
-            quota_bytes: Some(1 << 30),
+            grant: GrantSpec {
+                quota_bytes: Some(1 << 30),
+                ..Default::default()
+            },
         },
     )
     .await;
@@ -95,6 +101,8 @@ async fn daemon_backs_up_changes_to_peer() {
             recovery_passphrase: "a long recovery phrase".into(),
             debounce_secs: Some(1),
             rescan_secs: None,
+            upload_limit: None,
+            window: None,
         }),
     )
     .await;
@@ -228,4 +236,253 @@ async fn second_daemon_is_refused() {
         .err()
         .expect("second bind must fail");
     assert!(err.to_string().contains("already running"), "{err}");
+}
+
+async fn set_named(d: &Daemon, name: &str) -> SetStatus {
+    match call(d, Request::Status).await {
+        Reply::Status(s) => s
+            .sets
+            .into_iter()
+            .find(|s| s.name == name)
+            .expect("set exists"),
+        other => panic!("{other:?}"),
+    }
+}
+
+async fn peers(d: &Daemon) -> Vec<kinvault_daemon::api::PeerInfo> {
+    match call(d, Request::PeerList).await {
+        Reply::Peers(p) => p,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn friends_pair_with_an_invite_and_back_up_to_each_other() {
+    let tmp = tempfile::tempdir().unwrap();
+    let alice = start(&tmp.path().join("alice"), SecretKey::generate()).await;
+    let bob = start(&tmp.path().join("bob"), SecretKey::generate()).await;
+    call(
+        &alice,
+        Request::SetInstanceName {
+            name: "alice-nas".into(),
+        },
+    )
+    .await;
+    call(
+        &bob,
+        Request::SetInstanceName {
+            name: "bob-pc".into(),
+        },
+    )
+    .await;
+
+    // Alice invites Bob, offering 1 GiB and asking for storage in return.
+    let Reply::Invite { ticket, .. } = call(
+        &alice,
+        Request::CreateInvite(CreateInvite {
+            name: Some("bob".into()),
+            grant: GrantSpec {
+                quota_bytes: Some(1 << 30),
+                ..Default::default()
+            },
+            ask_reciprocal: true,
+            expires_secs: None,
+        }),
+    )
+    .await
+    else {
+        panic!()
+    };
+    assert!(ticket.starts_with("kvinvite1"));
+
+    // Bob redeems it and offers Alice 512 MiB back.
+    let offer = GrantSpec {
+        quota_bytes: Some(512 << 20),
+        ..Default::default()
+    };
+    let Reply::Redeemed {
+        host_name,
+        quota_bytes,
+        ask_reciprocal,
+        ..
+    } = call(
+        &bob,
+        Request::RedeemInvite {
+            ticket: ticket.clone(),
+            name: None,
+            offer: Some(offer),
+        },
+    )
+    .await
+    else {
+        panic!()
+    };
+    assert_eq!(
+        (host_name.as_str(), quota_bytes, ask_reciprocal),
+        ("alice-nas", Some(1 << 30), true)
+    );
+
+    // Both sides now know each other in both directions.
+    let on_alice = peers(&alice).await;
+    assert_eq!(on_alice.len(), 1);
+    assert_eq!(on_alice[0].name.as_deref(), Some("bob"));
+    assert_eq!(on_alice[0].grant.unwrap().quota_bytes, Some(1 << 30));
+    assert_eq!(
+        on_alice[0].hosts_us,
+        Some(HostOffer {
+            quota_bytes: Some(512 << 20)
+        })
+    );
+    let on_bob = peers(&bob).await;
+    assert_eq!(on_bob[0].name.as_deref(), Some("alice-nas"));
+    assert_eq!(on_bob[0].grant, Some(offer));
+    assert_eq!(
+        on_bob[0].hosts_us,
+        Some(HostOffer {
+            quota_bytes: Some(1 << 30)
+        })
+    );
+
+    // Invites are single use.
+    let err = bob
+        .handle(Request::RedeemInvite {
+            ticket,
+            name: None,
+            offer: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(err.contains("invalid, expired or already used"), "{err}");
+
+    // Bob backs up to Alice by name; the address came from the invite.
+    let bob_src = tmp.path().join("bob-files");
+    fs::create_dir_all(&bob_src).unwrap();
+    fs::write(bob_src.join("thesis.tex"), b"\\documentclass{article}").unwrap();
+    call(
+        &bob,
+        Request::CreateSet(CreateSet {
+            name: "thesis".into(),
+            paths: vec![bob_src.clone()],
+            target: Target::Peer {
+                id: "alice-nas".into(),
+                addrs: vec![],
+            },
+            recovery_passphrase: "bobs recovery phrase".into(),
+            debounce_secs: Some(1),
+            rescan_secs: None,
+            upload_limit: Some(10_000_000),
+            window: None,
+        }),
+    )
+    .await;
+    let Reply::Backup(b) = call(
+        &bob,
+        Request::BackupNow {
+            set: "thesis".into(),
+        },
+    )
+    .await
+    else {
+        panic!()
+    };
+    assert_eq!(b.files, 1);
+    assert!(peers(&alice).await[0].used_bytes > 0);
+
+    // Alice backs up to Bob, but only during a window that is closed right now.
+    let h = (jiff::Zoned::now().hour() as u16 + 22) % 24;
+    let closed = TimeWindow::new(h * 60, ((h + 1) % 24) * 60).unwrap();
+    let alice_src = tmp.path().join("alice-photos");
+    fs::create_dir_all(&alice_src).unwrap();
+    fs::write(alice_src.join("cat.jpg"), b"meow").unwrap();
+    call(
+        &alice,
+        Request::CreateSet(CreateSet {
+            name: "photos".into(),
+            paths: vec![alice_src],
+            target: Target::Peer {
+                id: "bob".into(),
+                addrs: bob.endpoint().bound_sockets(),
+            },
+            recovery_passphrase: "alices recovery phrase".into(),
+            debounce_secs: Some(1),
+            rescan_secs: None,
+            upload_limit: None,
+            window: Some(closed),
+        }),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let st = set_named(&alice, "photos").await;
+    assert_eq!(st.state, SetState::WaitingForWindow);
+    assert!(st.last_backup.is_none());
+    // An explicit request ignores the window.
+    let Reply::Backup(b) = call(
+        &alice,
+        Request::BackupNow {
+            set: "photos".into(),
+        },
+    )
+    .await
+    else {
+        panic!()
+    };
+    assert_eq!(b.files, 1);
+    assert!(peers(&bob).await[0].used_bytes > 0);
+
+    // Opening the window lets automatic backups run again.
+    call(
+        &alice,
+        Request::SetLimits {
+            set: "photos".into(),
+            upload_limit: None,
+            window: None,
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_ne!(
+        set_named(&alice, "photos").await.state,
+        SetState::WaitingForWindow
+    );
+
+    // Expired and cancelled invites.
+    let Reply::Invite { ticket, .. } = call(
+        &alice,
+        Request::CreateInvite(CreateInvite {
+            expires_secs: Some(0),
+            ..Default::default()
+        }),
+    )
+    .await
+    else {
+        panic!()
+    };
+    let err = bob
+        .handle(Request::RedeemInvite {
+            ticket,
+            name: None,
+            offer: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(err.contains("expired"), "{err}");
+    let Reply::Invite { id, .. } =
+        call(&alice, Request::CreateInvite(CreateInvite::default())).await
+    else {
+        panic!()
+    };
+    call(&alice, Request::CancelInvite { id }).await;
+    let Reply::Invites(left) = call(&alice, Request::ListInvites).await else {
+        panic!()
+    };
+    assert!(left.is_empty());
+
+    // Revoking Bob keeps Alice's record that Bob hosts her backups.
+    call(&alice, Request::PeerRevoke { id: "bob".into() }).await;
+    let on_alice = peers(&alice).await;
+    assert!(on_alice[0].grant.is_none());
+    assert!(on_alice[0].hosts_us.is_some());
+
+    alice.shutdown().await;
+    bob.shutdown().await;
 }

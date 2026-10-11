@@ -19,6 +19,8 @@ pub enum NetError {
     BadRequest(String),
     #[error("remote error: {0}")]
     Remote(String),
+    #[error("{0}")]
+    OutsideWindow(String),
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error("encoding error: {0}")]
@@ -37,6 +39,7 @@ impl NetError {
             ErrorCode::QuotaExceeded => Self::QuotaExceeded(message),
             ErrorCode::BadRequest => Self::BadRequest(message),
             ErrorCode::Internal => Self::Remote(message),
+            ErrorCode::OutsideWindow => Self::OutsideWindow(message),
         }
     }
 }

@@ -10,6 +10,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{NetError, transport};
+use crate::limits::{PACE_CHUNK, RateLimiter};
 
 pub const ALPN: &[u8] = b"kinvault/1";
 /// Largest pack or snapshot either side will accept.
@@ -27,14 +28,46 @@ pub struct Request {
 pub enum Op {
     Status,
     ListPacks,
-    PutPack { id: PackId, len: u64 },
-    GetPack { id: PackId },
-    GetPackTail { id: PackId, max_len: u64 },
-    DeletePack { id: PackId },
+    PutPack {
+        id: PackId,
+        len: u64,
+    },
+    GetPack {
+        id: PackId,
+    },
+    GetPackTail {
+        id: PackId,
+        max_len: u64,
+    },
+    DeletePack {
+        id: PackId,
+    },
     ListSnapshots,
-    PutSnapshot { id: SnapshotId, len: u64 },
-    GetSnapshot { id: SnapshotId },
-    DeleteSnapshot { id: SnapshotId },
+    PutSnapshot {
+        id: SnapshotId,
+        len: u64,
+    },
+    GetSnapshot {
+        id: SnapshotId,
+    },
+    DeleteSnapshot {
+        id: SnapshotId,
+    },
+    /// Claims an invite. Allowed from peers the host doesn't know yet;
+    /// `repo` is ignored.
+    RedeemInvite {
+        token: [u8; 16],
+        /// What the host should call the redeeming peer.
+        name: Option<String>,
+        /// Storage the redeeming peer offers the host in return.
+        offer: Option<Offer>,
+    },
+}
+
+/// Storage one peer offers another.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Offer {
+    pub quota_bytes: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -59,6 +92,10 @@ pub enum Response {
         code: ErrorCode,
         message: String,
     },
+    Redeemed {
+        host_name: String,
+        quota_bytes: Option<u64>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +105,8 @@ pub enum ErrorCode {
     QuotaExceeded,
     BadRequest,
     Internal,
+    /// Uploads are only accepted during the host's time window.
+    OutsideWindow,
 }
 
 /// Repository names become directory names on the host.
@@ -104,13 +143,51 @@ pub(crate) async fn read_msg<T: DeserializeOwned>(recv: &mut RecvStream) -> Resu
     Ok(postcard::from_bytes(&buf)?)
 }
 
-pub(crate) async fn read_payload(recv: &mut RecvStream, len: u64) -> Result<Vec<u8>, NetError> {
+pub(crate) async fn read_payload(
+    recv: &mut RecvStream,
+    len: u64,
+    limiter: Option<&RateLimiter>,
+) -> Result<Vec<u8>, NetError> {
     if len > MAX_OBJECT_LEN {
         return Err(NetError::Protocol(format!(
             "object of {len} bytes is too large"
         )));
     }
     let mut buf = vec![0u8; len as usize];
-    recv.read_exact(&mut buf).await.map_err(transport)?;
+    let Some(limiter) = limiter else {
+        recv.read_exact(&mut buf).await.map_err(transport)?;
+        return Ok(buf);
+    };
+    // Reading slowly makes QUIC flow control slow the sender down.
+    let mut filled = 0;
+    while filled < buf.len() {
+        let end = (filled + PACE_CHUNK).min(buf.len());
+        match recv.read(&mut buf[filled..end]).await.map_err(transport)? {
+            Some(n) => {
+                limiter.consume(n).await;
+                filled += n;
+            }
+            None => {
+                return Err(NetError::Protocol(
+                    "stream ended before the object was complete".into(),
+                ));
+            }
+        }
+    }
     Ok(buf)
+}
+
+pub(crate) async fn write_payload(
+    send: &mut SendStream,
+    data: &[u8],
+    limiter: Option<&RateLimiter>,
+) -> Result<(), NetError> {
+    let Some(limiter) = limiter else {
+        return send.write_all(data).await.map_err(transport);
+    };
+    for piece in data.chunks(PACE_CHUNK) {
+        limiter.consume(piece.len()).await;
+        send.write_all(piece).await.map_err(transport)?;
+    }
+    Ok(())
 }

@@ -7,15 +7,20 @@
 mod client;
 mod error;
 mod identity;
+mod limits;
 pub mod protocol;
 mod receiver;
+mod ticket;
 
-pub use client::{RemoteBackend, RemoteStatus};
+pub use client::{RemoteBackend, RemoteStatus, redeem_invite};
 pub use error::NetError;
 pub use identity::load_or_create_secret;
 pub use iroh::protocol::Router;
 pub use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
-pub use receiver::{Grant, Receiver};
+pub use limits::{RateLimiter, TimeWindow};
+pub use protocol::Offer;
+pub use receiver::{Grant, InviteAccepted, InviteHandler, InviteRedemption, Receiver};
+pub use ticket::InviteTicket;
 
 use iroh::endpoint::presets;
 

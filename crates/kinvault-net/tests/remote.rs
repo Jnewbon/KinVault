@@ -208,6 +208,7 @@ async fn quota_and_integrity_are_enforced() {
         ep.id(),
         Grant {
             quota_bytes: Some(1000),
+            ..Default::default()
         },
     );
 
@@ -241,5 +242,165 @@ async fn quota_and_integrity_are_enforced() {
         remote.status().await.unwrap_err(),
         NetError::Denied(_)
     ));
+    host.router.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invites_grant_access_once() {
+    use kinvault_net::{InviteAccepted, InviteHandler, InviteTicket, Offer, redeem_invite};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Host::start(tmp.path().join("host")).await;
+    let token = [42u8; 16];
+    let used = Arc::new(std::sync::Mutex::new(false));
+    let (receiver, used2) = (host.receiver.clone(), used.clone());
+    let handler: InviteHandler = Arc::new(move |r: kinvault_net::InviteRedemption| {
+        let (receiver, used) = (receiver.clone(), used2.clone());
+        Box::pin(async move {
+            let mut used = used.lock().unwrap();
+            if r.token != token || *used {
+                return Err("invite is invalid or already used".to_string());
+            }
+            *used = true;
+            assert_eq!(r.name.as_deref(), Some("bob"));
+            assert_eq!(
+                r.offer,
+                Some(Offer {
+                    quota_bytes: Some(5)
+                })
+            );
+            receiver.allow(
+                r.peer,
+                Grant {
+                    quota_bytes: Some(1 << 20),
+                    ..Default::default()
+                },
+            );
+            Ok(InviteAccepted {
+                host_name: "alice".into(),
+                quota_bytes: Some(1 << 20),
+            })
+        })
+    });
+    host.receiver.set_invite_handler(handler);
+
+    let mut ticket = InviteTicket {
+        host: host.addr(),
+        host_name: "alice".into(),
+        token: [0; 16],
+        quota_bytes: Some(1 << 20),
+        ask_reciprocal: true,
+        expires_unix: i64::MAX,
+    };
+    let (ep, remote) = client(&host, "repo").await;
+    let offer = Some(Offer {
+        quota_bytes: Some(5),
+    });
+
+    // Wrong token: refused, and still no access.
+    let err = redeem_invite(&ep, &ticket, Some("bob".into()), offer)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, NetError::Denied(_)), "{err}");
+    assert!(matches!(
+        remote.status().await.unwrap_err(),
+        NetError::Denied(_)
+    ));
+
+    ticket.token = token;
+    let accepted = redeem_invite(&ep, &ticket, Some("bob".into()), offer)
+        .await
+        .unwrap();
+    assert_eq!(accepted.host_name, "alice");
+    assert_eq!(remote.status().await.unwrap().quota_bytes, Some(1 << 20));
+
+    // Single use.
+    assert!(
+        redeem_invite(&ep, &ticket, Some("bob".into()), offer)
+            .await
+            .is_err()
+    );
+    host.router.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn window_rate_limit_and_trash() {
+    use kinvault_net::TimeWindow;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Host::start(tmp.path().join("host")).await;
+    let (ep, remote) = client(&host, "repo").await;
+
+    // A window that is closed right now (the hour that started 2 hours ago).
+    let now = jiff::Zoned::now();
+    let h = (now.hour() as u16 + 22) % 24;
+    let closed = TimeWindow::new(h * 60, ((h + 1) % 24) * 60).unwrap();
+    host.receiver.allow(
+        ep.id(),
+        Grant {
+            window: Some(closed),
+            ..Default::default()
+        },
+    );
+    let r = remote.clone();
+    let data = vec![3u8; 400_000];
+    let id = PackId(*blake3::hash(&data).as_bytes());
+    let d = data.clone();
+    let err = tokio::task::spawn_blocking(move || r.put_pack(&id, &d))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("only accepts uploads between"),
+        "{err}"
+    );
+    // Reads still work outside the window (restores must never be blocked).
+    remote.status().await.unwrap();
+
+    // 400 kB at 200 kB/s takes about two seconds.
+    host.receiver.allow(
+        ep.id(),
+        Grant {
+            upload_limit: Some(200_000),
+            ..Default::default()
+        },
+    );
+    let r = remote.clone();
+    let start = std::time::Instant::now();
+    tokio::task::spawn_blocking(move || r.put_pack(&id, &data))
+        .await
+        .unwrap()
+        .unwrap();
+    let took = start.elapsed();
+    assert!(
+        took >= std::time::Duration::from_millis(1500),
+        "upload took only {took:?}"
+    );
+
+    // Deleting moves to trash: hidden, still counted, purged after the grace period.
+    let used = remote.status().await.unwrap().used_bytes;
+    let r = remote.clone();
+    tokio::task::spawn_blocking(move || {
+        r.delete_pack(&id).unwrap();
+        assert!(r.list_packs().unwrap().is_empty());
+    })
+    .await
+    .unwrap();
+    assert_eq!(remote.status().await.unwrap().used_bytes, used);
+    assert_eq!(
+        host.receiver
+            .purge_trash(std::time::Duration::from_secs(3600))
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        host.receiver
+            .purge_trash(std::time::Duration::ZERO)
+            .await
+            .unwrap(),
+        400_000
+    );
+    assert!(remote.status().await.unwrap().used_bytes < used);
     host.router.shutdown().await.unwrap();
 }

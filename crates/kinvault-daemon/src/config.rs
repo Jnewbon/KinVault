@@ -10,20 +10,52 @@ use crate::api;
 /// Persistent daemon configuration (`config.json` in the state directory).
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct Config {
+    /// Name friends see for this instance (defaults to the hostname).
+    #[serde(default)]
+    pub name: Option<String>,
     /// Where hosted peers' data is stored; defaults to `<state>/hosted`.
     #[serde(default)]
     pub hosting_store: Option<PathBuf>,
+    /// Days that data a peer deletes is kept before it is really removed.
+    #[serde(default = "default_grace_days")]
+    pub trash_grace_days: u64,
     #[serde(default)]
     pub peers: Vec<PeerEntry>,
+    #[serde(default)]
+    pub invites: Vec<PendingInvite>,
     #[serde(default)]
     pub sets: Vec<SetConfig>,
 }
 
+fn default_grace_days() -> u64 {
+    30
+}
+
+/// Another instance we know, in either direction.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PeerEntry {
     pub id: String,
     pub name: Option<String>,
-    pub quota_bytes: Option<u64>,
+    /// Known direct addresses (from an invite); discovery is used otherwise.
+    #[serde(default)]
+    pub addrs: Vec<SocketAddr>,
+    /// Set if this peer may store backups here.
+    #[serde(default)]
+    pub grant: Option<api::GrantSpec>,
+    /// Set if this peer agreed to store our backups.
+    #[serde(default)]
+    pub hosts_us: Option<api::HostOffer>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PendingInvite {
+    pub id: String,
+    /// BLAKE3 of the token, so a leaked config can't be used to redeem it.
+    pub token_hash: String,
+    pub name: Option<String>,
+    pub grant: api::GrantSpec,
+    pub ask_reciprocal: bool,
+    pub expires_unix: i64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -34,6 +66,10 @@ pub struct SetConfig {
     pub target: StoredTarget,
     pub debounce_secs: u64,
     pub rescan_secs: u64,
+    #[serde(default)]
+    pub upload_limit: Option<u64>,
+    #[serde(default)]
+    pub window: Option<api::TimeWindow>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -64,6 +100,23 @@ impl StoredTarget {
 }
 
 impl Config {
+    pub fn peer_mut(&mut self, id: &str) -> &mut PeerEntry {
+        let pos = match self.peers.iter().position(|p| p.id == id) {
+            Some(pos) => pos,
+            None => {
+                self.peers.push(PeerEntry {
+                    id: id.to_string(),
+                    name: None,
+                    addrs: Vec::new(),
+                    grant: None,
+                    hosts_us: None,
+                });
+                self.peers.len() - 1
+            }
+        };
+        &mut self.peers[pos]
+    }
+
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         match fs::read_to_string(path) {
             Ok(text) => Ok(serde_json::from_str(&text)?),

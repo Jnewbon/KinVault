@@ -93,6 +93,58 @@ impl LocalDirBackend {
     fn snapshot_path(&self, id: &SnapshotId) -> PathBuf {
         self.root.join("snapshots").join(id.to_hex())
     }
+
+    /// Moves a pack to `trash/` instead of deleting it; see [`Self::purge_trash`].
+    pub fn trash_pack(&self, id: &PackId) -> Result<()> {
+        self.move_to_trash(&self.pack_path(id), "packs")
+    }
+
+    pub fn trash_snapshot(&self, id: &SnapshotId) -> Result<()> {
+        self.move_to_trash(&self.snapshot_path(id), "snapshots")
+    }
+
+    fn move_to_trash(&self, path: &Path, kind: &str) -> Result<()> {
+        let Some(name) = path.file_name() else {
+            return Ok(());
+        };
+        let dest_dir = self.root.join("trash").join(kind);
+        fs::create_dir_all(&dest_dir)?;
+        let dest = dest_dir.join(name);
+        match fs::rename(path, &dest) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            other => other?,
+        }
+        // The modification time records when it was deleted.
+        fs::File::options()
+            .write(true)
+            .open(&dest)?
+            .set_modified(std::time::SystemTime::now())?;
+        Ok(())
+    }
+
+    /// Permanently removes trashed objects deleted more than `grace` ago.
+    /// Returns the number of bytes freed.
+    pub fn purge_trash(&self, grace: std::time::Duration) -> Result<u64> {
+        let mut freed = 0;
+        for kind in ["packs", "snapshots"] {
+            let dir = self.root.join("trash").join(kind);
+            let entries = match fs::read_dir(&dir) {
+                Ok(e) => e,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e.into()),
+            };
+            for entry in entries {
+                let entry = entry?;
+                let meta = entry.metadata()?;
+                let age = meta.modified()?.elapsed().unwrap_or_default();
+                if age >= grace {
+                    fs::remove_file(entry.path())?;
+                    freed += meta.len();
+                }
+            }
+        }
+        Ok(freed)
+    }
 }
 
 fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
@@ -188,5 +240,29 @@ impl Backend for LocalDirBackend {
 
     fn delete_snapshot(&self, id: &SnapshotId) -> Result<()> {
         remove_object(&self.snapshot_path(id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn trash_hides_then_purges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = LocalDirBackend::create(tmp.path()).unwrap();
+        let id = PackId([1; 32]);
+        b.put_pack(&id, b"data").unwrap();
+        b.trash_pack(&id).unwrap();
+        assert!(b.list_packs().unwrap().is_empty());
+        assert!(matches!(b.get_pack(&id), Err(Error::NotFound(_))));
+        // Trashing something already gone is fine.
+        b.trash_pack(&id).unwrap();
+        assert_eq!(b.purge_trash(Duration::from_secs(3600)).unwrap(), 0);
+        assert!(tmp.path().join("trash/packs").join(id.to_hex()).exists());
+        assert_eq!(b.purge_trash(Duration::ZERO).unwrap(), 4);
+        assert!(!tmp.path().join("trash/packs").join(id.to_hex()).exists());
     }
 }

@@ -4,18 +4,29 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+pub use kinvault_net::TimeWindow;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum Request {
     Status,
+    /// Sets the name friends see for this instance.
+    SetInstanceName {
+        name: String,
+    },
     CreateSet(CreateSet),
     /// Stops a backup set. Its keys are kept locally; remote data is untouched.
     RemoveSet {
         set: String,
     },
-    /// Runs a backup now and waits for it to finish.
+    /// Changes a set's upload limit and time window.
+    SetLimits {
+        set: String,
+        upload_limit: Option<u64>,
+        window: Option<TimeWindow>,
+    },
+    /// Runs a backup now (ignoring the set's time window) and waits for it to finish.
     BackupNow {
         set: String,
     },
@@ -32,15 +43,30 @@ pub enum Request {
     RemoteUsage {
         set: String,
     },
+    /// Lets a peer store backups here (or updates its limits).
     PeerAllow {
         id: String,
         name: Option<String>,
-        quota_bytes: Option<u64>,
+        grant: GrantSpec,
     },
+    /// Stops accepting backups from a peer; what it stored is kept.
     PeerRevoke {
         id: String,
     },
     PeerList,
+    /// Creates a one-time invite code a friend can redeem to store backups here.
+    CreateInvite(CreateInvite),
+    ListInvites,
+    CancelInvite {
+        id: String,
+    },
+    /// Redeems a friend's invite code, optionally offering them storage in return.
+    RedeemInvite {
+        ticket: String,
+        /// What to call the host locally (defaults to the name it gives).
+        name: Option<String>,
+        offer: Option<GrantSpec>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -54,6 +80,46 @@ pub struct CreateSet {
     pub debounce_secs: Option<u64>,
     /// Interval between full rescans that catch missed changes (default 6 h).
     pub rescan_secs: Option<u64>,
+    /// Maximum upload rate in bytes per second.
+    #[serde(default)]
+    pub upload_limit: Option<u64>,
+    /// Only back up automatically inside this daily window (local time).
+    #[serde(default)]
+    pub window: Option<TimeWindow>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct CreateInvite {
+    /// What to call the friend once they join.
+    pub name: Option<String>,
+    pub grant: GrantSpec,
+    /// Ask the friend to store this instance's backups in return.
+    pub ask_reciprocal: bool,
+    /// Validity period (default 7 days).
+    pub expires_secs: Option<u64>,
+}
+
+/// Limits for a peer storing backups on this instance.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GrantSpec {
+    #[serde(default)]
+    pub quota_bytes: Option<u64>,
+    /// Maximum upload rate in bytes per second.
+    #[serde(default)]
+    pub upload_limit: Option<u64>,
+    /// Only accept uploads inside this daily window (local time).
+    #[serde(default)]
+    pub window: Option<TimeWindow>,
+}
+
+impl GrantSpec {
+    pub fn to_grant(self) -> kinvault_net::Grant {
+        kinvault_net::Grant {
+            quota_bytes: self.quota_bytes,
+            upload_limit: self.upload_limit,
+            window: self.window,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -63,6 +129,7 @@ pub enum Target {
         path: PathBuf,
     },
     Peer {
+        /// Peer id, or the name of a known peer.
         id: String,
         /// Known direct addresses; optional, the peer is otherwise found by id.
         #[serde(default)]
@@ -85,12 +152,25 @@ pub enum Reply {
         quota_bytes: Option<u64>,
     },
     Peers(Vec<PeerInfo>),
+    Invite {
+        id: String,
+        ticket: String,
+        expires_unix: i64,
+    },
+    Invites(Vec<InviteInfo>),
+    Redeemed {
+        host_id: String,
+        host_name: String,
+        quota_bytes: Option<u64>,
+        ask_reciprocal: bool,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DaemonStatus {
     /// This instance's id; peers use it to allow it or to back up to it.
     pub id: String,
+    pub name: String,
     pub version: String,
     pub hosting_store: PathBuf,
     pub sets: Vec<SetStatus>,
@@ -102,6 +182,8 @@ pub struct SetStatus {
     pub name: String,
     pub paths: Vec<PathBuf>,
     pub target: Target,
+    pub upload_limit: Option<u64>,
+    pub window: Option<TimeWindow>,
     pub state: SetState,
     pub last_backup: Option<BackupSummary>,
     pub last_error: Option<String>,
@@ -113,6 +195,8 @@ pub enum SetState {
     Idle,
     /// Changes seen; waiting for them to settle before backing up.
     ChangesPending,
+    /// Outside the set's time window; will back up when it opens.
+    WaitingForWindow,
     Running,
 }
 
@@ -149,6 +233,24 @@ pub struct RestoreSummary {
 pub struct PeerInfo {
     pub id: String,
     pub name: Option<String>,
-    pub quota_bytes: Option<u64>,
+    /// Set if this peer may store backups here.
+    pub grant: Option<GrantSpec>,
+    /// Bytes this peer stores here.
     pub used_bytes: u64,
+    /// Set if this peer agreed to store our backups (and how much).
+    pub hosts_us: Option<HostOffer>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostOffer {
+    pub quota_bytes: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct InviteInfo {
+    pub id: String,
+    pub name: Option<String>,
+    pub grant: GrantSpec,
+    pub ask_reciprocal: bool,
+    pub expires_unix: i64,
 }

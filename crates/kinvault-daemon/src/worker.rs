@@ -76,12 +76,15 @@ impl SetEnv {
         let master = MasterKey::from_bytes(bytes);
         let backend: Box<dyn Backend> = match &self.set.target {
             StoredTarget::Local { path } => Box::new(LocalDirBackend::open(path)?),
-            StoredTarget::Peer { id, repo, addrs } => Box::new(RemoteBackend::new(
-                self.endpoint.clone(),
-                peer_addr(id, addrs)?,
-                repo,
-                self.runtime.clone(),
-            )?),
+            StoredTarget::Peer { id, repo, addrs } => Box::new(
+                RemoteBackend::new(
+                    self.endpoint.clone(),
+                    peer_addr(id, addrs)?,
+                    repo,
+                    self.runtime.clone(),
+                )?
+                .with_upload_limit(self.set.upload_limit),
+            ),
         };
         let index = Index::open(&self.set_dir.join("index.db"))?;
         let mut repo = Repository::open(backend, &master, index);
@@ -188,10 +191,13 @@ async fn run(env: SetEnv, status: Arc<Mutex<RunStatus>>, mut rx: mpsc::Receiver<
     let mut scheduled = Instant::now();
     let mut change_deadline: Option<Instant> = None;
     let mut first_change: Option<Instant> = None;
+    let mut waiting_for_window = false;
 
     loop {
         status.lock().unwrap().state = if change_deadline.is_some() {
             SetState::ChangesPending
+        } else if waiting_for_window {
+            SetState::WaitingForWindow
         } else {
             SetState::Idle
         };
@@ -217,6 +223,18 @@ async fn run(env: SetEnv, status: Arc<Mutex<RunStatus>>, mut rx: mpsc::Receiver<
         }
         change_deadline = None;
         first_change = None;
+        // Automatic runs wait for the window; explicit requests don't.
+        if waiters.is_empty()
+            && let Some(window) = env.set.window
+        {
+            let wait = window.until_open();
+            if !wait.is_zero() {
+                waiting_for_window = true;
+                scheduled = Instant::now() + wait;
+                continue;
+            }
+        }
+        waiting_for_window = false;
         status.lock().unwrap().state = SetState::Running;
 
         let result = backup(&env, &mut repo).await;
