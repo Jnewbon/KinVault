@@ -1,0 +1,13 @@
+{
+  "name": "kinvault-gui",
+  "private": true,
+  "description": "Packaging scripts for the KinVault desktop app",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "bundle": "tauri build --config tauri.bundle.conf.json"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.2"
+  }
+}

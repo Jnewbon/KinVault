@@ -10,7 +10,21 @@ use anyhow::{Context, Result, bail};
 const NAME: &str = "kinvaultd";
 
 /// Finds `kinvaultd` next to the running executable (CLI or GUI), then on PATH.
+///
+/// Inside an AppImage the executable lives on a temporary mount that goes
+/// away when the app exits, so a copy in the user's data directory is used
+/// instead; that copy is what gets started and registered to run at login.
 pub fn daemon_binary() -> Result<PathBuf> {
+    let found = find_daemon()?;
+    let appdir = std::env::var_os("APPDIR").map(PathBuf::from);
+    let stable = directories::ProjectDirs::from("", "", "KinVault")
+        .context("could not determine the KinVault data directory")?
+        .data_dir()
+        .join("bin");
+    stable_location(found, appdir.as_deref(), &stable)
+}
+
+fn find_daemon() -> Result<PathBuf> {
     let file = format!("{NAME}{}", std::env::consts::EXE_SUFFIX);
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
@@ -26,6 +40,27 @@ pub fn daemon_binary() -> Result<PathBuf> {
         }
     }
     bail!("could not find {file}; install it next to this program or on your PATH")
+}
+
+/// Returns `found`, or a fresh copy of it in `stable_dir` when it lives inside
+/// a temporary AppImage mount (`appdir`).
+fn stable_location(found: PathBuf, appdir: Option<&Path>, stable_dir: &Path) -> Result<PathBuf> {
+    let Some(appdir) = appdir.filter(|a| found.starts_with(a)) else {
+        return Ok(found);
+    };
+    std::fs::create_dir_all(stable_dir)?;
+    let dest = stable_dir.join(found.file_name().context("daemon path has no file name")?);
+    // Copy then rename, which also works while an older copy is running.
+    let tmp = stable_dir.join(format!(".{NAME}.tmp"));
+    std::fs::copy(&found, &tmp)
+        .with_context(|| format!("copying {} out of {}", found.display(), appdir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    }
+    std::fs::rename(&tmp, &dest)?;
+    Ok(dest)
 }
 
 /// Starts the daemon in the background without installing it.
@@ -242,6 +277,43 @@ mod tests {
             "{unit}"
         );
         assert!(unit.contains("WantedBy=default.target"));
+    }
+
+    #[test]
+    fn appimage_daemon_is_copied_somewhere_stable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mount = tmp.path().join(".mount_KinVau");
+        std::fs::create_dir_all(mount.join("usr/bin")).unwrap();
+        let inside = mount.join("usr/bin/kinvaultd");
+        std::fs::write(&inside, b"daemon v2").unwrap();
+        let stable = tmp.path().join("data/bin");
+
+        // Not in an AppImage, or found outside the mount: used as is.
+        assert_eq!(
+            stable_location(inside.clone(), None, &stable).unwrap(),
+            inside
+        );
+        let elsewhere = tmp.path().join("kinvaultd");
+        assert_eq!(
+            stable_location(elsewhere.clone(), Some(&mount), &stable).unwrap(),
+            elsewhere
+        );
+        assert!(!stable.exists());
+
+        // From the mount: copied out (replacing an older copy).
+        std::fs::create_dir_all(&stable).unwrap();
+        std::fs::write(stable.join("kinvaultd"), b"daemon v1").unwrap();
+        let copy = stable_location(inside, Some(&mount), &stable).unwrap();
+        assert_eq!(copy, stable.join("kinvaultd"));
+        assert_eq!(std::fs::read(&copy).unwrap(), b"daemon v2");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
     }
 
     #[test]

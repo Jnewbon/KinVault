@@ -42,6 +42,29 @@ sudo apt install libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
 Keep `kinvaultd` in the same directory as `kinvault` and `kinvault-gui` (or on
 your `PATH`) so they can start it.
 
+## Packaging
+
+Installers are built with the Tauri CLI, pinned in
+`crates/kinvault-gui/package.json` (needs Node.js):
+
+```sh
+cd crates/kinvault-gui
+npm install
+npm run bundle
+```
+
+Bundles land in `target/release/bundle/`: `.deb`, `.rpm` and an AppImage on
+Linux; `.app`/`.dmg` on macOS; `.msi` and an NSIS installer on Windows. Each
+platform's installers must be built on that platform. Every bundle ships the
+app with `kinvaultd` and the `kinvault` CLI beside it (on Linux packages, all
+three in `/usr/bin`). The sidecars are built by `scripts/sidecars.mjs`, which
+`tauri.bundle.conf.json` runs before bundling; plain `cargo build` doesn't need
+them.
+
+When run from an AppImage, the app copies `kinvaultd` to
+`~/.local/share/KinVault/bin/` before starting it or registering it to run at
+login, because the AppImage's own files disappear when the app exits.
+
 ## Quick start (CLI)
 
 ```sh

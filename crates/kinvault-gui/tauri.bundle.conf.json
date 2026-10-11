@@ -1,0 +1,9 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "build": {
+    "beforeBuildCommand": "node scripts/sidecars.mjs"
+  },
+  "bundle": {
+    "externalBin": ["binaries/kinvaultd", "binaries/kinvault"]
+  }
+}
