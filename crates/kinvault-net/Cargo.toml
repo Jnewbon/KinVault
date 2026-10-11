@@ -1,0 +1,18 @@
+[package]
+name = "kinvault-net"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kinvault-core.workspace = true
+blake3.workspace = true
+hex.workspace = true
+iroh.workspace = true
+postcard.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

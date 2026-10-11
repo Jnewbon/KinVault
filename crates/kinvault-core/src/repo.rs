@@ -77,8 +77,12 @@ impl<B: Backend> Repository<B> {
             self.index.remove_pack(gone)?;
         }
         for new in remote.difference(&local) {
-            let data = self.fetch_pack(new)?;
-            let entries = pack::read_header(&self.keys, &data)?;
+            let (len, mut tail) = self.backend.get_pack_tail(new, pack::HEADER_TAIL_GUESS)?;
+            let needed = pack::header_tail_len(&tail)?;
+            if needed > tail.len() as u64 {
+                (_, tail) = self.backend.get_pack_tail(new, needed)?;
+            }
+            let entries = pack::read_header_tail(&self.keys, len, &tail)?;
             self.index.add_pack(new, &entries)?;
         }
         Ok(())

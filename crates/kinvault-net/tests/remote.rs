@@ -1,0 +1,245 @@
+//! Two real iroh endpoints talking over localhost (no relays or DNS discovery).
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use iroh::endpoint::presets;
+use iroh::protocol::Router;
+use iroh::{Endpoint, EndpointAddr, SecretKey};
+use kinvault_core::{Backend, Index, MasterKey, PackId, Repository};
+use kinvault_net::{Grant, NetError, Receiver, RemoteBackend, serve};
+
+const MARKER: &[u8] = b"KINVAULT-REMOTE-PLAINTEXT-MARKER";
+
+async fn local_endpoint() -> Endpoint {
+    Endpoint::builder(presets::Minimal)
+        .secret_key(SecretKey::generate())
+        .clear_ip_transports()
+        .bind_addr("127.0.0.1:0")
+        .unwrap()
+        .bind()
+        .await
+        .unwrap()
+}
+
+struct Host {
+    router: Router,
+    receiver: Receiver,
+    store: PathBuf,
+}
+
+impl Host {
+    async fn start(store: PathBuf) -> Self {
+        let receiver = Receiver::new(&store);
+        let router = serve(local_endpoint().await, receiver.clone());
+        Self {
+            router,
+            receiver,
+            store,
+        }
+    }
+
+    fn addr(&self) -> EndpointAddr {
+        let ep = self.router.endpoint();
+        EndpointAddr::new(ep.id()).with_ip_addr(ep.bound_sockets()[0])
+    }
+}
+
+async fn client(host: &Host, repo: &str) -> (Endpoint, Arc<RemoteBackend>) {
+    let ep = local_endpoint().await;
+    let backend = RemoteBackend::new(
+        ep.clone(),
+        host.addr(),
+        repo,
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    (ep, Arc::new(backend))
+}
+
+/// `Arc<RemoteBackend>` so the test can keep a handle while the repo owns one.
+struct Shared(Arc<RemoteBackend>);
+
+impl Backend for Shared {
+    fn put_pack(&self, id: &PackId, data: &[u8]) -> kinvault_core::Result<()> {
+        self.0.put_pack(id, data)
+    }
+    fn get_pack(&self, id: &PackId) -> kinvault_core::Result<Vec<u8>> {
+        self.0.get_pack(id)
+    }
+    fn get_pack_tail(&self, id: &PackId, max_len: u64) -> kinvault_core::Result<(u64, Vec<u8>)> {
+        self.0.get_pack_tail(id, max_len)
+    }
+    fn list_packs(&self) -> kinvault_core::Result<Vec<PackId>> {
+        self.0.list_packs()
+    }
+    fn delete_pack(&self, id: &PackId) -> kinvault_core::Result<()> {
+        self.0.delete_pack(id)
+    }
+    fn put_snapshot(
+        &self,
+        id: &kinvault_core::SnapshotId,
+        data: &[u8],
+    ) -> kinvault_core::Result<()> {
+        self.0.put_snapshot(id, data)
+    }
+    fn get_snapshot(&self, id: &kinvault_core::SnapshotId) -> kinvault_core::Result<Vec<u8>> {
+        self.0.get_snapshot(id)
+    }
+    fn list_snapshots(&self) -> kinvault_core::Result<Vec<kinvault_core::SnapshotId>> {
+        self.0.list_snapshots()
+    }
+    fn delete_snapshot(&self, id: &kinvault_core::SnapshotId) -> kinvault_core::Result<()> {
+        self.0.delete_snapshot(id)
+    }
+}
+
+fn make_source(dir: &Path) {
+    fs::create_dir_all(dir.join("photos")).unwrap();
+    fs::write(dir.join("diary.txt"), MARKER.repeat(500)).unwrap();
+    let mut big = vec![0u8; 3 * 1024 * 1024];
+    blake3::Hasher::new()
+        .update(b"photo")
+        .finalize_xof()
+        .fill(&mut big);
+    fs::write(dir.join("photos/beach.raw"), big).unwrap();
+}
+
+fn all_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir).unwrap() {
+        let p = entry.unwrap().path();
+        if p.is_dir() {
+            out.extend(all_files(&p))
+        } else {
+            out.push(p)
+        }
+    }
+    out
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn backup_and_restore_through_remote_host() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    make_source(&src);
+    let host = Host::start(tmp.path().join("host")).await;
+    let (client_ep, remote) = client(&host, "laptop-docs").await;
+    host.receiver.allow(client_ep.id(), Grant::default());
+
+    let master = MasterKey::generate().unwrap();
+    let (r, s, t) = (remote.clone(), src.clone(), tmp.path().to_path_buf());
+    let out = tokio::task::spawn_blocking(move || {
+        let mut repo =
+            Repository::open(Shared(r.clone()), &master, Index::open_in_memory().unwrap());
+        let (_, first) = repo.backup(std::slice::from_ref(&s), "laptop").unwrap();
+        assert!(first.bytes_uploaded > 3 * 1024 * 1024 / 2);
+        // Unchanged rerun only sends the snapshot record.
+        let (snap, second) = repo.backup(std::slice::from_ref(&s), "laptop").unwrap();
+        assert_eq!(second.bytes_uploaded, 0);
+        assert_eq!(second.files_changed, 0);
+
+        // A brand-new machine with only the key restores from the host.
+        let mut fresh = Repository::open(Shared(r), &master, Index::open_in_memory().unwrap());
+        let out = t.join("restored");
+        fresh.restore(&snap, &out, None).unwrap();
+        out
+    })
+    .await
+    .unwrap();
+
+    let root = fs::canonicalize(&src)
+        .unwrap()
+        .to_string_lossy()
+        .trim_start_matches('/')
+        .to_string();
+    assert_eq!(
+        fs::read(out.join(&root).join("diary.txt")).unwrap(),
+        MARKER.repeat(500)
+    );
+    assert_eq!(
+        fs::read(out.join(&root).join("photos/beach.raw")).unwrap(),
+        fs::read(src.join("photos/beach.raw")).unwrap()
+    );
+
+    // Host stored the data under the client's id, and can't read any of it.
+    let peer_dir = host
+        .store
+        .join(client_ep.id().to_string())
+        .join("laptop-docs");
+    let stored = all_files(&peer_dir);
+    assert!(!stored.is_empty());
+    for f in stored {
+        let bytes = fs::read(&f).unwrap();
+        assert!(
+            !bytes.windows(MARKER.len()).any(|w| w == MARKER),
+            "plaintext in {f:?}"
+        );
+        assert!(
+            !bytes.windows(9).any(|w| w == b"diary.txt"),
+            "file name in {f:?}"
+        );
+    }
+
+    let status = remote.status().await.unwrap();
+    assert!(status.used_bytes > 0);
+    host.router.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_peer_is_denied() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Host::start(tmp.path().join("host")).await;
+    let (_ep, remote) = client(&host, "repo").await;
+    let err = remote.status().await.unwrap_err();
+    assert!(matches!(err, NetError::Denied(_)), "{err}");
+    // Nothing was created on the host for the stranger.
+    assert!(!host.store.exists() || fs::read_dir(&host.store).unwrap().next().is_none());
+    host.router.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn quota_and_integrity_are_enforced() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Host::start(tmp.path().join("host")).await;
+    let (ep, remote) = client(&host, "repo").await;
+    host.receiver.allow(
+        ep.id(),
+        Grant {
+            quota_bytes: Some(1000),
+        },
+    );
+
+    let r = remote.clone();
+    tokio::task::spawn_blocking(move || {
+        let small = vec![1u8; 600];
+        r.put_pack(&PackId(*blake3::hash(&small).as_bytes()), &small)
+            .unwrap();
+
+        // Second upload would exceed the 1000-byte quota.
+        let more = vec![2u8; 600];
+        let err = r
+            .put_pack(&PackId(*blake3::hash(&more).as_bytes()), &more)
+            .unwrap_err();
+        assert!(err.to_string().contains("quota"), "{err}");
+
+        // Content that doesn't match its claimed id is rejected.
+        let err = r.put_pack(&PackId([0u8; 32]), b"tiny").unwrap_err();
+        assert!(err.to_string().contains("does not match"), "{err}");
+
+        // Missing objects map to NotFound.
+        let err = r.get_pack(&PackId([9u8; 32])).unwrap_err();
+        assert!(matches!(err, kinvault_core::Error::NotFound(_)), "{err}");
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(remote.status().await.unwrap().used_bytes, 600);
+    host.receiver.revoke(&ep.id());
+    assert!(matches!(
+        remote.status().await.unwrap_err(),
+        NetError::Denied(_)
+    ));
+    host.router.shutdown().await.unwrap();
+}

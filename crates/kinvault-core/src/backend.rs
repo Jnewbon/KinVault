@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
@@ -10,6 +10,14 @@ use crate::ids::{PackId, SnapshotId};
 pub trait Backend: Send + Sync {
     fn put_pack(&self, id: &PackId, data: &[u8]) -> Result<()>;
     fn get_pack(&self, id: &PackId) -> Result<Vec<u8>>;
+    /// Returns the pack's total length and up to `max_len` bytes from its end,
+    /// so the header can be read without downloading the whole pack.
+    fn get_pack_tail(&self, id: &PackId, max_len: u64) -> Result<(u64, Vec<u8>)> {
+        let mut data = self.get_pack(id)?;
+        let total = data.len() as u64;
+        let start = data.len().saturating_sub(max_len as usize);
+        Ok((total, data.split_off(start)))
+    }
     fn list_packs(&self) -> Result<Vec<PackId>>;
     fn delete_pack(&self, id: &PackId) -> Result<()>;
     fn put_snapshot(&self, id: &SnapshotId, data: &[u8]) -> Result<()>;
@@ -24,6 +32,9 @@ impl<B: Backend + ?Sized> Backend for Box<B> {
     }
     fn get_pack(&self, id: &PackId) -> Result<Vec<u8>> {
         (**self).get_pack(id)
+    }
+    fn get_pack_tail(&self, id: &PackId, max_len: u64) -> Result<(u64, Vec<u8>)> {
+        (**self).get_pack_tail(id, max_len)
     }
     fn list_packs(&self) -> Result<Vec<PackId>> {
         (**self).list_packs()
@@ -128,6 +139,19 @@ impl Backend for LocalDirBackend {
 
     fn get_pack(&self, id: &PackId) -> Result<Vec<u8>> {
         read_object(&self.pack_path(id), &format!("pack {id}"))
+    }
+
+    fn get_pack_tail(&self, id: &PackId, max_len: u64) -> Result<(u64, Vec<u8>)> {
+        let mut f = fs::File::open(self.pack_path(id)).map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => Error::NotFound(format!("pack {id}")),
+            _ => e.into(),
+        })?;
+        let total = f.metadata()?.len();
+        let start = total.saturating_sub(max_len);
+        f.seek(SeekFrom::Start(start))?;
+        let mut buf = Vec::with_capacity((total - start) as usize);
+        f.read_to_end(&mut buf)?;
+        Ok((total, buf))
     }
 
     fn list_packs(&self) -> Result<Vec<PackId>> {

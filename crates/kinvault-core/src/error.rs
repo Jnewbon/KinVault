@@ -16,6 +16,8 @@ pub enum Error {
     NotFound(String),
     #[error("invalid input: {0}")]
     Invalid(String),
+    #[error("storage backend: {0}")]
+    Backend(String),
     #[error("system random number generator failed")]
     Rng,
 }

@@ -133,23 +133,41 @@ pub fn decode_blob(keys: &Keys, id: &ChunkId, blob: &[u8]) -> Result<Vec<u8>> {
     Ok(plaintext)
 }
 
-pub fn read_header(keys: &Keys, pack: &[u8]) -> Result<Vec<BlobEntry>> {
-    if pack.len() < TRAILER_LEN || &pack[pack.len() - MAGIC.len()..] != MAGIC {
+/// A tail fetch of this size holds the header of nearly every pack.
+pub const HEADER_TAIL_GUESS: u64 = 64 * 1024;
+
+/// How many bytes from the end of a pack are needed to read its header,
+/// given at least the trailer.
+pub fn header_tail_len(tail: &[u8]) -> Result<u64> {
+    if tail.len() < TRAILER_LEN || &tail[tail.len() - MAGIC.len()..] != MAGIC {
         return Err(Error::Corrupt("not a KinVault pack".into()));
     }
-    let len_at = pack.len() - TRAILER_LEN;
-    let header_len = u32::from_le_bytes(pack[len_at..len_at + 4].try_into().unwrap()) as usize;
-    let header_start = len_at
-        .checked_sub(header_len)
-        .ok_or_else(|| Error::Corrupt("pack header length out of range".into()))?;
-    let header = keys.open_meta(HEADER_AAD, &pack[header_start..len_at])?;
+    let len_at = tail.len() - TRAILER_LEN;
+    let header_len = u32::from_le_bytes(tail[len_at..len_at + 4].try_into().unwrap());
+    Ok(header_len as u64 + TRAILER_LEN as u64)
+}
+
+/// Reads a pack header from the last bytes of a pack of length `pack_len`.
+pub fn read_header_tail(keys: &Keys, pack_len: u64, tail: &[u8]) -> Result<Vec<BlobEntry>> {
+    let needed = header_tail_len(tail)?;
+    if needed > tail.len() as u64 || needed > pack_len {
+        return Err(Error::Corrupt("pack header length out of range".into()));
+    }
+    let len_at = tail.len() - TRAILER_LEN;
+    let header_start_in_tail = tail.len() - needed as usize;
+    let header = keys.open_meta(HEADER_AAD, &tail[header_start_in_tail..len_at])?;
     let entries: Vec<BlobEntry> = postcard::from_bytes(&header)?;
+    let blob_area = pack_len - needed;
     for e in &entries {
-        if e.offset + e.len as u64 > header_start as u64 {
+        if e.offset + e.len as u64 > blob_area {
             return Err(Error::Corrupt("pack entry points outside blob area".into()));
         }
     }
     Ok(entries)
+}
+
+pub fn read_header(keys: &Keys, pack: &[u8]) -> Result<Vec<BlobEntry>> {
+    read_header_tail(keys, pack.len() as u64, pack)
 }
 
 pub fn blob_bytes<'a>(pack: &'a [u8], entry: &BlobEntry) -> Result<&'a [u8]> {
@@ -188,6 +206,12 @@ mod tests {
 
         let entries = read_header(&keys, &pack.data).unwrap();
         assert_eq!(entries, pack.entries);
+        let need = header_tail_len(&pack.data[pack.data.len() - 64..]).unwrap() as usize;
+        let tail = &pack.data[pack.data.len() - need..];
+        assert_eq!(
+            read_header_tail(&keys, pack.data.len() as u64, tail).unwrap(),
+            entries
+        );
         assert_eq!(entries.len(), 3);
         for (e, data) in entries.iter().zip(&blobs) {
             let got = decode_blob(&keys, &e.id, blob_bytes(&pack.data, e).unwrap()).unwrap();
