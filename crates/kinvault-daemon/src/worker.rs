@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use kinvault_core::{Backend, Index, LocalDirBackend, MasterKey, Repository};
+use kinvault_core::{Backend, Index, LocalDirBackend, MasterKey, Repository, SnapshotId};
 use kinvault_net::{Endpoint, EndpointAddr, EndpointId, RemoteBackend};
 use notify::event::{AccessKind, AccessMode};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -312,12 +312,19 @@ impl Worker {
             );
         }
         let paths = self.env.set.paths.clone();
+        let previous = self
+            .status
+            .lock()
+            .unwrap()
+            .last_backup
+            .as_ref()
+            .and_then(|b| SnapshotId::from_hex(&b.snapshot).ok());
         let progress = progress_reporter(&self.env);
         let (id, stats) = self
             .with_repo(move |repo| {
                 let host = gethostname::gethostname().to_string_lossy().into_owned();
                 repo.set_progress(Some(progress));
-                let result = repo.backup(&paths, &host);
+                let result = repo.backup_if_changed(&paths, &host, previous.as_ref());
                 repo.set_progress(None);
                 Ok(result?)
             })

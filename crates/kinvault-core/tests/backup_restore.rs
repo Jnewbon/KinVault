@@ -248,3 +248,33 @@ fn corrupted_pack_is_detected() {
         .unwrap_err();
     assert!(err.to_string().contains("corrupt"), "{err}");
 }
+
+#[test]
+fn unchanged_backup_reuses_previous_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.txt"), b"some content").unwrap();
+    let mut repo = Repository::open(
+        LocalDirBackend::create(tmp.path().join("store")).unwrap(),
+        &MasterKey::generate().unwrap(),
+        Index::open_in_memory().unwrap(),
+    );
+    let sources = std::slice::from_ref(&src);
+    let (first, _) = repo.backup(sources, "h").unwrap();
+
+    let (same, stats) = repo.backup_if_changed(sources, "h", Some(&first)).unwrap();
+    assert_eq!(same, first);
+    assert_eq!(stats.files_changed, 0);
+    assert_eq!(repo.list_snapshots().unwrap().len(), 1);
+
+    // A previous snapshot that no longer exists doesn't stop a backup.
+    let gone = SnapshotId::from_hex(&"00".repeat(32)).unwrap();
+    let (fresh, _) = repo.backup_if_changed(sources, "h", Some(&gone)).unwrap();
+    assert_ne!(fresh, first);
+
+    fs::write(src.join("a.txt"), b"other content").unwrap();
+    let (changed, _) = repo.backup_if_changed(sources, "h", Some(&fresh)).unwrap();
+    assert_ne!(changed, fresh);
+    assert_eq!(repo.list_snapshots().unwrap().len(), 3);
+}

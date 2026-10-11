@@ -130,6 +130,19 @@ impl<B: Backend> Repository<B> {
         sources: &[PathBuf],
         hostname: &str,
     ) -> Result<(SnapshotId, BackupStats)> {
+        self.backup_if_changed(sources, hostname, None)
+    }
+
+    /// Like [`Self::backup`], but if the result would be identical to the
+    /// `previous` snapshot (same sources, same contents), no new snapshot is
+    /// stored and `previous` is returned. Saves traffic and keeps retention's
+    /// "latest N" for real changes.
+    pub fn backup_if_changed(
+        &mut self,
+        sources: &[PathBuf],
+        hostname: &str,
+        previous: Option<&SnapshotId>,
+    ) -> Result<(SnapshotId, BackupStats)> {
         self.sync_index()?;
         let mut run = BackupRun {
             repo: self,
@@ -155,6 +168,16 @@ impl<B: Backend> Repository<B> {
         let root = run.store_tree(Tree { nodes })?;
         run.flush()?;
         let stats = run.stats;
+
+        if let Some(prev) = previous
+            // Gone (e.g. pruned) or unreadable: just store a new one.
+            && let Ok(old) = self.load_snapshot(prev)
+            && old.root == root
+            && old.paths == paths
+            && old.hostname == hostname
+        {
+            return Ok((*prev, stats));
+        }
 
         let snapshot = Snapshot {
             time_ns: SystemTime::now()

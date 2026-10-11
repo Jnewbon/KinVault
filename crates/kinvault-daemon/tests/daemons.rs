@@ -136,7 +136,11 @@ async fn daemon_backs_up_changes_to_peer() {
         .await
         .unwrap()
     {
-        Reply::Backup(b) => assert_eq!(b.files_changed, 0),
+        // Nothing changed: no new snapshot.
+        Reply::Backup(b) => {
+            assert_eq!(b.files_changed, 0);
+            assert_eq!(b.snapshot, second.snapshot);
+        }
         other => panic!("{other:?}"),
     }
     let err = client
@@ -149,7 +153,7 @@ async fn daemon_backs_up_changes_to_peer() {
     else {
         panic!()
     };
-    assert_eq!(snaps.len(), 3);
+    assert_eq!(snaps.len(), 2);
 
     let out = tmp.path().join("restored");
     call(

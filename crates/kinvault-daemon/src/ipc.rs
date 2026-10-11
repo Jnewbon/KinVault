@@ -158,8 +158,12 @@ impl Listener {
         let inner = ServerOptions::new()
             .first_pipe_instance(true)
             .create(path.as_os_str())
-            .map_err(|e| {
-                io::Error::new(e.kind(), format!("kinvaultd may already be running: {e}"))
+            .map_err(|e| match e.kind() {
+                // Another process holds the first instance of this pipe.
+                io::ErrorKind::PermissionDenied => {
+                    io::Error::new(io::ErrorKind::AddrInUse, "kinvaultd is already running")
+                }
+                _ => e,
             })?;
         Ok(Self {
             inner,
