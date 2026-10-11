@@ -17,11 +17,11 @@ use notify::event::{AccessKind, AccessMode};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::api::{BackupSummary, PruneSummary, SetState, VerifySummary};
+use crate::api::{BackupSummary, Event, PruneSummary, SetState, VerifySummary};
 use crate::config::{SetConfig, StoredTarget, write_private};
 
 /// A burst of changes never delays a backup by more than this.
@@ -67,6 +67,7 @@ pub(crate) struct SetEnv {
     pub endpoint: Endpoint,
     pub runtime: Handle,
     pub excludes: Vec<PathBuf>,
+    pub events: broadcast::Sender<Event>,
 }
 
 pub(crate) fn master_key_path(set_dir: &Path) -> PathBuf {
@@ -229,6 +230,38 @@ fn start_watcher(env: &SetEnv, tx: mpsc::Sender<Trigger>) -> Option<RecommendedW
     Some(watcher)
 }
 
+/// Updates the set's state, telling subscribers if it changed.
+fn set_state(env: &SetEnv, status: &Mutex<RunStatus>, state: SetState) {
+    let mut st = status.lock().unwrap();
+    if st.state != state {
+        st.state = state;
+        let _ = env.events.send(Event::SetState {
+            set: env.set.id.clone(),
+            state,
+        });
+    }
+}
+
+/// Forwards backup progress to subscribers, at most four times a second.
+fn progress_reporter(env: &SetEnv) -> kinvault_core::ProgressFn {
+    let events = env.events.clone();
+    let set = env.set.id.clone();
+    let last = Mutex::new(std::time::Instant::now() - Duration::from_secs(1));
+    Arc::new(move |p: &kinvault_core::BackupProgress| {
+        let mut last = last.lock().unwrap();
+        if last.elapsed() >= Duration::from_millis(250) {
+            *last = std::time::Instant::now();
+            let _ = events.send(Event::Progress {
+                set: set.clone(),
+                files: p.files,
+                total_bytes: p.total_bytes,
+                bytes_read: p.bytes_read,
+                bytes_uploaded: p.bytes_uploaded,
+            });
+        }
+    })
+}
+
 fn retry_delay(failures: u32) -> Duration {
     Duration::from_secs(60)
         .saturating_mul(1 << failures.saturating_sub(1).min(10))
@@ -273,10 +306,14 @@ impl Worker {
             );
         }
         let paths = self.env.set.paths.clone();
+        let progress = progress_reporter(&self.env);
         let (id, stats) = self
             .with_repo(move |repo| {
                 let host = gethostname::gethostname().to_string_lossy().into_owned();
-                Ok(repo.backup(&paths, &host)?)
+                repo.set_progress(Some(progress));
+                let result = repo.backup(&paths, &host);
+                repo.set_progress(None);
+                Ok(result?)
             })
             .await?;
         Ok(BackupSummary {
@@ -340,6 +377,7 @@ impl Worker {
         if let Ok(json) = serde_json::to_string(&st.maintenance) {
             let _ = fs::write(self.env.maintenance_path(), json);
         }
+        let _ = self.env.events.send(Event::SetsChanged);
     }
 
     /// Runs prune and verify if they are due. Returns true if a backup should
@@ -399,15 +437,19 @@ async fn run(env: SetEnv, status: Arc<Mutex<RunStatus>>, mut rx: mpsc::Receiver<
     let mut waiting_for_window = false;
 
     loop {
-        status.lock().unwrap().state = if paused {
-            SetState::Paused
-        } else if change_deadline.is_some() {
-            SetState::ChangesPending
-        } else if waiting_for_window {
-            SetState::WaitingForWindow
-        } else {
-            SetState::Idle
-        };
+        set_state(
+            &worker.env,
+            &status,
+            if paused {
+                SetState::Paused
+            } else if change_deadline.is_some() {
+                SetState::ChangesPending
+            } else if waiting_for_window {
+                SetState::WaitingForWindow
+            } else {
+                SetState::Idle
+            },
+        );
         let next = change_deadline.map_or(scheduled, |c| c.min(scheduled));
         let run_now = tokio::select! {
             msg = rx.recv() => match msg {
@@ -423,12 +465,12 @@ async fn run(env: SetEnv, status: Arc<Mutex<RunStatus>>, mut rx: mpsc::Receiver<
                     true
                 }
                 Some(Trigger::Prune(reply)) => {
-                    status.lock().unwrap().state = SetState::Running;
+                    set_state(&worker.env, &status, SetState::Running);
                     let _ = reply.send(worker.prune().await.map_err(|e| format!("{e:#}")));
                     false
                 }
                 Some(Trigger::Verify(max_bytes, reply)) => {
-                    status.lock().unwrap().state = SetState::Running;
+                    set_state(&worker.env, &status, SetState::Running);
                     let result = worker.verify(max_bytes).await;
                     if matches!(&result, Ok(v) if !v.ok) && !paused {
                         scheduled = Instant::now();
@@ -456,7 +498,7 @@ async fn run(env: SetEnv, status: Arc<Mutex<RunStatus>>, mut rx: mpsc::Receiver<
             }
         }
         waiting_for_window = false;
-        status.lock().unwrap().state = SetState::Running;
+        set_state(&worker.env, &status, SetState::Running);
 
         let result = worker.backup().await;
         match result {
@@ -478,6 +520,10 @@ async fn run(env: SetEnv, status: Arc<Mutex<RunStatus>>, mut rx: mpsc::Receiver<
                     st.last_backup = Some(summary.clone());
                     st.last_error = None;
                 }
+                let _ = worker.env.events.send(Event::BackupFinished {
+                    set: worker.env.set.id.clone(),
+                    summary: summary.clone(),
+                });
                 for w in waiters.drain(..) {
                     let _ = w.send(Ok(summary.clone()));
                 }
@@ -494,6 +540,10 @@ async fn run(env: SetEnv, status: Arc<Mutex<RunStatus>>, mut rx: mpsc::Receiver<
                     tracing::warn!(set = %worker.env.set.name, "backup failed (retrying in {}s): {msg}", delay.as_secs());
                     status.lock().unwrap().last_error = Some(msg.clone());
                 }
+                let _ = worker.env.events.send(Event::BackupFailed {
+                    set: worker.env.set.id.clone(),
+                    error: msg.clone(),
+                });
                 for w in waiters.drain(..) {
                     let _ = w.send(Err(msg.clone()));
                 }

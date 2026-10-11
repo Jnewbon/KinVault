@@ -13,10 +13,10 @@ use kinvault_net::{
     RemoteBackend,
 };
 use tokio::runtime::Handle;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::api::{self, GrantSpec, HostOffer, Reply, Request};
+use crate::api::{self, Event, GrantSpec, HostOffer, Reply, Request};
 use crate::config::{Config, PendingInvite, SetConfig, StoredTarget};
 use crate::worker::{
     SetEnv, SetHandle, Trigger, VERIFY_BUDGET_BYTES, peer_addr, read_master_key, write_master_key,
@@ -50,6 +50,7 @@ struct Inner {
     config: Mutex<Config>,
     sets: Mutex<HashMap<String, SetHandle>>,
     background: std::sync::Mutex<Vec<JoinHandle<()>>>,
+    events: broadcast::Sender<Event>,
 }
 
 fn unix_now() -> i64 {
@@ -99,6 +100,7 @@ impl Daemon {
                 sets: Mutex::new(HashMap::new()),
                 config: Mutex::new(config.clone()),
                 background: Default::default(),
+                events: broadcast::channel(256).0,
             }),
         };
 
@@ -181,6 +183,7 @@ impl Daemon {
             endpoint: self.inner.endpoint.clone(),
             runtime: self.inner.runtime.clone(),
             excludes,
+            events: self.inner.events.clone(),
         }
     }
 
@@ -194,12 +197,34 @@ impl Daemon {
     }
 
     pub async fn handle(&self, req: Request) -> Result<Reply, String> {
-        self.dispatch(req).await.map_err(|e| format!("{e:#}"))
+        let event = match &req {
+            Request::SetInstanceName { .. }
+            | Request::CreateSet(_)
+            | Request::RemoveSet { .. }
+            | Request::SetLimits { .. }
+            | Request::SetRetention { .. }
+            | Request::PauseSet { .. }
+            | Request::ResumeSet { .. } => Some(Event::SetsChanged),
+            Request::PeerAllow { .. }
+            | Request::PeerRevoke { .. }
+            | Request::CreateInvite(_)
+            | Request::CancelInvite { .. }
+            | Request::RedeemInvite { .. } => Some(Event::PeersChanged),
+            _ => None,
+        };
+        let result = self.dispatch(req).await.map_err(|e| format!("{e:#}"));
+        if result.is_ok()
+            && let Some(event) = event
+        {
+            self.notify(event);
+        }
+        result
     }
 
     async fn dispatch(&self, req: Request) -> Result<Reply> {
         match req {
             Request::Status => self.status().await,
+            Request::Subscribe => bail!("subscribing is only possible over the control socket"),
             Request::SetInstanceName { name } => {
                 let name = name.trim().to_string();
                 ensure!(!name.is_empty(), "name must not be empty");
@@ -422,6 +447,15 @@ impl Daemon {
                 offer,
             } => self.redeem_invite(&ticket, name, offer).await,
         }
+    }
+
+    /// Live events: set states, backup progress and configuration changes.
+    pub fn subscribe(&self) -> broadcast::Receiver<Event> {
+        self.inner.events.subscribe()
+    }
+
+    fn notify(&self, event: Event) {
+        let _ = self.inner.events.send(event);
     }
 
     /// Sends a request to a set's worker and waits for its answer.
@@ -650,6 +684,7 @@ impl Daemon {
             .map_err(|e| format!("host could not save the invite: {e:#}"))?;
         self.inner.receiver.allow(r.peer, invite.grant.to_grant());
         tracing::info!(peer = %peer_id, name = ?entry_name(&config, &peer_id), "invite redeemed");
+        self.notify(Event::PeersChanged);
         Ok(InviteAccepted {
             host_name: Self::instance_name(&config),
             quota_bytes: invite.grant.quota_bytes,

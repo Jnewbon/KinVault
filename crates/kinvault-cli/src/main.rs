@@ -65,6 +65,11 @@ enum Command {
         #[arg(long)]
         full: bool,
     },
+    /// Show live activity until interrupted.
+    Watch,
+    /// Start kinvaultd automatically when you log in.
+    #[command(subcommand)]
+    Service(ServiceCommand),
     /// Export or import a recovery kit for restoring on a new machine.
     #[command(subcommand)]
     Recovery(RecoveryCommand),
@@ -119,6 +124,15 @@ enum SetCommand {
     },
     /// Stop backing up a set. Existing backups and the set's key are kept.
     Remove { set: String },
+}
+
+#[derive(Subcommand)]
+enum ServiceCommand {
+    /// Start kinvaultd now and at every login.
+    Install,
+    /// Stop starting kinvaultd at login (and stop it).
+    Uninstall,
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -384,6 +398,40 @@ async fn main() -> Result<()> {
         None => kinvault_daemon::default_state_dir()
             .context("could not determine a data directory; pass --state")?,
     };
+    if let Command::Service(cmd) = &cli.command {
+        use kinvault_daemon::service;
+        // Only pass --state through when it isn't the default.
+        let custom_state = (Some(&state) != kinvault_daemon::default_state_dir().as_ref())
+            .then_some(state.as_path());
+        match cmd {
+            ServiceCommand::Install => {
+                let daemon = service::daemon_binary()?;
+                service::install(&daemon, custom_state)?;
+                println!(
+                    "kinvaultd ({}) now starts at login and is running.",
+                    daemon.display()
+                );
+            }
+            ServiceCommand::Uninstall => {
+                service::uninstall()?;
+                println!("kinvaultd no longer starts at login.");
+            }
+            ServiceCommand::Status => {
+                let installed = if service::is_installed() {
+                    "starts at login"
+                } else {
+                    "does not start at login"
+                };
+                let running = if kinvault_daemon::ipc::daemon_running(&state) {
+                    "running"
+                } else {
+                    "not running"
+                };
+                println!("kinvaultd {installed}; currently {running}.");
+            }
+        }
+        return Ok(());
+    }
     // Importing a recovery kit happens before the daemon runs.
     if let Command::Recovery(RecoveryCommand::Import { file, force }) = &cli.command {
         let json =
@@ -608,8 +656,48 @@ async fn main() -> Result<()> {
             );
             println!("Export again after adding backup sets.");
         }
-        Command::Recovery(RecoveryCommand::Import { .. }) => {
+        Command::Recovery(RecoveryCommand::Import { .. }) | Command::Service(_) => {
             unreachable!("handled before connecting")
+        }
+        Command::Watch => {
+            use kinvault_daemon::api::Event;
+            let Reply::Status(s) = client.call(&Request::Status).await? else {
+                bail!("unexpected reply")
+            };
+            let names: std::collections::HashMap<String, String> =
+                s.sets.into_iter().map(|set| (set.id, set.name)).collect();
+            let name = |id: &String| names.get(id).cloned().unwrap_or_else(|| id.clone());
+            let mut events = client.subscribe().await?;
+            println!("watching kinvaultd (Ctrl+C to stop)");
+            while let Some(event) = events.next().await {
+                match event {
+                    Event::SetState { set, state } => println!("{}: {state:?}", name(&set)),
+                    Event::Progress {
+                        set,
+                        files,
+                        total_bytes,
+                        bytes_uploaded,
+                        ..
+                    } => println!(
+                        "{}: {files} files scanned ({}), uploaded {}",
+                        name(&set),
+                        format_bytes(total_bytes),
+                        format_bytes(bytes_uploaded)
+                    ),
+                    Event::BackupFinished { set, summary } => println!(
+                        "{}: backup done, {} changed, uploaded {}",
+                        name(&set),
+                        summary.files_changed,
+                        format_bytes(summary.bytes_uploaded)
+                    ),
+                    Event::BackupFailed { set, error } => {
+                        println!("{}: backup failed: {error}", name(&set))
+                    }
+                    Event::SetsChanged => println!("(backup sets changed)"),
+                    Event::PeersChanged => println!("(peers changed)"),
+                }
+            }
+            println!("kinvaultd stopped");
         }
         Command::Set(SetCommand::Remove { set }) => {
             client.call(&Request::RemoveSet { set }).await?;

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
-use crate::api::{Reply, Request};
+use crate::api::{Event, Reply, Request};
 use crate::daemon::Daemon;
 
 #[derive(Debug, thiserror::Error)]
@@ -73,15 +73,52 @@ async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin>(
     let (read, mut write) = tokio::io::split(stream);
     let mut lines = BufReader::new(read).lines();
     while let Some(line) = lines.next_line().await? {
-        let reply = match serde_json::from_str::<Request>(&line) {
+        let request = serde_json::from_str::<Request>(&line);
+        if matches!(request, Ok(Request::Subscribe)) {
+            let events = daemon.subscribe();
+            write_line(&mut write, &Ok::<Reply, String>(Reply::Subscribed)).await?;
+            return stream_events(events, &mut write, lines).await;
+        }
+        let reply = match request {
             Ok(req) => daemon.handle(req).await,
             Err(e) => Err(format!("malformed request: {e}")),
         };
-        let mut out = serde_json::to_string(&reply).map_err(io::Error::other)?;
-        out.push('\n');
-        write.write_all(out.as_bytes()).await?;
+        write_line(&mut write, &reply).await?;
     }
     Ok(())
+}
+
+async fn write_line<W: AsyncWrite + Unpin, T: serde::Serialize>(
+    write: &mut W,
+    value: &T,
+) -> io::Result<()> {
+    let mut out = serde_json::to_string(value).map_err(io::Error::other)?;
+    out.push('\n');
+    write.write_all(out.as_bytes()).await
+}
+
+/// Sends events until the client goes away.
+async fn stream_events<W: AsyncWrite + Unpin, R: tokio::io::AsyncBufRead + Unpin>(
+    mut events: tokio::sync::broadcast::Receiver<Event>,
+    write: &mut W,
+    mut lines: tokio::io::Lines<R>,
+) -> io::Result<()> {
+    use tokio::sync::broadcast::error::RecvError;
+    loop {
+        tokio::select! {
+            event = events.recv() => match event {
+                Ok(event) => write_line(write, &event).await?,
+                // Too slow to keep up: tell the client to refresh everything.
+                Err(RecvError::Lagged(_)) => {
+                    write_line(write, &Event::SetsChanged).await?;
+                    write_line(write, &Event::PeersChanged).await?;
+                }
+                Err(RecvError::Closed) => return Ok(()),
+            },
+            // The client closed its side.
+            line = lines.next_line() => if line?.is_none() { return Ok(()) },
+        }
+    }
 }
 
 /// The daemon's control socket. Binding it doubles as the single-instance
@@ -190,6 +227,12 @@ impl Client {
         })
     }
 
+    /// Turns this connection into a stream of daemon events.
+    pub async fn subscribe(mut self) -> Result<EventStream, ClientError> {
+        self.call(&Request::Subscribe).await?;
+        Ok(EventStream { client: self })
+    }
+
     pub async fn call(&mut self, request: &Request) -> Result<Reply, ClientError> {
         let mut line = serde_json::to_string(request).map_err(io::Error::other)?;
         line.push('\n');
@@ -220,5 +263,26 @@ mod tests {
         let name = endpoint_name(&long);
         assert!(name.as_os_str().len() <= MAX_SOCKET_PATH + 40, "{name:?}");
         assert_ne!(name, endpoint_name(&long.join("other")));
+    }
+}
+
+/// Events from [`Client::subscribe`].
+pub struct EventStream {
+    client: Client,
+}
+
+impl EventStream {
+    /// The next event, or `None` once the daemon has gone away.
+    pub async fn next(&mut self) -> Option<Event> {
+        loop {
+            let mut line = String::new();
+            match self.client.stream.read_line(&mut line).await {
+                Ok(0) | Err(_) => return None,
+                Ok(_) => match serde_json::from_str(&line) {
+                    Ok(event) => return Some(event),
+                    Err(e) => tracing::debug!("ignoring unknown event: {e}"),
+                },
+            }
+        }
     }
 }

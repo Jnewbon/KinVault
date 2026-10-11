@@ -10,6 +10,7 @@ pub mod config;
 mod daemon;
 pub mod ipc;
 pub mod recovery;
+pub mod service;
 mod worker;
 
 use std::path::PathBuf;

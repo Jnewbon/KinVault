@@ -60,6 +60,9 @@ pub enum Request {
     ExportRecoveryKit {
         passphrase: String,
     },
+    /// Turns this connection into a stream of [`Event`]s, one JSON object per
+    /// line, after a `Subscribed` reply.
+    Subscribe,
     ListSnapshots {
         set: String,
     },
@@ -202,6 +205,36 @@ pub enum Reply {
     RecoveryKit {
         json: String,
     },
+    Subscribed,
+}
+
+/// Something changed in the daemon; streamed to subscribers.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum Event {
+    SetState {
+        set: String,
+        state: SetState,
+    },
+    Progress {
+        set: String,
+        files: u64,
+        total_bytes: u64,
+        bytes_read: u64,
+        bytes_uploaded: u64,
+    },
+    BackupFinished {
+        set: String,
+        summary: BackupSummary,
+    },
+    BackupFailed {
+        set: String,
+        error: String,
+    },
+    /// Sets were created, removed or reconfigured, or maintenance ran.
+    SetsChanged,
+    /// Peers or invites changed.
+    PeersChanged,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

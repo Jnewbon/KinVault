@@ -17,6 +17,8 @@ pub use crypto::{KeyFile, Keys, MasterKey};
 pub use error::{Error, Result};
 pub use ids::{ChunkId, PackId, SnapshotId};
 pub use index::Index;
-pub use repo::{BackupStats, PruneStats, Repository, RestoreStats, VerifyReport};
+pub use repo::{
+    BackupProgress, BackupStats, ProgressFn, PruneStats, Repository, RestoreStats, VerifyReport,
+};
 pub use retention::RetentionPolicy;
 pub use snapshot::Snapshot;

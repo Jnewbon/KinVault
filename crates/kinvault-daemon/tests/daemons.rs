@@ -662,3 +662,78 @@ fn hex_master_key(state: &Path) -> String {
         .trim()
         .to_string()
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn subscribers_see_state_changes_and_results() {
+    use kinvault_daemon::api::Event;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let daemon = start(&state, SecretKey::generate()).await;
+    let listener = ipc::Listener::bind(&ipc::endpoint_name(&state))
+        .await
+        .unwrap();
+    let server = tokio::spawn(listener.serve(daemon.clone()));
+    let mut events = ipc::Client::connect(&state)
+        .await
+        .unwrap()
+        .subscribe()
+        .await
+        .unwrap();
+
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    for i in 0..50 {
+        fs::write(src.join(format!("f{i}")), vec![i as u8; 100_000]).unwrap();
+    }
+    call(
+        &daemon,
+        Request::CreateSet(CreateSet {
+            name: "local".into(),
+            paths: vec![src],
+            target: Target::Local {
+                path: tmp.path().join("disk"),
+            },
+            recovery_passphrase: "recovery phrase".into(),
+            debounce_secs: Some(60),
+            rescan_secs: None,
+            upload_limit: None,
+            window: None,
+            retention: None,
+        }),
+    )
+    .await;
+
+    let mut seen = Vec::new();
+    let finished = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(event) = events.next().await {
+            let done = matches!(event, Event::BackupFinished { .. });
+            seen.push(event);
+            if done {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap();
+    assert!(finished, "{seen:?}");
+    assert!(matches!(seen[0], Event::SetsChanged), "{seen:?}");
+    assert!(
+        seen.iter().any(|e| matches!(
+            e,
+            Event::SetState {
+                state: SetState::Running,
+                ..
+            }
+        )),
+        "{seen:?}"
+    );
+    let Some(Event::BackupFinished { summary, .. }) = seen.last() else {
+        panic!()
+    };
+    assert_eq!(summary.files, 50);
+
+    server.abort();
+    daemon.shutdown().await;
+}

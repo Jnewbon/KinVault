@@ -1,6 +1,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fastcdc::v2020::StreamCDC;
@@ -21,6 +22,17 @@ const CHUNK_AVG: u32 = 1024 * 1024;
 const CHUNK_MAX: u32 = 4 * 1024 * 1024;
 const DEFAULT_PACK_TARGET: usize = 32 * 1024 * 1024;
 const PACK_CACHE_SLOTS: usize = 4;
+
+/// Running totals reported while a backup is in progress.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BackupProgress {
+    pub files: u64,
+    pub total_bytes: u64,
+    pub bytes_read: u64,
+    pub bytes_uploaded: u64,
+}
+
+pub type ProgressFn = Arc<dyn Fn(&BackupProgress) + Send + Sync>;
 
 #[derive(Debug, Default, Clone)]
 pub struct BackupStats {
@@ -52,6 +64,7 @@ pub struct Repository<B: Backend> {
     index: Index,
     pack_target: usize,
     excludes: Vec<PathBuf>,
+    progress: Option<ProgressFn>,
 }
 
 impl<B: Backend> Repository<B> {
@@ -62,6 +75,7 @@ impl<B: Backend> Repository<B> {
             index,
             pack_target: DEFAULT_PACK_TARGET,
             excludes: Vec::new(),
+            progress: None,
         }
     }
 
@@ -70,6 +84,11 @@ impl<B: Backend> Repository<B> {
     }
 
     /// Absolute paths (and everything below them) to leave out of backups.
+    /// Called after each file during backups; keep it cheap.
+    pub fn set_progress(&mut self, progress: Option<ProgressFn>) {
+        self.progress = progress;
+    }
+
     pub fn set_excludes(&mut self, excludes: Vec<PathBuf>) {
         self.excludes = excludes;
     }
@@ -395,6 +414,17 @@ impl<B: Backend> BackupRun<'_, B> {
         Ok(())
     }
 
+    fn report_progress(&self) {
+        if let Some(progress) = &self.repo.progress {
+            progress(&BackupProgress {
+                files: self.stats.files,
+                total_bytes: self.stats.total_bytes,
+                bytes_read: self.stats.bytes_read,
+                bytes_uploaded: self.writer.bytes,
+            });
+        }
+    }
+
     fn is_stored(&self, id: &ChunkId) -> Result<bool> {
         Ok(self.writer.contains(id) || self.repo.index.has_chunk(id)?)
     }
@@ -507,6 +537,7 @@ impl<B: Backend> BackupRun<'_, B> {
         self.stats.files += 1;
         self.stats.files_changed += 1;
         self.stats.bytes_read += read;
+        self.report_progress();
         self.stats.total_bytes += read;
         // Cache keyed on the metadata seen *before* reading, so a file modified
         // mid-read gets a new mtime and is re-read next time.
