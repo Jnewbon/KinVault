@@ -16,12 +16,14 @@ kinvault-daemon = { path = "crates/kinvault-daemon" }
 
 anyhow = "1"
 argon2 = "0.5"
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json"] }
 blake3 = "1.8"
 chacha20poly1305 = "0.10"
 clap = { version = "4.5", features = ["derive", "env"] }
 data-encoding = "2"
 directories = "6"
 fastcdc = "3"
+futures-util = { version = "0.3", default-features = false }
 gethostname = "1"
 getrandom = "0.3"
 hex = "0.4"

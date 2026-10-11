@@ -37,12 +37,13 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo fmt --all --check
 
-      # Default workspace members: everything except the desktop app.
+      # Default workspace members: everything except the desktop app,
+      # including the daemon's web interface.
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --features kinvault-daemon/web -- -D warnings
 
       - name: Test
-        run: cargo test
+        run: cargo test --features kinvault-daemon/web
 
   gui:
     name: Desktop app (lint)
@@ -69,4 +70,6 @@ jobs:
         run: cargo clippy -p kinvault-gui --all-targets -- -D warnings
 
       - name: Check frontend syntax
-        run: node --check crates/kinvault-gui/ui/app.js
+        run: |
+          node --check crates/kinvault-gui/ui/app.js
+          for f in crates/kinvault-daemon/web/*.js; do node --check "$f"; done

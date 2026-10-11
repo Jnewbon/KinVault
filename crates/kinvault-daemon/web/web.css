@@ -1,0 +1,12 @@
+/* Additions for the web interface (kinvaultd --web). */
+.login { min-height: 100vh; display: grid; place-items: center; padding: 16px; box-sizing: border-box; }
+.login form { width: min(360px, 100%); display: grid; gap: 14px; }
+.login .brand { display: flex; align-items: center; gap: 10px; font-weight: 650; font-size: 18px; }
+.login .brand img { width: 32px; height: 32px; }
+.login .btn { justify-self: end; }
+.folder-browser { width: min(560px, calc(100vw - 32px)); }
+.folder-list { min-height: 200px; max-height: 320px; margin-top: 10px; }
+.folder-list .item.link { cursor: pointer; border-radius: 6px; }
+.folder-list .item.link:hover { background: var(--surface-2); }
+.folder-browser .small { margin-top: 8px; }
+.login .brand span { display: inline; }

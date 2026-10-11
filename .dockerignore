@@ -1,0 +1,8 @@
+# Only sources go into the image build.
+target
+.git
+.idea
+.github
+**/node_modules
+crates/kinvault-gui/binaries
+crates/kinvault-gui/gen

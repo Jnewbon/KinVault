@@ -76,6 +76,22 @@ artifacts without creating a release. `.github/workflows/ci.yml` runs
 formatting, clippy and the tests on Linux, macOS and Windows for every push
 and pull request.
 
+### Server / NAS (Docker)
+
+For headless machines, `kinvaultd` can serve the desktop app's interface over
+HTTP (cargo feature `web`, enabled with `--web 0.0.0.0:8080`, password
+sign-in). The `Dockerfile` builds an image with it and the CLI, and
+`.github/workflows/docker.yml` publishes it to `ghcr.io/<owner>/kinvault` for
+every push to the default branch and every release tag. See
+[`deploy/truenas/README.md`](deploy/truenas/README.md) for TrueNAS SCALE.
+
+```sh
+docker build -t kinvault .
+docker run -d --name kinvault --network host -v kinvault-data:/data \
+  -v ~/Documents:/backup/documents:ro kinvault
+docker logs kinvault        # shows the generated web password
+```
+
 When run from an AppImage, the app copies `kinvaultd` to
 `~/.local/share/KinVault/bin/` before starting it or registering it to run at
 login, because the AppImage's own files disappear when the app exits.

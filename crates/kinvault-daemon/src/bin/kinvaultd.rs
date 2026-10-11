@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use kinvault_daemon::config::Config;
 use kinvault_daemon::{Daemon, DaemonOptions, default_state_dir, ipc};
 
 #[derive(Parser)]
@@ -12,6 +13,14 @@ struct Args {
     /// Directory holding this instance's identity, configuration and keys.
     #[arg(long, env = "KINVAULT_STATE")]
     state: Option<PathBuf>,
+    /// UDP port to listen on for peers when none has been configured yet
+    /// (e.g. to match a container's published port).
+    #[arg(long, env = "KINVAULT_LISTEN_PORT", value_parser = clap::value_parser!(u16).range(1..))]
+    listen_port: Option<u16>,
+    /// Serve the web interface on this address, e.g. 0.0.0.0:8080.
+    #[cfg(feature = "web")]
+    #[arg(long, env = "KINVAULT_WEB")]
+    web: Option<std::net::SocketAddr>,
 }
 
 #[tokio::main]
@@ -32,6 +41,25 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&state_dir)?;
 
     let listener = ipc::Listener::bind(&ipc::endpoint_name(&state_dir)).await?;
+    if let Some(port) = args.listen_port {
+        let path = state_dir.join("config.json");
+        let mut config = Config::load(&path)?;
+        if config.listen_port.is_none() {
+            config.listen_port = Some(port);
+            config.save(&path)?;
+        }
+    }
+    #[cfg(feature = "web")]
+    let web = match args.web {
+        Some(addr) => {
+            let password = kinvault_daemon::web::password(&state_dir)?;
+            let tcp = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("listening for the web interface on {addr}"))?;
+            Some((tcp, password))
+        }
+        None => None,
+    };
     let daemon = Daemon::start(DaemonOptions {
         state_dir,
         endpoint: None,
@@ -43,9 +71,23 @@ async fn main() -> Result<()> {
         daemon.id()
     );
 
+    #[cfg(feature = "web")]
+    let web = async {
+        match web {
+            Some((tcp, password)) => {
+                tracing::info!("web interface on http://{}", tcp.local_addr()?);
+                kinvault_daemon::web::serve(daemon.clone(), tcp, &password).await
+            }
+            None => std::future::pending().await,
+        }
+    };
+    #[cfg(not(feature = "web"))]
+    let web = std::future::pending::<Result<()>>();
+
     let socket = listener.path().to_path_buf();
     tokio::select! {
         result = listener.serve(daemon.clone()) => result?,
+        result = web => result?,
         _ = shutdown_signal() => tracing::info!("shutting down"),
     }
     daemon.shutdown().await;

@@ -11,6 +11,8 @@ mod daemon;
 pub mod ipc;
 pub mod recovery;
 pub mod service;
+#[cfg(feature = "web")]
+pub mod web;
 mod worker;
 
 use std::path::PathBuf;

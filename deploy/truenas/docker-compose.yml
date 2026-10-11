@@ -1,0 +1,33 @@
+# KinVault on TrueNAS SCALE: Apps → Discover Apps → ⋮ → Install via YAML,
+# then paste this file. Adjust the paths under `volumes` to your pools first.
+services:
+  kinvault:
+    image: ghcr.io/jnewbon/kinvault:latest
+    container_name: kinvault
+    restart: unless-stopped
+    # The host network lets KinVault see the NAS's real addresses, so friends
+    # on your LAN connect directly and your router can map its port.
+    network_mode: host
+    # TrueNAS's "apps" user. It needs write access to the /data dataset and
+    # read access to everything you back up.
+    user: "568:568"
+    environment:
+      # Web interface. Change the port if 8080 is taken on the NAS.
+      KINVAULT_WEB: "0.0.0.0:8080"
+      # UDP port for other KinVault instances; forward it on your router.
+      KINVAULT_LISTEN_PORT: "47100"
+      # Sign-in password for the web interface. Leave unset to have one
+      # generated and printed in the app's logs on first start.
+      # KINVAULT_WEB_PASSWORD: "choose-a-long-password"
+    volumes:
+      # Identity, encryption keys, settings and indexes. Keep it on a dataset
+      # you snapshot; without it (or a recovery kit) backups can't be read.
+      - /mnt/tank/apps/kinvault:/data
+      # Optional: store friends' backups on a separate dataset.
+      # - /mnt/tank/kinvault-hosted:/data/hosted
+      # What to back up: mount datasets read-only under /backup and choose
+      # them in the web interface.
+      - /mnt/tank/documents:/backup/documents:ro
+      - /mnt/tank/photos:/backup/photos:ro
+      # Somewhere writable to restore into.
+      - /mnt/tank/kinvault-restore:/restore

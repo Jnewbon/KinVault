@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>KinVault – Sign in</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="web.css">
+</head>
+<body>
+  <main class="login">
+    <form class="card" id="login">
+      <div class="brand"><img src="logo.png" alt=""><span>KinVault</span></div>
+      <div class="field">
+        <label for="password">Password</label>
+        <input id="password" type="password" autocomplete="current-password" required autofocus>
+        <div class="hint">Set with KINVAULT_WEB_PASSWORD, or printed in the server log when it first starts.</div>
+      </div>
+      <div class="form-error" id="error" hidden></div>
+      <button class="btn primary" type="submit">Sign in</button>
+    </form>
+  </main>
+  <script src="login.js"></script>
+</body>
+</html>

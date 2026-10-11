@@ -3,6 +3,8 @@
 "use strict";
 
 const { invoke } = window.__TAURI__.core;
+/// Served by `kinvaultd --web` (see web.js) rather than the desktop app.
+const WEB = !!window.KINVAULT_WEB;
 const { listen } = window.__TAURI__.event;
 
 const GiB = 1024 ** 3;
@@ -329,6 +331,12 @@ function renderBanner() {
   const banner = document.getElementById("banner");
   if (state.connected) {
     banner.hidden = true;
+    return;
+  }
+  if (WEB) {
+    banner.replaceChildren(el("div", { class: "spacer" },
+      el("strong", {}, "Lost the connection to the KinVault server. "), "Reconnecting…"));
+    banner.hidden = false;
     return;
   }
   const start = el("button", { class: "btn primary" }, "Start it");
@@ -755,11 +763,16 @@ function renderSettings() {
     autostart.checked = state.autostart;
   }));
 
-  const general = el("div", { class: "card kv" },
-    el("div", { class: "muted" }, "Background service"),
-    el("div", {}, state.connected ? "Running" : "Not running"),
-    el("div", { class: "muted" }, "Start at login"),
-    el("label", { class: "toggle" }, autostart, "Run KinVault in the background whenever I log in"));
+  const general = WEB
+    ? el("div", { class: "card kv" },
+      el("div", { class: "muted" }, "Web interface"),
+      el("div", { class: "row" }, el("span", { class: "spacer" }, state.connected ? "Connected" : "Reconnecting…"),
+        el("button", { class: "btn small", onclick: () => window.kinvaultSignOut() }, "Sign out")))
+    : el("div", { class: "card kv" },
+      el("div", { class: "muted" }, "Background service"),
+      el("div", {}, state.connected ? "Running" : "Not running"),
+      el("div", { class: "muted" }, "Start at login"),
+      el("label", { class: "toggle" }, autostart, "Run KinVault in the background whenever I log in"));
   page.append(general);
 
   if (s) {
@@ -795,13 +808,15 @@ function renderSettings() {
 
   page.append(el("h2", {}, "Recovery"));
   const exportBtn = el("button", { class: "btn primary", disabled: !state.connected, onclick: exportKit }, "Export recovery kit…");
-  const importBtn = el("button", { class: "btn", disabled: state.connected, onclick: importKit }, "Import recovery kit…");
+  const importBtn = WEB ? null : el("button", { class: "btn", disabled: state.connected, onclick: importKit }, "Import recovery kit…");
   page.append(el("div", { class: "card" },
     el("p", { style: "margin-top:0" },
       "A recovery kit lets a new computer take over these backups if this one is lost. ",
       "It's protected by a passphrase. Keep it somewhere other than this computer, and export again after adding backups."),
     el("div", { class: "actions" }, exportBtn, importBtn),
-    state.connected ? el("div", { class: "muted small", style: "margin-top:8px" },
+    WEB ? el("div", { class: "muted small", style: "margin-top:8px" },
+      "To set up a new server from a kit, import it with the kinvault command before the server first starts (see the README).")
+    : state.connected ? el("div", { class: "muted small", style: "margin-top:8px" },
       "To import a kit on a new computer, do it before the background service first starts (stop it if it's running).") : null));
 }
 

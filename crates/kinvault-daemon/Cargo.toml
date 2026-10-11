@@ -7,13 +7,20 @@ edition.workspace = true
 name = "kinvaultd"
 path = "src/bin/kinvaultd.rs"
 
+[features]
+# Web interface (`kinvaultd --web`), for headless machines such as a NAS.
+web = ["dep:axum", "dep:data-encoding", "dep:futures-util"]
+
 [dependencies]
 kinvault-core.workspace = true
 kinvault-net.workspace = true
 anyhow.workspace = true
+axum = { workspace = true, optional = true }
 blake3.workspace = true
 clap.workspace = true
+data-encoding = { workspace = true, optional = true }
 directories.workspace = true
+futures-util = { workspace = true, optional = true }
 gethostname.workspace = true
 hex.workspace = true
 notify.workspace = true
