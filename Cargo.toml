@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# The desktop app needs WebKitGTK and friends on Linux; build it explicitly
+# with `cargo build -p kinvault-gui` so the rest builds anywhere.
+default-members = ["crates/kinvault-core", "crates/kinvault-net", "crates/kinvault-daemon", "crates/kinvault-cli"]
 
 [workspace.package]
 version = "0.1.0"
