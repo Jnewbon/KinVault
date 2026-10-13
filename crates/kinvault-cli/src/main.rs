@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use kinvault_daemon::api::{
     CreateInvite, CreateSet, GrantSpec, HostAddr, NetworkInfo, NetworkSettings, Reply, Request,
@@ -12,6 +12,8 @@ use kinvault_daemon::api::{
 use kinvault_daemon::ipc::Client;
 
 const PASSPHRASE_ENV: &str = "KINVAULT_PASSPHRASE";
+/// What users type to confirm deleting a set for good.
+const DELETE_CONFIRMATION: &str = "DELETE PERMANENTLY";
 
 #[derive(Parser)]
 #[command(
@@ -82,6 +84,21 @@ enum Command {
     /// The port this instance listens on and the addresses invite codes include.
     #[command(subcommand)]
     Network(NetworkCommand),
+    /// Pair with your other devices on this network, without an invite code.
+    #[command(subcommand)]
+    Nearby(NearbyCommand),
+}
+
+#[derive(Subcommand)]
+enum NearbyCommand {
+    /// Look for your other devices for a few minutes and list them as they
+    /// appear. Run this on both devices.
+    Find,
+    /// Confirm a device found by `find` (name or id) as one of your own,
+    /// after checking it shows the same code. Do this on both devices.
+    Pair { device: String },
+    /// Stop looking.
+    Stop,
 }
 
 #[derive(Subcommand)]
@@ -108,6 +125,27 @@ enum SetCommand {
         limits: SetLimits,
         #[command(flatten)]
         retention: RetentionArgs,
+        /// Leave out matching files and folders; repeat for more. Quote
+        /// patterns so the shell doesn't expand them. See `set exclude`.
+        #[arg(long = "exclude", value_name = "PATTERN")]
+        excludes: Vec<String>,
+    },
+    /// Show or change the files and folders a set leaves out. Changes apply
+    /// from the next backup; earlier versions keep what they hold until
+    /// they're cleaned up. Quote patterns so the shell doesn't expand them.
+    ///
+    /// `*.bat` (anywhere), `/media/*.bat` (in /media only),
+    /// `/media/.../*.bat` (in /media and below), `/media/*` (files in
+    /// /media, not its folders), `/media/...` (everything in /media),
+    /// `target/...` or `target/` (every folder named target).
+    Exclude {
+        set: String,
+        /// The new list of patterns, replacing the current one.
+        #[arg(value_name = "PATTERN")]
+        patterns: Vec<String>,
+        /// Leave nothing out.
+        #[arg(long, conflicts_with = "patterns")]
+        clear: bool,
     },
     /// Change which snapshots a set keeps (applied at the next prune).
     Retention {
@@ -127,6 +165,14 @@ enum SetCommand {
     },
     /// Stop backing up a set. Existing backups and the set's key are kept.
     Remove { set: String },
+    /// Delete a set and its backups for good. The set's key is erased now and
+    /// the backups a week later, wherever they are stored.
+    Delete {
+        set: String,
+        /// Don't ask to confirm.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -234,6 +280,9 @@ enum InviteCommand {
         /// Ask the friend to store your backups in return.
         #[arg(long)]
         ask_reciprocal: bool,
+        /// For one of your own devices: no limits either way, listed as mine.
+        #[arg(long, conflicts_with = "ask_reciprocal")]
+        mine: bool,
         /// Days until the code expires.
         #[arg(long, default_value_t = 7)]
         expires_days: u64,
@@ -255,6 +304,10 @@ enum InviteCommand {
         /// Offer them unlimited storage here in return.
         #[arg(long, conflicts_with = "offer")]
         offer_unlimited: bool,
+        /// The code is from one of your own devices: no limits either way,
+        /// listed as mine.
+        #[arg(long, conflicts_with_all = ["offer", "offer_unlimited", "offer_upload_limit", "offer_window"])]
+        mine: bool,
         /// Maximum upload speed per second for their backups here.
         #[arg(long, value_parser = parse_size)]
         offer_upload_limit: Option<u64>,
@@ -279,6 +332,21 @@ enum PeerCommand {
         peer: String,
     },
     List,
+    /// Mark a peer (name or id) as one of your own devices; it may then
+    /// store backups here without limits.
+    Mine {
+        peer: String,
+    },
+    /// Move a peer (name or id) back from your devices to your friends.
+    Friend {
+        peer: String,
+    },
+    /// Remove a peer (name or id). It can no longer store backups here, and
+    /// what it stored here is erased in a week. Only possible once none of
+    /// your backups are stored on it.
+    Remove {
+        peer: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -574,6 +642,9 @@ async fn main() -> Result<()> {
                     println!("  last error: {e}");
                 }
                 println!("  keeps {}", set.retention);
+                if !set.excludes.is_empty() {
+                    println!("  leaves out {}", set.excludes.join(", "));
+                }
                 if let Some(p) = set.last_prune {
                     println!(
                         "  last prune {}: removed {} snapshot(s), freed {}",
@@ -616,6 +687,7 @@ async fn main() -> Result<()> {
             peer_addr,
             debounce,
             limits,
+            excludes,
         }) => {
             let target = match (local, peer) {
                 (Some(path), _) => Target::Local { path },
@@ -635,6 +707,7 @@ async fn main() -> Result<()> {
                 upload_limit: limits.upload_limit,
                 window: limits.window,
                 retention: retention.policy(),
+                excludes,
             });
             let Reply::SetCreated { id } = client.call(&req).await? else {
                 bail!("unexpected reply")
@@ -644,6 +717,36 @@ async fn main() -> Result<()> {
             println!(
                 "  kinvault recovery export <file>   (keep it somewhere other than this machine)"
             );
+        }
+        Command::Set(SetCommand::Exclude {
+            set,
+            patterns,
+            clear,
+        }) => {
+            if patterns.is_empty() && !clear {
+                let Reply::Status(s) = client.call(&Request::Status).await? else {
+                    bail!("unexpected reply")
+                };
+                let found = s
+                    .sets
+                    .into_iter()
+                    .find(|s| s.id == set || s.name == set)
+                    .ok_or_else(|| anyhow::anyhow!("no backup set named {set:?}"))?;
+                if found.excludes.is_empty() {
+                    println!("{} leaves nothing out.", found.name);
+                }
+                for p in found.excludes {
+                    println!("{p}");
+                }
+                return Ok(());
+            }
+            client
+                .call(&Request::SetExcludes {
+                    set,
+                    excludes: patterns,
+                })
+                .await?;
+            println!("Saved. Applies from the next backup; earlier versions keep what they hold.");
         }
         Command::Set(SetCommand::Limits { set, limits }) => {
             let req = Request::SetLimits {
@@ -772,6 +875,33 @@ async fn main() -> Result<()> {
                     Event::SetsChanged => println!("(backup sets changed)"),
                     Event::PeersChanged => println!("(peers changed)"),
                     Event::NetworkChanged => println!("(network settings changed)"),
+                    Event::NearbyChanged => println!("(nearby devices changed)"),
+                    Event::RestoreProgress(r) => println!(
+                        "restoring {}: {} of {} files, {} of {}",
+                        r.set_name,
+                        r.files,
+                        r.total_files,
+                        format_bytes(r.bytes),
+                        format_bytes(r.total_bytes)
+                    ),
+                    Event::RestoreFinished { set, summary, .. } => println!(
+                        "{}: restored {} files ({})",
+                        name(&set),
+                        summary.files,
+                        format_bytes(summary.bytes)
+                    ),
+                    Event::RestoreFailed {
+                        set,
+                        error,
+                        cancelled,
+                        ..
+                    } => {
+                        if cancelled {
+                            println!("{}: restore cancelled", name(&set))
+                        } else {
+                            println!("{}: restore failed: {error}", name(&set))
+                        }
+                    }
                 }
             }
             println!("kinvaultd stopped");
@@ -779,6 +909,39 @@ async fn main() -> Result<()> {
         Command::Set(SetCommand::Remove { set }) => {
             client.call(&Request::RemoveSet { set }).await?;
             println!("Set removed. Its backups and key were kept.");
+        }
+        Command::Set(SetCommand::Delete { set, yes }) => {
+            if !yes {
+                println!(
+                    "This deletes {set} and all its backups. They can't be restored afterwards,"
+                );
+                println!(
+                    "not even with a recovery kit. Where they're stored, they're erased in a week."
+                );
+                print!("Type {DELETE_CONFIRMATION} to confirm: ");
+                std::io::Write::flush(&mut std::io::stdout())?;
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                ensure!(line.trim() == DELETE_CONFIRMATION, "not deleted");
+            }
+            let Reply::SetDeleted(d) = client
+                .call(&Request::DeleteSet { set: set.clone() })
+                .await?
+            else {
+                bail!("unexpected reply")
+            };
+            println!("Deleted {set}.");
+            match (d.erase_after_unix, d.error) {
+                (Some(t), None) => println!(
+                    "Its backups will be erased on {}.",
+                    format_time(t * 1_000_000_000)
+                ),
+                (_, Some(e)) if d.retrying => println!(
+                    "The host storing its backups couldn't be reached ({e}).\nKinVault will keep asking it to erase them."
+                ),
+                (_, Some(e)) => println!("Its backups weren't erased there: {e}"),
+                (None, None) => {}
+            }
         }
         Command::Backup { set } => {
             let Reply::Backup(b) = client.call(&Request::BackupNow { set }).await? else {
@@ -854,6 +1017,7 @@ async fn main() -> Result<()> {
             name,
             grant,
             ask_reciprocal,
+            mine,
             expires_days,
         }) => {
             let req = Request::CreateInvite(CreateInvite {
@@ -861,6 +1025,7 @@ async fn main() -> Result<()> {
                 grant: grant.spec(),
                 ask_reciprocal,
                 expires_secs: Some(expires_days * 24 * 60 * 60),
+                mine,
             });
             let Reply::Invite {
                 ticket,
@@ -875,7 +1040,13 @@ async fn main() -> Result<()> {
                 format_time(expires_unix * 1_000_000_000)
             );
             println!("{ticket}\n");
-            println!("They accept it with: kinvault invite redeem <code>");
+            if mine {
+                println!(
+                    "Accept it on your other device with: kinvault invite redeem --mine <code>"
+                );
+            } else {
+                println!("They accept it with: kinvault invite redeem <code>");
+            }
         }
         Command::Invite(InviteCommand::List) => {
             let Reply::Invites(invites) = client.call(&Request::ListInvites).await? else {
@@ -897,6 +1068,9 @@ async fn main() -> Result<()> {
                     },
                     format_time(i.expires_unix * 1_000_000_000)
                 );
+                if i.mine {
+                    println!("  for one of your devices");
+                }
             }
         }
         Command::Invite(InviteCommand::Cancel { id }) => {
@@ -910,13 +1084,14 @@ async fn main() -> Result<()> {
             offer_unlimited,
             offer_upload_limit,
             offer_window,
+            mine,
         }) => {
             let offer = (offer.is_some() || offer_unlimited).then_some(GrantSpec {
                 quota_bytes: offer,
                 upload_limit: offer_upload_limit,
                 window: offer_window,
             });
-            let offered = offer.is_some();
+            let offered = offer.is_some() || mine;
             let Reply::Redeemed {
                 host_name,
                 quota_bytes,
@@ -927,6 +1102,7 @@ async fn main() -> Result<()> {
                     ticket: code,
                     name,
                     offer,
+                    mine,
                 })
                 .await?
             else {
@@ -958,6 +1134,28 @@ async fn main() -> Result<()> {
             client.call(&Request::PeerRevoke { id: peer }).await?;
             println!("Revoked. Data they already stored is kept.");
         }
+        Command::Peer(PeerCommand::Mine { peer }) => {
+            client
+                .call(&Request::PeerSetMine {
+                    id: peer,
+                    mine: true,
+                })
+                .await?;
+            println!("Marked as your device. It may store backups here without limits.");
+        }
+        Command::Peer(PeerCommand::Friend { peer }) => {
+            client
+                .call(&Request::PeerSetMine {
+                    id: peer,
+                    mine: false,
+                })
+                .await?;
+            println!("Moved to your friends. Its storage limits are unchanged.");
+        }
+        Command::Peer(PeerCommand::Remove { peer }) => {
+            client.call(&Request::PeerRemove { id: peer }).await?;
+            println!("Removed. Anything it stored here is erased in a week.");
+        }
         Command::Peer(PeerCommand::List) => {
             let Reply::Peers(peers) = client.call(&Request::PeerList).await? else {
                 bail!("unexpected reply")
@@ -966,12 +1164,26 @@ async fn main() -> Result<()> {
                 println!("no peers yet; invite a friend with `kinvault invite create`");
             }
             for p in peers {
-                println!("{}  {}", p.name.as_deref().unwrap_or("(unnamed)"), p.id);
+                println!(
+                    "{}  {}{}",
+                    p.name.as_deref().unwrap_or("(unnamed)"),
+                    p.id,
+                    if p.mine { "  (mine)" } else { "" }
+                );
+                let deleting = if p.deleting_bytes > 0 {
+                    format!(" ({} marked for deletion)", format_bytes(p.deleting_bytes))
+                } else {
+                    String::new()
+                };
                 match p.grant {
                     Some(g) => println!(
-                        "  stores here: using {} of {}",
+                        "  stores here: using {} of {}{deleting}",
                         format_bytes(p.used_bytes),
                         describe_grant(&g)
+                    ),
+                    None if p.used_bytes > 0 => println!(
+                        "  may not store backups here; {} left here{deleting}",
+                        format_bytes(p.used_bytes)
                     ),
                     None => println!("  may not store backups here"),
                 }
@@ -983,6 +1195,85 @@ async fn main() -> Result<()> {
                     println!("  hosts our backups: {space}");
                 }
             }
+        }
+        Command::Nearby(NearbyCommand::Find) => {
+            use kinvault_daemon::api::NearbyState;
+            let Reply::Nearby(mut status) = client.call(&Request::FindNearby).await? else {
+                bail!("unexpected reply")
+            };
+            println!("Looking for your devices on this network. Run this on the other device too.");
+            println!("Then pair with: kinvault nearby pair <name>  (on both devices)\n");
+            let mut shown = std::collections::HashMap::new();
+            while let Some(until) = status.until_unix {
+                for d in &status.devices {
+                    if shown.get(&d.id) != Some(&d.state) {
+                        let state = match d.state {
+                            NearbyState::Found => "found",
+                            NearbyState::Waiting => "waiting for it to confirm",
+                            NearbyState::Paired => "yours",
+                        };
+                        println!("{}  code {}  {state}  ({})", d.name, d.code, d.id);
+                        shown.insert(d.id.clone(), d.state);
+                    }
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                if until <= now {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let Reply::Nearby(s) = client.call(&Request::NearbyStatus).await? else {
+                    bail!("unexpected reply")
+                };
+                status = s;
+            }
+            println!("Stopped looking.");
+        }
+        Command::Nearby(NearbyCommand::Pair { device }) => {
+            use kinvault_daemon::api::NearbyState;
+            let Reply::Nearby(status) = client.call(&Request::NearbyStatus).await? else {
+                bail!("unexpected reply")
+            };
+            ensure!(
+                status.until_unix.is_some(),
+                "not looking for devices; run `kinvault nearby find` first"
+            );
+            let matches: Vec<_> = status
+                .devices
+                .iter()
+                .filter(|d| d.id == device || d.name == device)
+                .collect();
+            let d = match matches.as_slice() {
+                [d] => *d,
+                [] => bail!("no nearby device named {device:?}"),
+                _ => bail!("more than one nearby device is named {device:?}; use its id"),
+            };
+            let Reply::Nearby(status) = client
+                .call(&Request::PairNearby { id: d.id.clone() })
+                .await?
+            else {
+                bail!("unexpected reply")
+            };
+            match status
+                .devices
+                .iter()
+                .find(|x| x.id == d.id)
+                .map(|x| x.state)
+            {
+                Some(NearbyState::Paired) => {
+                    println!("Paired with {}. It's now one of your devices.", d.name)
+                }
+                _ => println!(
+                    "Confirmed. Now pair with this device on {} (code {}).",
+                    d.name, d.code
+                ),
+            }
+        }
+        Command::Nearby(NearbyCommand::Stop) => {
+            client.call(&Request::StopNearby).await?;
+            println!("Stopped looking.");
         }
         Command::Network(NetworkCommand::Show) => {
             print_network(&get_network(&mut client).await?);

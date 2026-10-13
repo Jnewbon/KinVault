@@ -1,10 +1,30 @@
 # KinVault on TrueNAS SCALE: Apps → Discover Apps → ⋮ → Install via YAML,
 # then paste this file. Adjust the paths under `volumes` to your pools first.
 services:
+  # Runs once before KinVault, as root, to hand the writable mounts to the
+  # "apps" user (568), then exits. This is how TrueNAS's own apps prepare
+  # new datasets and ixVolumes; KinVault itself never runs as root. Keep its
+  # volumes in step with the writable ones below. Not needed if you already
+  # gave `apps` write access to them (e.g. with Edit Permissions).
+  permissions:
+    image: ghcr.io/jnewbon/kinvault:latest
+    user: "0:0"
+    entrypoint: ["chown", "568:568", "/data", "/restore"]
+    network_mode: none
+    cap_drop: [ALL]
+    cap_add: [CHOWN]
+    restart: "no"
+    volumes:
+      - /mnt/tank/apps/kinvault:/data
+      - /mnt/tank/kinvault-restore:/restore
+
   kinvault:
     image: ghcr.io/jnewbon/kinvault:latest
     container_name: kinvault
     restart: unless-stopped
+    depends_on:
+      permissions:
+        condition: service_completed_successfully
     # The host network lets KinVault see the NAS's real addresses, so friends
     # on your LAN connect directly and your router can map its port.
     network_mode: host

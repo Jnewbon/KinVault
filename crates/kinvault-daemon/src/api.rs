@@ -21,11 +21,23 @@ pub enum Request {
     RemoveSet {
         set: String,
     },
+    /// Deletes a set and its backups for good: its key is erased here, and
+    /// the place it backs up to erases the backups a week later. Succeeds
+    /// even if that place can't be reached; it is asked again later.
+    DeleteSet {
+        set: String,
+    },
     /// Changes a set's upload limit and time window.
     SetLimits {
         set: String,
         upload_limit: Option<u64>,
         window: Option<TimeWindow>,
+    },
+    /// Changes which files and folders a set leaves out, from its next
+    /// backup on. Earlier snapshots keep them until retention removes them.
+    SetExcludes {
+        set: String,
+        excludes: Vec<String>,
     },
     /// Changes which snapshots a set keeps; takes effect at the next prune.
     SetRetention {
@@ -72,6 +84,18 @@ pub enum Request {
         target: PathBuf,
         include: Option<String>,
     },
+    /// Starts restoring in the background and answers at once with
+    /// `RestoreStarted`; progress and the result arrive as events.
+    StartRestore {
+        set: String,
+        snapshot: String,
+        target: PathBuf,
+        include: Option<String>,
+    },
+    /// Stops a background restore. Files restored so far are kept.
+    CancelRestore {
+        id: String,
+    },
     /// Storage used by a set's owner on the host it backs up to.
     RemoteUsage {
         set: String,
@@ -87,6 +111,17 @@ pub enum Request {
         id: String,
     },
     PeerList,
+    /// Forgets a peer: it can no longer store backups here, and what it
+    /// stored is erased a week later. Refused while a set backs up to it.
+    PeerRemove {
+        id: String,
+    },
+    /// Moves a peer to or from "mine" (this user's own devices). Marking it
+    /// mine also lets it store backups here without limits.
+    PeerSetMine {
+        id: String,
+        mine: bool,
+    },
     /// Creates a one-time invite code a friend can redeem to store backups here.
     CreateInvite(CreateInvite),
     ListInvites,
@@ -103,6 +138,20 @@ pub enum Request {
         /// What to call the host locally (defaults to the name it gives).
         name: Option<String>,
         offer: Option<GrantSpec>,
+        /// The host is one of this user's own devices: offer it unlimited
+        /// storage (instead of `offer`) and list it under "mine".
+        #[serde(default)]
+        mine: bool,
+    },
+    /// Looks for this user's other devices on the local network for a few
+    /// minutes (restarting the countdown if already looking).
+    FindNearby,
+    StopNearby,
+    NearbyStatus,
+    /// Confirms a nearby device as one of this user's own. They are paired
+    /// once it has been confirmed on the other device too.
+    PairNearby {
+        id: String,
     },
 }
 
@@ -126,6 +175,10 @@ pub struct CreateSet {
     /// Which snapshots to keep (default: [`RetentionPolicy::recommended`]).
     #[serde(default)]
     pub retention: Option<RetentionPolicy>,
+    /// Files and folders to leave out, e.g. `*.o` or `target/...`; see
+    /// [`kinvault_core::Excludes`].
+    #[serde(default)]
+    pub excludes: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -137,6 +190,11 @@ pub struct CreateInvite {
     pub ask_reciprocal: bool,
     /// Validity period (default 7 days).
     pub expires_secs: Option<u64>,
+    /// For one of this user's own devices: it may store backups here without
+    /// limits (instead of `grant`), is asked to do the same, and is listed
+    /// under "mine".
+    #[serde(default)]
+    pub mine: bool,
 }
 
 /// Limits for a peer storing backups on this instance.
@@ -230,6 +288,22 @@ pub enum Reply {
     },
     Subscribed,
     Network(NetworkInfo),
+    Nearby(NearbyStatus),
+    SetDeleted(DeletedSet),
+    RestoreStarted {
+        id: String,
+    },
+}
+
+/// What happened to a deleted set's backups.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DeletedSet {
+    /// When the backups are erased, if known (Unix seconds).
+    pub erase_after_unix: Option<i64>,
+    /// Why the backups' host couldn't be told (yet).
+    pub error: Option<String>,
+    /// The host couldn't be reached; it will be asked again.
+    pub retrying: bool,
 }
 
 /// Something changed in the daemon; streamed to subscribers.
@@ -261,6 +335,22 @@ pub enum Event {
     PeersChanged,
     /// The listening port or public addresses changed.
     NetworkChanged,
+    /// Finding nearby devices started or stopped, or found or paired one.
+    NearbyChanged,
+    /// A background restore started or made progress.
+    RestoreProgress(RestoreJob),
+    RestoreFinished {
+        id: String,
+        set: String,
+        summary: RestoreSummary,
+    },
+    RestoreFailed {
+        id: String,
+        set: String,
+        error: String,
+        /// The user cancelled it.
+        cancelled: bool,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -271,6 +361,25 @@ pub struct DaemonStatus {
     pub version: String,
     pub hosting_store: PathBuf,
     pub sets: Vec<SetStatus>,
+    /// Restores running in the background.
+    #[serde(default)]
+    pub restores: Vec<RestoreJob>,
+}
+
+/// A restore running in the background.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RestoreJob {
+    pub id: String,
+    /// The set's id.
+    pub set: String,
+    pub set_name: String,
+    pub snapshot: String,
+    pub target: PathBuf,
+    pub files: u64,
+    pub bytes: u64,
+    /// What it restores in total; 0 until known.
+    pub total_files: u64,
+    pub total_bytes: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -282,6 +391,8 @@ pub struct SetStatus {
     pub upload_limit: Option<u64>,
     pub window: Option<TimeWindow>,
     pub retention: RetentionPolicy,
+    #[serde(default)]
+    pub excludes: Vec<String>,
     pub state: SetState,
     pub last_backup: Option<BackupSummary>,
     pub last_error: Option<String>,
@@ -363,8 +474,13 @@ pub struct PeerInfo {
     pub grant: Option<GrantSpec>,
     /// Bytes this peer stores here.
     pub used_bytes: u64,
+    /// Of those, bytes it deleted that are erased once their grace period is over.
+    #[serde(default)]
+    pub deleting_bytes: u64,
     /// Set if this peer agreed to store our backups (and how much).
     pub hosts_us: Option<HostOffer>,
+    /// One of this user's own devices rather than a friend's.
+    pub mine: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -379,4 +495,32 @@ pub struct InviteInfo {
     pub grant: GrantSpec,
     pub ask_reciprocal: bool,
     pub expires_unix: i64,
+    pub mine: bool,
+}
+
+/// Looking for this user's other devices on the local network.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct NearbyStatus {
+    /// When looking stops; `None` when not looking.
+    pub until_unix: Option<i64>,
+    pub devices: Vec<NearbyDevice>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct NearbyDevice {
+    pub id: String,
+    pub name: String,
+    /// Shown on both devices; the user checks they match before confirming.
+    pub code: String,
+    pub state: NearbyState,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NearbyState {
+    Found,
+    /// Confirmed here; waiting for it to be confirmed on the other device.
+    Waiting,
+    /// One of this user's devices (paired now or before).
+    Paired,
 }

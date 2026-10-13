@@ -87,6 +87,15 @@ impl RemoteBackend {
         }
     }
 
+    /// Asks the host to erase this repository. It is hidden at once and
+    /// erased at the returned time (Unix seconds).
+    pub async fn delete_repo(&self) -> Result<i64, NetError> {
+        match self.call(Op::DeleteRepo, None).await?.0 {
+            Response::DeleteScheduled { erase_after_unix } => Ok(erase_after_unix),
+            other => Err(unexpected(&other)),
+        }
+    }
+
     async fn connection(&self) -> Result<Connection, NetError> {
         let mut guard = self.conn.lock().await;
         if let Some(conn) = guard.as_ref()
@@ -210,6 +219,29 @@ pub async fn redeem_invite(
             host_name,
             quota_bytes,
         }),
+        Response::Error { code, message } => Err(NetError::from_code(code, message)),
+        other => Err(unexpected(&other)),
+    }
+}
+
+/// Asks a nearby peer to pair as one of its owner's devices. Fails with
+/// [`NetError::Denied`] until its owner has confirmed this instance too.
+/// Returns the peer's name.
+pub async fn pair(
+    endpoint: &Endpoint,
+    addr: EndpointAddr,
+    name: String,
+    hosts: Vec<String>,
+) -> Result<String, NetError> {
+    let conn = endpoint.connect(addr, ALPN).await.map_err(transport)?;
+    let req = Request {
+        repo: "pair".into(),
+        op: Op::Pair { name, hosts },
+    };
+    let result = call_once(&conn, &req, None, None).await;
+    conn.close(0u32.into(), b"done");
+    match result?.0 {
+        Response::Paired { host_name } => Ok(host_name),
         Response::Error { code, message } => Err(NetError::from_code(code, message)),
         other => Err(unexpected(&other)),
     }

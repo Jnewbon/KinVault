@@ -17,10 +17,13 @@ const state = {
   peers: [],
   invites: [],
   network: null, // NetworkInfo
+  nearby: { until_unix: null, devices: [] }, // NearbyStatus
   progress: {}, // set id -> latest Progress event
   autostart: false,
   restoreSet: null,
   snapshots: [],
+  snapshotsError: null, // why the restore set's versions couldn't be loaded
+  snapshotsLoading: false,
   selectedSnapshot: null,
 };
 
@@ -110,6 +113,17 @@ function describeGrant(g) {
   if (g.upload_limit) parts.push(`max ${bytes(g.upload_limit)}/s`);
   if (g.window) parts.push(`uploads ${g.window}`);
   return parts.join(", ");
+}
+
+/** " (12 MiB marked for deletion)" when part of what a peer stores here is waiting to be erased. */
+function deletingNote(peer) {
+  return peer.deleting_bytes ? ` (${bytes(peer.deleting_bytes)} marked for deletion)` : "";
+}
+
+function notAllowed(peer) {
+  return peer.used_bytes
+    ? `Not allowed to store backups here · ${bytes(peer.used_bytes)} left here${deletingNote(peer)}`
+    : "Not allowed to store backups here";
 }
 
 function describePolicy(p) {
@@ -230,7 +244,7 @@ function fieldNode(f, inputs) {
       get = () => input.value.trim();
   }
   inputs[f.name] = get;
-  return el("div", { class: "field", id: `wrap-${f.name}`, hidden: f.hidden }, el("label", { for: id }, f.label), input,
+  return el("div", { class: "field", id: `wrap-${f.name}`, hidden: f.hidden }, el("label", { for: id }, f.label, f.info ? infoTip(f.info) : null), input,
     f.hint ? el("div", { class: "hint" }, f.hint) : null);
 }
 
@@ -252,6 +266,78 @@ function toBytes(value, unit) {
 
 function windowFrom(start, end) {
   return start && end ? `${start}-${end}` : null;
+}
+
+/** The rules for exclude patterns, shown from the ⓘ next to "Leave out". */
+function excludeRules() {
+  const code = (t) => el("code", {}, t);
+  const examples = [
+    ["*.bat", "every .bat file, anywhere"],
+    ["/media/*.bat", ".bat files directly in /media"],
+    ["/media/.../*.bat", ".bat files in /media and all its subfolders"],
+    ["/media/*", "the files in /media, but not its subfolders"],
+    ["/media/...", "everything in /media"],
+    ["target/...", "every folder named target, with its contents"],
+  ];
+  return [
+    el("strong", {}, "How patterns work"),
+    el("ul", {},
+      el("li", {}, "One pattern per line."),
+      el("li", {}, code("*"), " matches any part of a name and ", code("?"), " one character. Neither crosses a ", code("/"), "."),
+      el("li", {}, code("..."), " matches any number of folders, including none."),
+      el("li", {}, "Starting with ", code("/"), " means a full path. Otherwise the pattern matches at any depth."),
+      el("li", {}, "Ending in ", code("/..."), " or ", code("/"), " leaves out a folder and everything in it. Other patterns only match files.")),
+    el("table", {}, el("tbody", {}, examples.map(([p, what]) => el("tr", {}, el("td", {}, code(p)), el("td", {}, what))))),
+    el("p", {}, "Changes apply from the next backup. Versions already backed up keep these files until they're cleaned up."),
+  ];
+}
+
+function excludeField(value = []) {
+  return { name: "excludes", label: "Leave out (optional)", type: "textarea", placeholder: "target/...\nnode_modules/\n*.o",
+    value: value.join("\n"), hint: "One pattern per line, e.g. target/... or *.o",
+    info: { label: "How leave-out patterns work", content: excludeRules } };
+}
+
+let infoTips = 0;
+
+/** An ⓘ button showing `content` on hover, focus or click. */
+function infoTip({ label, content }) {
+  const tip = el("div", { class: "info-tip", role: "tooltip", id: `info-tip-${++infoTips}` }, content());
+  const button = el("button", { type: "button", class: "info-btn", "aria-label": label, "aria-describedby": tip.id }, "i");
+  const wrap = el("span", { class: "info" }, button, tip);
+  // Clicking the tip's text mustn't act on the surrounding <label>.
+  tip.addEventListener("click", (e) => e.preventDefault());
+  // Fixed to the window, so the dialog's scrolling body can't cut it off:
+  // as wide as its field, below the ⓘ, or above it if there isn't room.
+  tip.place = () => {
+    const field = (wrap.closest(".field") || wrap).getBoundingClientRect();
+    const at = button.getBoundingClientRect();
+    tip.style.left = `${field.left}px`;
+    tip.style.width = `${field.width}px`;
+    const height = tip.offsetHeight;
+    const below = at.bottom + 6;
+    tip.style.top = `${below + height <= window.innerHeight - 8 ? below : Math.max(8, at.top - 6 - height)}px`;
+  };
+  for (const ev of ["mouseenter", "focusin", "click"]) wrap.addEventListener(ev, () => requestAnimationFrame(tip.place));
+  button.addEventListener("click", (e) => {
+    e.preventDefault(); // inside a <label>: don't move focus to its input
+    wrap.classList.toggle("open");
+  });
+  button.addEventListener("blur", () => wrap.classList.remove("open"));
+  button.addEventListener("keydown", (e) => {
+    // Escape closes the tip first, and the dialog only on a second press.
+    if (e.key === "Escape" && wrap.matches(".open, :hover, :focus-within")) {
+      e.preventDefault();
+      e.stopPropagation();
+      wrap.classList.remove("open");
+      button.blur();
+    }
+  });
+  return wrap;
+}
+
+function excludesFrom(text) {
+  return text.split("\n").map((l) => l.trim()).filter(Boolean);
 }
 
 function grantFields(g = {}) {
@@ -306,6 +392,16 @@ async function refreshNetwork() {
   if (state.page === "settings") render();
 }
 
+async function refreshNearby() {
+  if (!state.connected) return;
+  try {
+    state.nearby = await call("nearby_status");
+  } catch (e) {
+    return;
+  }
+  if (state.page === "mine") render();
+}
+
 let refreshTimer = null;
 function refreshSoon() {
   clearTimeout(refreshTimer);
@@ -320,11 +416,12 @@ function render() {
   document.getElementById("conn-text").textContent = state.connected
     ? (state.status ? state.status.name : "Connected")
     : "Service not running";
-  const renderers = { backups: renderBackups, restore: renderRestore, friends: renderFriends, settings: renderSettings };
+  const renderers = { backups: renderBackups, restore: renderRestore, mine: renderMine, friends: renderFriends, settings: renderSettings };
   for (const name of Object.keys(renderers)) {
     document.getElementById(`page-${name}`).hidden = name !== state.page;
   }
   renderers[state.page]();
+  updateRestoreNav();
 }
 
 function renderBanner() {
@@ -401,6 +498,7 @@ function setCard(set) {
   if (set.upload_limit) limits.push(`max ${bytes(set.upload_limit)}/s`);
   if (set.window) limits.push(`backs up automatically ${set.window}`);
   limits.push(`keeps ${describePolicy(set.retention)}`);
+  if (set.excludes?.length) limits.push(`leaves out ${set.excludes.join(", ")}`);
   lines.append(el("div", { class: "muted small" }, limits.join(" · ")));
 
   const backup = el("button", { class: "btn primary small", disabled: set.state === "running" || set.state === "paused" }, "Back up now");
@@ -473,14 +571,20 @@ async function setSettingsDialog(set) {
         { name: "weekly", label: "Keep weekly", type: "number", min: "0", value: r.weekly ?? "" },
         { name: "monthly", label: "Keep monthly", type: "number", min: "0", value: r.monthly ?? "" },
       ] },
+      excludeField(set.excludes || []),
       { type: "custom", node: el("div", { class: "hint field" }, "Leave all “Keep” boxes empty to keep every version. Hourly/yearly rules: ",
         `${r.hourly ?? "none"} hourly, ${r.yearly ?? "none"} yearly (kept as they are).`) },
-      { type: "custom", node: el("div", { class: "field" }, el("button", { class: "btn danger small", type: "button", onclick: () => removeSet(set) }, "Stop backing up this set…")) },
+      { type: "custom", node: el("div", { class: "field row" },
+        el("button", { class: "btn danger small", type: "button", onclick: () => removeSet(set) }, "Stop backing up this set…"),
+        el("button", { class: "btn danger small", type: "button", onclick: () => deleteSet(set) }, "Delete permanently…")) },
     ],
     ok: "Save",
     validate: windowProblem,
     onSubmit: async (v) => {
       const num = (x) => (x === "" ? null : Math.max(0, Math.floor(Number(x))));
+      // First, so an invalid pattern stops the whole save.
+      const excludes = excludesFrom(v.excludes);
+      if (excludes.join("\n") !== (set.excludes || []).join("\n")) await call("set_excludes", { set: set.id, excludes });
       await call("set_limits", { set: set.id, upload_limit: toBytes(v.rate, MiB), window: windowFrom(v.from, v.to) });
       await call("set_retention", { set: set.id, policy: { last: num(v.last), hourly: r.hourly, daily: num(v.daily), weekly: num(v.weekly), monthly: num(v.monthly), yearly: r.yearly } });
     },
@@ -496,14 +600,45 @@ async function removeSet(set) {
   await attempt(() => call("remove_set", { set: set.id }));
 }
 
+const DELETE_CONFIRMATION = "DELETE PERMANENTLY";
+
+async function deleteSet(set) {
+  document.getElementById("modal").close();
+  const where = set.target.kind === "local" ? `the folder ${set.target.path}` : peerName(set.target.id);
+  let result = null;
+  const v = await form({
+    title: `Delete ${set.name} permanently?`,
+    intro: `This deletes ${set.name} and every version of it that was backed up. Its key is erased from this computer now, ` +
+      `and ${where} erases the backups in a week. They can't be restored afterwards, not even with a recovery kit.`,
+    fields: [{ name: "confirm", label: `Type ${DELETE_CONFIRMATION} to confirm`, placeholder: DELETE_CONFIRMATION }],
+    ok: "Delete permanently",
+    danger: true,
+    validate: (v) => (v.confirm === DELETE_CONFIRMATION ? null : `Type ${DELETE_CONFIRMATION} exactly, in capitals.`),
+    onSubmit: async () => { result = await call("delete_set", { set: set.id }); },
+  });
+  if (!v || !result) return;
+  const date = (t) => new Date(t * 1000).toLocaleDateString();
+  if (result.erase_after_unix && !result.error) {
+    toast(`${set.name} deleted. ${set.target.kind === "local" ? "Its backup folder" : where} will erase the backups on ${date(result.erase_after_unix)}.`);
+  } else if (result.retrying) {
+    toast(`${set.name} deleted. ${where} couldn't be reached, so KinVault will keep asking it to erase the backups.`);
+  } else {
+    toast(`${set.name} deleted. ${where} didn't erase the backups: ${result.error}`);
+  }
+}
+
 async function newSetDialog() {
-  const hosts = state.peers.filter((p) => p.hosts_us);
-  const others = state.peers.filter((p) => !p.hosts_us);
+  // Your own devices first, friends last; within each, those that agreed to
+  // keep your backups come first.
+  const byHosting = (a, b) => !!b.hosts_us - !!a.hosts_us;
+  const mine = state.peers.filter((p) => p.mine).sort(byHosting);
+  const friends = state.peers.filter((p) => !p.mine).sort(byHosting);
+  const space = (p) => (p.hosts_us ? ` (${p.hosts_us.quota_bytes ? bytes(p.hosts_us.quota_bytes) : "unlimited"})` : "");
   const options = [
-    ...hosts.map((p) => [`peer:${p.id}`, `${p.name || shortId(p.id)} (friend, ${p.hosts_us.quota_bytes ? bytes(p.hosts_us.quota_bytes) : "unlimited"})`]),
-    ...others.map((p) => [`peer:${p.id}`, `${p.name || shortId(p.id)}`]),
-    ["id", "Another KinVault instance (paste its id)…"],
+    ...mine.map((p) => [`peer:${p.id}`, `${p.name || shortId(p.id)}${space(p)}`]),
     ["local", "A folder or external drive…"],
+    ["id", "Another KinVault instance (paste its id)…"],
+    ...friends.map((p) => [`peer:${p.id}`, `Friend: ${p.name || shortId(p.id)}${space(p)}`]),
   ];
   const v = await form({
     title: "New backup",
@@ -511,6 +646,7 @@ async function newSetDialog() {
     fields: [
       { name: "name", label: "Name", placeholder: "e.g. Documents" },
       { name: "paths", label: "What to back up", type: "folders", multiple: true },
+      excludeField(),
       { name: "dest", label: "Where to keep the backup", type: "select", options, value: options[0][0], onchange: (d) => { show("peerId", d === "id"); show("localPath", d === "local"); } },
       { name: "peerId", label: "Instance id", placeholder: "64-character id", hidden: options[0][0] !== "id", hint: "Ask the owner to run “kinvault id” or look in their Settings." },
       { name: "localPath", label: "Backup folder", type: "folders", hidden: options[0][0] !== "local" },
@@ -544,7 +680,7 @@ async function newSetDialog() {
       await call("create_set", {
         name: v.name, paths: v.paths, target, recovery_passphrase: v.pass,
         debounce_secs: null, rescan_secs: null, upload_limit: toBytes(v.rate, MiB),
-        window: windowFrom(v.from, v.to), retention,
+        window: windowFrom(v.from, v.to), retention, excludes: excludesFrom(v.excludes),
       });
     },
   });
@@ -553,21 +689,47 @@ async function newSetDialog() {
 
 // ----- restore -----
 
+let snapshotsRequest = 0;
+
 async function loadSnapshots(setId) {
+  const request = ++snapshotsRequest;
   state.restoreSet = setId;
   state.selectedSnapshot = null;
   state.snapshots = [];
+  state.snapshotsError = null;
+  state.snapshotsLoading = true;
   render();
-  const snaps = await attempt(() => call("list_snapshots", { set: setId }));
-  if (snaps && state.restoreSet === setId) {
+  try {
+    const snaps = await call("list_snapshots", { set: setId });
+    if (request !== snapshotsRequest) return; // another backup was chosen meanwhile
     state.snapshots = snaps.reverse();
-    render();
+  } catch (e) {
+    if (request !== snapshotsRequest) return;
+    state.snapshotsError = String(e);
   }
+  state.snapshotsLoading = false;
+  if (state.page === "restore") render();
+}
+
+/** What the versions card shows instead of the table, if anything. */
+function snapshotsNotice(set) {
+  if (state.snapshotsLoading) {
+    const from = set?.target.kind === "peer" ? ` from ${peerName(set.target.id)}` : "";
+    return el("div", { class: "muted" }, `Loading versions${from}…`);
+  }
+  if (state.snapshotsError) {
+    const offline = set?.target.kind === "peer"
+      ? ` Check that ${peerName(set.target.id)} is switched on and connected, then try again.` : "";
+    return el("div", { class: "notice bad" }, `Couldn't load the versions: ${state.snapshotsError}.${offline}`);
+  }
+  if (!state.snapshots.length) return el("div", { class: "muted" }, "No versions yet. They appear after the first backup finishes.");
+  return null;
 }
 
 function renderRestore() {
   const page = document.getElementById("page-restore");
   page.replaceChildren(el("div", { class: "page-head" }, el("h1", {}, "Restore")));
+  for (const job of restoreJobs()) page.append(restoreCard(job));
   const sets = state.status?.sets || [];
   if (!sets.length) {
     page.append(el("div", { class: "card empty" }, "There's nothing to restore yet."));
@@ -590,10 +752,14 @@ function renderRestore() {
     }, el("td", {}, dateTime(s.time_ns / 1e9)), el("td", {}, s.hostname), el("td", {}, s.file_count), el("td", {}, bytes(s.total_bytes))));
   }
   table.append(tbody);
+  const notice = snapshotsNotice(sets.find((s) => s.id === state.restoreSet));
+  const retry = state.snapshotsLoading ? null
+    : el("button", { class: "btn", onclick: () => loadSnapshots(state.restoreSet) }, state.snapshotsError ? "Try again" : "Refresh");
   page.append(el("div", { class: "card" },
-    state.snapshots.length ? table : el("div", { class: "muted" }, "Loading versions…"),
+    notice || table,
     el("div", { class: "actions" },
-      el("button", { class: "btn primary", disabled: !state.selectedSnapshot, onclick: restoreDialog }, "Restore this version…"))));
+      el("button", { class: "btn primary", disabled: !state.selectedSnapshot, onclick: restoreDialog }, "Restore this version…"),
+      retry)));
 }
 
 async function restoreDialog() {
@@ -608,11 +774,66 @@ async function restoreDialog() {
     ok: "Restore",
     validate: (v) => (v.target.length ? null : "Choose where to restore to."),
     onSubmit: async (v) => {
-      const r = await call("restore", { set: state.restoreSet, snapshot: snap.id, target: v.target[0], include: v.include || null });
-      toast(`Restored ${plural(r.files, "file")} (${bytes(r.bytes)}) to ${v.target[0]}`);
+      await call("start_restore", { set: state.restoreSet, snapshot: snap.id, target: v.target[0], include: v.include || null });
     },
   });
+  if (v) toast("Restoring in the background. You can keep using KinVault meanwhile.");
   return v;
+}
+
+// ----- background restores -----
+
+function restoreJobs() {
+  return state.status?.restores || [];
+}
+
+function restorePercent(job) {
+  if (!job.total_bytes) return job.total_files ? Math.floor((100 * job.files) / job.total_files) : 0;
+  return Math.min(100, Math.floor((100 * job.bytes) / job.total_bytes));
+}
+
+function restoreText(job) {
+  if (!job.total_files && !job.files) return "Starting…";
+  return `${job.files} of ${plural(job.total_files, "file")} · ${bytes(job.bytes)} of ${bytes(job.total_bytes)} · ${restorePercent(job)}%`;
+}
+
+function restoreCard(job) {
+  const cancel = el("button", { class: "btn small" }, "Cancel");
+  cancel.addEventListener("click", () => attempt(() => call("cancel_restore", { id: job.id }), cancel));
+  return el("div", { class: "card", id: `restore-${job.id}` },
+    el("div", { class: "card-head" }, el("span", { class: "card-title" }, `Restoring ${job.set_name}`), el("span", { class: "spacer" }), cancel),
+    el("div", { class: "muted small" }, `Into ${job.target}`),
+    el("div", { class: "progress" }, el("div", { class: "bar", style: `width:${restorePercent(job)}%` })),
+    el("div", { class: "muted small text", style: "margin-top:6px" }, restoreText(job)));
+}
+
+/** Shows a restore's latest progress without redrawing the page. */
+function updateRestore(job) {
+  const jobs = state.status?.restores;
+  if (!jobs) return;
+  const i = jobs.findIndex((j) => j.id === job.id);
+  if (i < 0) jobs.push(job); else jobs[i] = job;
+  const card = document.getElementById(`restore-${job.id}`);
+  if (card) {
+    card.querySelector(".bar").style.width = `${restorePercent(job)}%`;
+    card.querySelector(".text").textContent = restoreText(job);
+  } else if (state.page === "restore") {
+    render();
+  }
+  updateRestoreNav();
+}
+
+function restoreEnded(id) {
+  if (state.status) state.status.restores = restoreJobs().filter((j) => j.id !== id);
+  if (state.page === "restore") render();
+  updateRestoreNav();
+}
+
+/** The Restore menu item shows progress while a restore runs. */
+function updateRestoreNav() {
+  const item = document.querySelector('.nav-item[data-page="restore"]');
+  const jobs = restoreJobs();
+  item.textContent = jobs.length ? `Restore · ${restorePercent(jobs[0])}%` : "Restore";
 }
 
 // ----- friends -----
@@ -625,41 +846,185 @@ function renderFriends() {
   page.append(el("p", { class: "muted" },
     "Friends can keep encrypted backups on each other's computers. They can't read what you store, and you can't read theirs."));
 
-  if (!state.peers.length) {
+  const friends = state.peers.filter((p) => !p.mine);
+  if (!friends.length) {
     page.append(el("div", { class: "card empty" }, "No friends yet. Invite someone, or join with a code a friend sent you."));
   }
-  for (const p of state.peers) {
+  for (const p of friends) {
     const lines = el("div", { class: "lines" });
     if (p.grant) {
       const quota = p.grant.quota_bytes;
-      lines.append(el("div", {}, `Stores backups here: ${bytes(p.used_bytes)} used of ${describeGrant(p.grant)}`));
+      lines.append(el("div", {}, `Stores backups here: ${bytes(p.used_bytes)} used of ${describeGrant(p.grant)}${deletingNote(p)}`));
       if (quota) lines.append(el("div", { class: "progress" }, el("div", { style: `width:${Math.min(100, (100 * p.used_bytes) / quota).toFixed(1)}%` })));
     } else {
-      lines.append(el("div", { class: "muted" }, "Not allowed to store backups here"));
+      lines.append(el("div", { class: "muted" }, notAllowed(p)));
     }
     lines.append(el("div", {}, p.hosts_us
       ? `Keeps your backups: up to ${bytes(p.hosts_us.quota_bytes)}`
       : el("span", { class: "muted" }, "Doesn't keep your backups")));
     const edit = el("button", { class: "btn small", onclick: () => limitsDialog(p) }, p.grant ? "Change limits…" : "Allow to store here…");
     const revoke = p.grant ? el("button", { class: "btn small danger", onclick: () => revokeDialog(p) }, "Stop hosting…") : null;
+    const toMine = el("button", { class: "btn small", onclick: () => moveToMineDialog(p) }, "Move to Mine…");
     page.append(el("div", { class: "card" },
       el("div", { class: "card-head" }, el("span", { class: "card-title" }, p.name || "Unnamed friend"), el("span", { class: "spacer" }),
         el("span", { class: "mono muted", title: p.id }, shortId(p.id))),
-      lines, el("div", { class: "actions" }, edit, revoke)));
+      lines, el("div", { class: "actions" }, edit, toMine, revoke)));
   }
+  renderInvites(page, state.invites.filter((i) => !i.mine));
+}
 
-  if (state.invites.length) {
+function renderInvites(page, invites) {
+  if (invites.length) {
     page.append(el("h2", {}, "Invites waiting to be used"));
-    for (const i of state.invites) {
+    for (const i of invites) {
       const cancel = el("button", { class: "btn small" }, "Cancel");
       cancel.addEventListener("click", () => attempt(() => call("cancel_invite", { id: i.id }), cancel));
       page.append(el("div", { class: "card row" },
-        el("span", { class: "spacer" }, `${i.name || "Invite"} · ${describeGrant(i.grant)}${i.ask_reciprocal ? " · asks for storage back" : ""}`,
+        el("span", { class: "spacer" }, i.mine ? `${i.name || "Invite"} · one of your devices`
+          : `${i.name || "Invite"} · ${describeGrant(i.grant)}${i.ask_reciprocal ? " · asks for storage back" : ""}`,
           el("div", { class: "muted small" }, `Expires ${dateTime(i.expires_unix)}`)),
         cancel));
     }
   }
 }
+
+// ----- mine -----
+
+function renderMine() {
+  const page = document.getElementById("page-mine");
+  const add = el("button", { class: "btn primary", disabled: !state.connected, onclick: addDeviceDialog }, "Add a device");
+  const join = el("button", { class: "btn", disabled: !state.connected, onclick: () => joinDialog(true) }, "Join with a code");
+  const looking = !!state.nearby.until_unix;
+  const find = el("button", { class: "btn", disabled: !state.connected || looking }, "Find nearby devices");
+  find.addEventListener("click", () => attempt(async () => { state.nearby = await call("find_nearby"); render(); }, find));
+  page.replaceChildren(el("div", { class: "page-head" }, el("h1", {}, "Mine"), el("div", { class: "row" }, find, join, add)));
+  page.append(el("p", { class: "muted" },
+    "Your own computers and servers. They keep each other's backups without storage, speed or time limits."));
+  if (looking) page.append(nearbyCard());
+
+  const mine = state.peers.filter((p) => p.mine);
+  if (!mine.length) {
+    page.append(el("div", { class: "card empty" },
+      "No devices yet. Choose “Add a device” here, then “Join with a code” on Mine on the other device."));
+  }
+  for (const p of mine) {
+    const lines = el("div", { class: "lines" });
+    lines.append(p.grant
+      ? el("div", {}, `Stores backups here: ${bytes(p.used_bytes)}${deletingNote(p)}`)
+      : el("div", { class: "muted" }, notAllowed(p)));
+    const using = setsOn(p.id);
+    lines.append(using.length
+      ? el("div", {}, `Keeps your backups: ${using.map((s) => s.name).join(", ")}`)
+      : p.hosts_us
+        ? el("div", {}, "Can keep your backups")
+        : el("div", { class: "muted" }, "Doesn't keep your backups"));
+    const remove = el("button", {
+      class: "btn small danger", disabled: using.length > 0, onclick: () => removeDeviceDialog(p),
+      title: using.length ? "Delete the backups it keeps first" : null,
+    }, "Remove…");
+    const toFriends = el("button", { class: "btn small" }, "Move to Friends");
+    toFriends.addEventListener("click", () => attempt(async () => {
+      await call("peer_set_mine", { id: p.id, mine: false });
+      toast(`${p.name || "Device"} moved to Friends. Set its limits there if you want any.`);
+    }, toFriends));
+    const allow = p.grant ? null : el("button", { class: "btn small" }, "Allow to store here");
+    allow?.addEventListener("click", () => attempt(() => call("peer_set_mine", { id: p.id, mine: true }), allow));
+    page.append(el("div", { class: "card" },
+      el("div", { class: "card-head" }, el("span", { class: "card-title" }, p.name || "Unnamed device"), el("span", { class: "spacer" }),
+        el("span", { class: "mono muted", title: p.id }, shortId(p.id))),
+      lines, el("div", { class: "actions" }, allow, toFriends, remove),
+      using.length ? el("div", { class: "muted small", style: "margin-top:6px" },
+        `To remove it, first delete the backups it keeps (Backups → Settings… → Delete permanently).`) : null));
+  }
+  renderInvites(page, state.invites.filter((i) => i.mine));
+}
+
+/** Backup sets stored on this peer. */
+function setsOn(id) {
+  return (state.status?.sets || []).filter((s) => s.target.kind === "peer" && s.target.id === id);
+}
+
+async function removeDeviceDialog(peer) {
+  const name = peer.name || "this device";
+  const stored = peer.used_bytes ? ` What it stored here (${bytes(peer.used_bytes)}) is erased in a week.` : "";
+  if (!await confirmDialog(`Remove ${name}?`,
+    `It will no longer be able to store backups here.${stored} To use it again later, pair it again.`,
+    "Remove")) return;
+  if (await attempt(() => call("peer_remove", { id: peer.id }))) toast(`${name} removed.`);
+}
+
+function secondsLeft() {
+  return Math.max(0, Math.round(state.nearby.until_unix - Date.now() / 1000));
+}
+
+function countdown() {
+  const s = secondsLeft();
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")} left`;
+}
+
+function nearbyCard() {
+  const stop = el("button", { class: "btn small" }, "Stop");
+  stop.addEventListener("click", () => attempt(async () => { await call("stop_nearby"); await refreshNearby(); }, stop));
+  const card = el("div", { class: "card" },
+    el("div", { class: "card-head" }, el("span", { class: "card-title" }, "Looking for your devices on this network"),
+      el("span", { class: "spacer" }), el("span", { class: "muted small", id: "nearby-left" }, countdown()), stop),
+    el("div", { class: "muted small" }, "Choose “Find nearby devices” on your other device too. Both need to be on the same network."));
+  const devices = state.nearby.devices;
+  if (!devices.length) card.append(el("div", { class: "lines" }, el("div", { class: "muted" }, "Nothing found yet…")));
+  for (const d of devices) {
+    let action;
+    if (d.state === "paired") action = el("span", { class: "chip ok" }, "Yours");
+    else if (d.state === "waiting") action = el("span", { class: "chip" }, `Now confirm on ${d.name}`);
+    else action = el("button", { class: "btn primary small", onclick: () => pairDialog(d) }, "Add…");
+    card.append(el("div", { class: "row", style: "margin-top:12px" },
+      el("span", { class: "spacer" }, el("strong", {}, d.name), el("div", { class: "muted small" }, `Code ${d.code}`)), action));
+  }
+  return card;
+}
+
+async function pairDialog(device) {
+  const v = await form({
+    title: `Add ${device.name}?`,
+    intro: `Check that ${device.name} shows the code ${device.code} for this computer. If it doesn't, or it isn't your own device, cancel.`,
+    fields: [{ type: "custom", node: el("div", { class: "pair-code" }, device.code) }],
+    ok: "The codes match, add it",
+    onSubmit: async () => { state.nearby = await call("pair_nearby", { id: device.id }); },
+  });
+  if (!v) return;
+  const now = state.nearby.devices.find((d) => d.id === device.id);
+  toast(now?.state === "paired" ? `${device.name} is now one of your devices.` : `Now add this computer on ${device.name} to finish.`);
+  render();
+}
+
+async function addDeviceDialog() {
+  let code = null;
+  const v = await form({
+    title: "Add a device",
+    intro: "Creates a one-time code for another of your own devices. Both devices can then keep each other's backups without limits.",
+    fields: [
+      { name: "name", label: "Device name", placeholder: "e.g. Laptop" },
+      { name: "days", label: "Code valid for (days)", type: "number", min: "1", value: "7" },
+    ],
+    ok: "Create code",
+    onSubmit: async (v) => {
+      const r = await call("create_invite", {
+        name: v.name || null, grant: { quota_bytes: null, upload_limit: null, window: null }, ask_reciprocal: true,
+        expires_secs: Math.max(1, Number(v.days) || 7) * 86400, mine: true,
+      });
+      code = r.ticket;
+    },
+  });
+  if (v && code) showCode(code, true);
+}
+
+async function moveToMineDialog(peer) {
+  if (!await confirmDialog(`Move ${peer.name || "this friend"} to Mine?`,
+    "Only do this for your own devices. It will be able to store backups here without storage, speed or time limits.",
+    "Move to Mine", false)) return;
+  await attempt(() => call("peer_set_mine", { id: peer.id, mine: true }));
+}
+
+// ----- friends (continued) -----
 
 async function inviteDialog() {
   let code = null;
@@ -685,7 +1050,7 @@ async function inviteDialog() {
   if (v && code) showCode(code);
 }
 
-function showCode(code) {
+function showCode(code, mine = false) {
   const area = el("textarea", { readonly: true });
   area.value = code;
   const copy = el("button", { class: "btn", type: "button" }, "Copy");
@@ -698,31 +1063,39 @@ function showCode(code) {
     }
   });
   form({
-    title: "Send this code to your friend",
-    intro: "They open KinVault → Friends → Join with a code, and paste it.",
+    title: mine ? "Use this code on your other device" : "Send this code to your friend",
+    intro: mine ? "On that device, open KinVault → Mine → Join with a code, and paste it."
+      : "They open KinVault → Friends → Join with a code, and paste it.",
     fields: [{ type: "custom", node: el("div", { class: "code-box" }, area, copy) }],
     ok: "Done",
   });
 }
 
-async function joinDialog() {
+async function joinDialog(mine = false) {
   let result = null;
   const v = await form({
-    title: "Join with a code",
+    title: mine ? "Join one of your devices" : "Join with a code",
+    intro: mine ? "Paste the code from “Add a device” on your other device. Each will keep the other's backups without limits." : null,
     fields: [
       { name: "code", label: "Invite code", type: "textarea", placeholder: "kvinvite1…" },
-      { name: "name", label: "What to call this friend (optional)" },
-      { name: "offer", label: "Let them keep their backups here too", type: "checkbox", value: true },
-      { name: "quota", label: "Storage you offer them (GB)", type: "number", min: "0", step: "any", placeholder: "Unlimited", value: "100" },
+      { name: "name", label: mine ? "What to call this device (optional)" : "What to call this friend (optional)" },
+      ...(mine ? [] : [
+        { name: "offer", label: "Let them keep their backups here too", type: "checkbox", value: true },
+        { name: "quota", label: "Storage you offer them (GB)", type: "number", min: "0", step: "any", placeholder: "Unlimited", value: "100" },
+      ]),
     ],
     ok: "Join",
     validate: (v) => (v.code.startsWith("kvinvite1") ? null : "That doesn't look like a KinVault invite code."),
     onSubmit: async (v) => {
       const offer = v.offer ? { quota_bytes: toBytes(v.quota, GiB), upload_limit: null, window: null } : null;
-      result = await call("redeem_invite", { ticket: v.code, name: v.name || null, offer });
+      result = await call("redeem_invite", { ticket: v.code, name: v.name || null, offer, mine });
     },
   });
   if (!v || !result) return;
+  if (mine) {
+    toast(`${result.host_name} added to Mine. Create a backup to use it.`);
+    return;
+  }
   toast(`You joined ${result.host_name}: you can store ${bytes(result.quota_bytes)} there. Create a backup to use it.`);
   if (result.ask_reciprocal && !v.offer) {
     toast(`${result.host_name} asked to keep their backups here too. Use “Allow to store here” on their card if you agree.`);
@@ -894,7 +1267,9 @@ async function importKit() {
 function go(page) {
   state.page = page;
   for (const b of document.querySelectorAll(".nav-item")) b.classList.toggle("active", b.dataset.page === page);
-  if (page === "friends" || page === "backups") refreshPeers();
+  if (page === "mine" || page === "friends" || page === "backups") refreshPeers();
+  if (page === "mine") refreshNearby();
+  if (page === "restore" && state.snapshotsError && state.restoreSet) loadSnapshots(state.restoreSet);
   if (page === "settings") refreshNetwork();
   render();
   document.getElementById("main").scrollTop = 0;
@@ -905,10 +1280,11 @@ for (const b of document.querySelectorAll(".nav-item")) b.addEventListener("clic
 async function setConnected(connected) {
   state.connected = connected;
   if (connected) {
-    await Promise.all([refreshStatus(), refreshPeers(), refreshNetwork()]);
+    await Promise.all([refreshStatus(), refreshPeers(), refreshNetwork(), refreshNearby()]);
   } else {
     state.status = null;
     state.network = null;
+    state.nearby = { until_unix: null, devices: [] };
     state.progress = {};
   }
   render();
@@ -942,10 +1318,41 @@ listen("daemon-event", (e) => {
     case "network_changed":
       refreshNetwork();
       break;
+    case "nearby_changed":
+      refreshNearby();
+      break;
+    case "restore_progress":
+      updateRestore(ev);
+      break;
+    case "restore_finished": {
+      const job = restoreJobs().find((j) => j.id === ev.id);
+      restoreEnded(ev.id);
+      toast(`Restored ${plural(ev.summary.files, "file")} (${bytes(ev.summary.bytes)})${job ? ` to ${job.target}` : ""}.`);
+      break;
+    }
+    case "restore_failed":
+      restoreEnded(ev.id);
+      toast(ev.cancelled ? "Restore cancelled. Files restored so far were kept." : `Restore failed: ${ev.error}`, !ev.cancelled);
+      break;
     default:
       refreshSoon();
   }
 });
+
+// The time left to find nearby devices counts down.
+setInterval(() => {
+  if (!state.nearby.until_unix) return;
+  if (secondsLeft() === 0) refreshNearby();
+  const left = document.getElementById("nearby-left");
+  if (left) left.textContent = countdown();
+}, 1000);
+
+// Open info tips follow their ⓘ when a dialog scrolls or the window resizes.
+for (const ev of ["scroll", "resize"]) {
+  window.addEventListener(ev, () => {
+    for (const tip of document.querySelectorAll(".info-tip")) if (tip.offsetParent || tip.offsetHeight) tip.place?.();
+  }, true);
+}
 
 // Relative times ("5 min ago") stay fresh.
 setInterval(() => { if (state.page === "backups") renderBackups(); }, 30_000);

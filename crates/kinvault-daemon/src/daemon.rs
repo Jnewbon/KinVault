@@ -18,6 +18,10 @@ use tokio::task::JoinHandle;
 
 use crate::api::{self, Event, GrantSpec, HostOffer, Reply, Request};
 use crate::config::{Config, PendingInvite, SetConfig, StoredTarget};
+mod deletion;
+mod nearby;
+mod restores;
+
 use crate::worker::{
     SetEnv, SetHandle, Trigger, VERIFY_BUDGET_BYTES, peer_addr, read_master_key, write_master_key,
 };
@@ -32,6 +36,8 @@ pub struct DaemonOptions {
     /// Use this endpoint instead of binding one from the stored identity
     /// (tests use local-only endpoints).
     pub endpoint: Option<Endpoint>,
+    /// Where to look for the user's other devices on the local network.
+    pub nearby: kinvault_net::nearby::NearbyOptions,
 }
 
 #[derive(Clone)]
@@ -53,6 +59,10 @@ struct Inner {
     sets: Mutex<HashMap<String, SetHandle>>,
     background: std::sync::Mutex<Vec<JoinHandle<()>>>,
     events: broadcast::Sender<Event>,
+    nearby_opts: kinvault_net::nearby::NearbyOptions,
+    /// Set while looking for nearby devices.
+    nearby: std::sync::Mutex<Option<nearby::Session>>,
+    restores: std::sync::Mutex<Vec<restores::Running>>,
 }
 
 fn unix_now() -> i64 {
@@ -104,6 +114,9 @@ impl Daemon {
                 config: Mutex::new(config.clone()),
                 background: Default::default(),
                 events: broadcast::channel(256).0,
+                nearby_opts: opts.nearby,
+                nearby: Default::default(),
+                restores: Default::default(),
             }),
         };
 
@@ -113,6 +126,14 @@ impl Daemon {
             Box::pin(async move {
                 let inner = weak.upgrade().ok_or("host is shutting down")?;
                 Daemon { inner }.accept_invite(r).await
+            })
+        }));
+        let weak = Arc::downgrade(&daemon.inner);
+        daemon.inner.receiver.set_pair_handler(Arc::new(move |r| {
+            let weak = weak.clone();
+            Box::pin(async move {
+                let inner = weak.upgrade().ok_or("host is shutting down")?;
+                Daemon { inner }.accept_pair(r).await
             })
         }));
 
@@ -131,6 +152,19 @@ impl Daemon {
         });
         daemon.inner.background.lock().unwrap().push(purge);
 
+        // Keep asking hosts to erase deleted sets' backups.
+        let weak = Arc::downgrade(&daemon.inner);
+        let deletions = tokio::spawn(async move {
+            loop {
+                let Some(inner) = weak.upgrade() else { return };
+                if let Err(e) = (Daemon { inner }).process_deletions().await {
+                    tracing::warn!("erasing deleted sets' backups failed: {e:#}");
+                }
+                tokio::time::sleep(deletion::RETRY_INTERVAL).await;
+            }
+        });
+        daemon.inner.background.lock().unwrap().push(deletions);
+
         let mut sets = daemon.inner.sets.lock().await;
         for set in config.sets {
             sets.insert(set.id.clone(), SetHandle::start(daemon.set_env(set)));
@@ -148,6 +182,8 @@ impl Daemon {
     }
 
     pub async fn shutdown(&self) {
+        self.inner.nearby.lock().unwrap().take();
+        self.cancel_all_restores();
         for task in self.inner.background.lock().unwrap().drain(..) {
             task.abort();
         }
@@ -204,12 +240,16 @@ impl Daemon {
             Request::SetInstanceName { .. }
             | Request::CreateSet(_)
             | Request::RemoveSet { .. }
+            | Request::DeleteSet { .. }
             | Request::SetLimits { .. }
+            | Request::SetExcludes { .. }
             | Request::SetRetention { .. }
             | Request::PauseSet { .. }
             | Request::ResumeSet { .. } => Some(Event::SetsChanged),
             Request::PeerAllow { .. }
             | Request::PeerRevoke { .. }
+            | Request::PeerSetMine { .. }
+            | Request::PeerRemove { .. }
             | Request::CreateInvite(_)
             | Request::CancelInvite { .. }
             | Request::RedeemInvite { .. } => Some(Event::PeersChanged),
@@ -239,6 +279,14 @@ impl Daemon {
             }
             Request::CreateSet(create) => self.create_set(create).await,
             Request::RemoveSet { set } => self.remove_set(&set).await,
+            Request::DeleteSet { set } => self.delete_set(&set).await,
+            Request::StartRestore {
+                set,
+                snapshot,
+                target,
+                include,
+            } => self.start_restore(&set, snapshot, target, include).await,
+            Request::CancelRestore { id } => self.cancel_restore(&id),
             Request::SetLimits {
                 set,
                 upload_limit,
@@ -247,6 +295,14 @@ impl Daemon {
                 self.update_set(&set, |s| {
                     s.upload_limit = upload_limit;
                     s.window = window;
+                    Ok(())
+                })
+                .await
+            }
+            Request::SetExcludes { set, excludes } => {
+                let excludes = clean_excludes(excludes)?;
+                self.update_set(&set, |s| {
+                    s.excludes = excludes;
                     Ok(())
                 })
                 .await
@@ -409,21 +465,75 @@ impl Daemon {
                 let peers = self.inner.config.lock().await.peers.clone();
                 let mut out = Vec::with_capacity(peers.len());
                 for p in peers {
-                    let used_bytes = match EndpointId::from_str(&p.id) {
-                        Ok(id) if p.grant.is_some() => {
-                            self.inner.receiver.usage(&id).await.unwrap_or(0)
-                        }
-                        _ => 0,
+                    // Also for peers no longer allowed here: what they left is still stored.
+                    let usage = match EndpointId::from_str(&p.id) {
+                        Ok(id) => self
+                            .inner
+                            .receiver
+                            .usage_detail(&id)
+                            .await
+                            .unwrap_or_default(),
+                        _ => Default::default(),
                     };
                     out.push(api::PeerInfo {
                         id: p.id,
                         name: p.name,
                         grant: p.grant,
-                        used_bytes,
+                        used_bytes: usage.used_bytes,
+                        deleting_bytes: usage.deleting_bytes,
                         hosts_us: p.hosts_us,
+                        mine: p.mine,
                     });
                 }
                 Ok(Reply::Peers(out))
+            }
+            Request::PeerRemove { id } => {
+                let mut config = self.inner.config.lock().await;
+                let id = resolve_peer(&config, &id)?.0;
+                let peer = self.parse_peer_id(&id)?;
+                let name = entry_name(&config, &id).unwrap_or_else(|| id.clone());
+                ensure!(
+                    config.peers.iter().any(|p| p.id == id),
+                    "{id} is not a known peer"
+                );
+                let using: Vec<&str> = config
+                    .sets
+                    .iter()
+                    .filter(|s| matches!(&s.target, StoredTarget::Peer { id: p, .. } if *p == id))
+                    .map(|s| s.name.as_str())
+                    .collect();
+                ensure!(
+                    using.is_empty(),
+                    "{name} still keeps these backups: {}. Delete them first.",
+                    using.join(", ")
+                );
+                config.peers.retain(|p| p.id != id);
+                config.save(&self.config_path())?;
+                drop(config);
+                self.inner.receiver.remove_peer(&peer).await?;
+                tracing::info!(peer = %id, name, "removed peer");
+                Ok(Reply::Done)
+            }
+            Request::PeerSetMine { id, mine } => {
+                let mut config = self.inner.config.lock().await;
+                let id = resolve_peer(&config, &id)?.0;
+                ensure!(
+                    config.peers.iter().any(|p| p.id == id),
+                    "{id} is not a known peer"
+                );
+                let peer = self.parse_peer_id(&id)?;
+                let entry = config.peer_mut(&id);
+                entry.mine = mine;
+                // Your own devices may store as much as they like.
+                let grant = mine.then(GrantSpec::default);
+                if let Some(grant) = grant {
+                    entry.grant = Some(grant);
+                }
+                config.save(&self.config_path())?;
+                if let Some(grant) = grant {
+                    self.inner.receiver.allow(peer, grant.to_grant());
+                }
+                Ok(Reply::Done)
             }
             Request::CreateInvite(invite) => self.create_invite(invite).await,
             Request::ListInvites => {
@@ -440,6 +550,7 @@ impl Daemon {
                             grant: i.grant,
                             ask_reciprocal: i.ask_reciprocal,
                             expires_unix: i.expires_unix,
+                            mine: i.mine,
                         })
                         .collect(),
                 ))
@@ -477,7 +588,19 @@ impl Daemon {
                 ticket,
                 name,
                 offer,
-            } => self.redeem_invite(&ticket, name, offer).await,
+                mine,
+            } => {
+                let offer = if mine {
+                    Some(GrantSpec::default())
+                } else {
+                    offer
+                };
+                self.redeem_invite(&ticket, name, offer, mine).await
+            }
+            Request::FindNearby => self.find_nearby().await,
+            Request::StopNearby => Ok(self.stop_nearby()),
+            Request::NearbyStatus => self.nearby_status().await,
+            Request::PairNearby { id } => self.pair_nearby(&id).await,
         }
     }
 
@@ -553,6 +676,7 @@ impl Daemon {
                     upload_limit: h.env.set.upload_limit,
                     window: h.env.set.window,
                     retention: h.env.set.retention,
+                    excludes: h.env.set.excludes.clone(),
                     state: st.state,
                     last_backup: st.last_backup,
                     last_error: st.last_error,
@@ -568,6 +692,7 @@ impl Daemon {
             version: env!("CARGO_PKG_VERSION").to_string(),
             hosting_store: self.inner.hosting_store.clone(),
             sets: out,
+            restores: self.restore_jobs(),
         }))
     }
 
@@ -662,6 +787,7 @@ impl Daemon {
                 .retention
                 .unwrap_or_else(api::RetentionPolicy::recommended),
             paused: false,
+            excludes: clean_excludes(req.excludes)?,
         };
 
         let set_dir = self.set_dir(&set.id);
@@ -702,7 +828,11 @@ impl Daemon {
         Ok(Reply::Done)
     }
 
-    async fn create_invite(&self, req: api::CreateInvite) -> Result<Reply> {
+    async fn create_invite(&self, mut req: api::CreateInvite) -> Result<Reply> {
+        if req.mine {
+            req.grant = GrantSpec::default();
+            req.ask_reciprocal = true;
+        }
         let token: [u8; 16] = kinvault_core::crypto::random_bytes()?;
         let token_hash = blake3::hash(&token).to_hex().to_string();
         let id = token_hash[..8].to_string();
@@ -724,6 +854,7 @@ impl Daemon {
             grant: req.grant,
             ask_reciprocal: req.ask_reciprocal,
             expires_unix,
+            mine: req.mine,
         });
         config.save(&self.config_path())?;
         Ok(Reply::Invite {
@@ -751,6 +882,7 @@ impl Daemon {
         let entry = config.peer_mut(&peer_id);
         entry.grant = Some(invite.grant);
         entry.name = invite.name.clone().or(r.name.clone()).or(entry.name.take());
+        entry.mine |= invite.mine;
         if !r.hosts.is_empty() {
             entry.hosts = r.hosts.clone();
         }
@@ -777,6 +909,7 @@ impl Daemon {
         ticket: &str,
         name: Option<String>,
         offer: Option<GrantSpec>,
+        mine: bool,
     ) -> Result<Reply> {
         let ticket = InviteTicket::decode(ticket)?;
         ensure!(
@@ -806,6 +939,7 @@ impl Daemon {
         let mut config = self.inner.config.lock().await;
         let entry = config.peer_mut(&host_id);
         entry.name = name.or(Some(accepted.host_name.clone()));
+        entry.mine |= mine;
         entry.addrs = ticket.host.ip_addrs().copied().collect();
         entry.hosts = ticket.hosts.clone();
         entry.hosts_us = Some(HostOffer {
@@ -867,11 +1001,31 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'sta
 }
 
 fn create_private_dir(path: &std::path::Path) -> Result<()> {
-    fs::create_dir_all(path)?;
+    fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        // Only the owner may change permissions. A directory we can write to
+        // but don't own (e.g. a NAS dataset shared through an ACL) keeps the
+        // access its owner gave it.
+        match fs::set_permissions(path, fs::Permissions::from_mode(0o700)) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => tracing::warn!(
+                "couldn't make {} private ({e}); make sure only KinVault's user can read it",
+                path.display()
+            ),
+            other => other.with_context(|| format!("making {} private", path.display()))?,
+        }
     }
     Ok(())
+}
+
+/// Trims patterns, drops blank ones and checks the rest are valid.
+fn clean_excludes(patterns: Vec<String>) -> Result<Vec<String>> {
+    let patterns: Vec<String> = patterns
+        .into_iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    kinvault_core::Excludes::parse(&patterns)?;
+    Ok(patterns)
 }

@@ -7,10 +7,11 @@ use std::time::Duration;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, SecretKey};
 use kinvault_daemon::api::{
-    BackupSummary, CreateInvite, CreateSet, GrantSpec, HostOffer, NetworkSettings, Reply, Request,
-    SetState, SetStatus, Target, TimeWindow,
+    BackupSummary, CreateInvite, CreateSet, GrantSpec, HostOffer, NearbyState, NearbyStatus,
+    NetworkSettings, Reply, Request, SetState, SetStatus, Target, TimeWindow,
 };
 use kinvault_daemon::{Daemon, DaemonOptions, ipc};
+use kinvault_net::nearby::NearbyOptions;
 
 async fn local_endpoint(secret: SecretKey) -> Endpoint {
     Endpoint::builder(presets::Minimal)
@@ -24,9 +25,14 @@ async fn local_endpoint(secret: SecretKey) -> Endpoint {
 }
 
 async fn start(state: &Path, secret: SecretKey) -> Daemon {
+    start_with_nearby(state, secret, Default::default()).await
+}
+
+async fn start_with_nearby(state: &Path, secret: SecretKey, nearby: NearbyOptions) -> Daemon {
     Daemon::start(DaemonOptions {
         state_dir: state.to_path_buf(),
         endpoint: Some(local_endpoint(secret).await),
+        nearby,
     })
     .await
     .unwrap()
@@ -104,6 +110,7 @@ async fn daemon_backs_up_changes_to_peer() {
             upload_limit: None,
             window: None,
             retention: None,
+            excludes: Vec::new(),
         }),
     )
     .await;
@@ -295,6 +302,7 @@ async fn friends_pair_with_an_invite_and_back_up_to_each_other() {
             },
             ask_reciprocal: true,
             expires_secs: None,
+            mine: false,
         }),
     )
     .await
@@ -319,6 +327,7 @@ async fn friends_pair_with_an_invite_and_back_up_to_each_other() {
             ticket: ticket.clone(),
             name: None,
             offer: Some(offer),
+            mine: false,
         },
     )
     .await
@@ -357,6 +366,7 @@ async fn friends_pair_with_an_invite_and_back_up_to_each_other() {
             ticket,
             name: None,
             offer: None,
+            mine: false,
         })
         .await
         .unwrap_err();
@@ -381,6 +391,7 @@ async fn friends_pair_with_an_invite_and_back_up_to_each_other() {
             upload_limit: Some(10_000_000),
             window: None,
             retention: None,
+            excludes: Vec::new(),
         }),
     )
     .await;
@@ -418,6 +429,7 @@ async fn friends_pair_with_an_invite_and_back_up_to_each_other() {
             upload_limit: None,
             window: Some(closed),
             retention: None,
+            excludes: Vec::new(),
         }),
     )
     .await;
@@ -460,6 +472,7 @@ async fn friends_pair_with_an_invite_and_back_up_to_each_other() {
         &alice,
         Request::CreateInvite(CreateInvite {
             expires_secs: Some(0),
+            mine: false,
             ..Default::default()
         }),
     )
@@ -472,6 +485,7 @@ async fn friends_pair_with_an_invite_and_back_up_to_each_other() {
             ticket,
             name: None,
             offer: None,
+            mine: false,
         })
         .await
         .unwrap_err();
@@ -535,6 +549,7 @@ async fn recovery_kit_restores_backups_on_a_new_machine() {
             upload_limit: None,
             window: None,
             retention: None,
+            excludes: Vec::new(),
         }),
     )
     .await;
@@ -698,6 +713,7 @@ async fn subscribers_see_state_changes_and_results() {
             upload_limit: None,
             window: None,
             retention: None,
+            excludes: Vec::new(),
         }),
     )
     .await;
@@ -837,6 +853,7 @@ async fn configured_addresses_travel_in_invites() {
             ticket,
             name: None,
             offer: Some(GrantSpec::default()),
+            mine: false,
         },
     )
     .await;
@@ -851,4 +868,610 @@ async fn configured_addresses_travel_in_invites() {
     );
     alice.shutdown().await;
     bob.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn own_devices_pair_without_limits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nas = start(&tmp.path().join("nas"), SecretKey::generate()).await;
+    let laptop = start(&tmp.path().join("laptop"), SecretKey::generate()).await;
+
+    // Limits and the reciprocal flag are ignored for one of your own devices.
+    let Reply::Invite { ticket, .. } = call(
+        &nas,
+        Request::CreateInvite(CreateInvite {
+            name: Some("laptop".into()),
+            grant: GrantSpec {
+                quota_bytes: Some(1 << 30),
+                ..Default::default()
+            },
+            ask_reciprocal: false,
+            expires_secs: None,
+            mine: true,
+        }),
+    )
+    .await
+    else {
+        panic!()
+    };
+    let Reply::Invites(invites) = call(&nas, Request::ListInvites).await else {
+        panic!()
+    };
+    assert!(invites[0].mine && invites[0].ask_reciprocal);
+    assert_eq!(invites[0].grant, GrantSpec::default());
+
+    let Reply::Redeemed { quota_bytes, .. } = call(
+        &laptop,
+        Request::RedeemInvite {
+            ticket,
+            name: Some("nas".into()),
+            offer: Some(GrantSpec {
+                quota_bytes: Some(1),
+                ..Default::default()
+            }),
+            mine: true,
+        },
+    )
+    .await
+    else {
+        panic!()
+    };
+    assert_eq!(quota_bytes, None);
+
+    for (d, name) in [(&nas, "laptop"), (&laptop, "nas")] {
+        let p = peers(d).await;
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].name.as_deref(), Some(name));
+        assert!(p[0].mine);
+        assert_eq!(p[0].grant, Some(GrantSpec::default()));
+        assert_eq!(p[0].hosts_us, Some(HostOffer { quota_bytes: None }));
+    }
+
+    // Moving a device to friends keeps its storage; moving it back lifts any
+    // limits set in between.
+    call(
+        &nas,
+        Request::PeerSetMine {
+            id: "laptop".into(),
+            mine: false,
+        },
+    )
+    .await;
+    let limited = GrantSpec {
+        quota_bytes: Some(1 << 20),
+        ..Default::default()
+    };
+    call(
+        &nas,
+        Request::PeerAllow {
+            id: "laptop".into(),
+            name: None,
+            grant: limited,
+        },
+    )
+    .await;
+    let p = peers(&nas).await;
+    assert!(!p[0].mine);
+    assert_eq!(p[0].grant, Some(limited));
+    call(
+        &nas,
+        Request::PeerSetMine {
+            id: "laptop".into(),
+            mine: true,
+        },
+    )
+    .await;
+    let p = peers(&nas).await;
+    assert!(p[0].mine);
+    assert_eq!(p[0].grant, Some(GrantSpec::default()));
+}
+
+fn free_udp_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+async fn nearby(d: &Daemon) -> NearbyStatus {
+    match call(d, Request::NearbyStatus).await {
+        Reply::Nearby(s) => s,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nearby_devices_pair_once_confirmed_on_both() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (port_a, port_b) = (free_udp_port(), free_udp_port());
+    // Each sends its beacons straight to the other's port.
+    let opts = |port, other: u16| NearbyOptions {
+        port,
+        targets: vec![([127, 0, 0, 1], other).into()],
+    };
+    let nas = start_with_nearby(
+        &tmp.path().join("nas"),
+        SecretKey::generate(),
+        opts(port_a, port_b),
+    )
+    .await;
+    let laptop = start_with_nearby(
+        &tmp.path().join("laptop"),
+        SecretKey::generate(),
+        opts(port_b, port_a),
+    )
+    .await;
+    for (d, name) in [(&nas, "nas"), (&laptop, "laptop")] {
+        call(d, Request::SetInstanceName { name: name.into() }).await;
+    }
+    assert!(nearby(&nas).await.until_unix.is_none());
+    call(&nas, Request::FindNearby).await;
+    call(&laptop, Request::FindNearby).await;
+
+    let mut found = None;
+    for _ in 0..100 {
+        let (a, b) = (nearby(&nas).await, nearby(&laptop).await);
+        if !a.devices.is_empty() && !b.devices.is_empty() {
+            found = Some((a.devices[0].clone(), b.devices[0].clone()));
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let (on_nas, on_laptop) = found.expect("the devices find each other");
+    assert_eq!(
+        (on_nas.name.as_str(), on_laptop.name.as_str()),
+        ("laptop", "nas")
+    );
+    assert_eq!(on_nas.id, laptop.id().to_string());
+    assert_eq!(on_nas.code, on_laptop.code);
+    assert_eq!(on_nas.state, NearbyState::Found);
+
+    // Confirmed on one side only: nothing is shared yet.
+    let Reply::Nearby(s) = call(
+        &nas,
+        Request::PairNearby {
+            id: on_nas.id.clone(),
+        },
+    )
+    .await
+    else {
+        panic!()
+    };
+    assert_eq!(s.devices[0].state, NearbyState::Waiting);
+    assert!(peers(&nas).await.is_empty());
+    assert!(peers(&laptop).await.is_empty());
+
+    // Confirmed on the other too: both list each other as their own.
+    let Reply::Nearby(s) = call(
+        &laptop,
+        Request::PairNearby {
+            id: on_laptop.id.clone(),
+        },
+    )
+    .await
+    else {
+        panic!()
+    };
+    assert_eq!(s.devices[0].state, NearbyState::Paired);
+    assert_eq!(nearby(&nas).await.devices[0].state, NearbyState::Paired);
+    for (d, name) in [(&nas, "laptop"), (&laptop, "nas")] {
+        let p = peers(d).await;
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].name.as_deref(), Some(name));
+        assert!(p[0].mine);
+        assert_eq!(p[0].grant, Some(GrantSpec::default()));
+        assert_eq!(p[0].hosts_us, Some(HostOffer { quota_bytes: None }));
+    }
+
+    call(&nas, Request::StopNearby).await;
+    assert!(nearby(&nas).await.until_unix.is_none());
+    let err = nas
+        .handle(Request::PairNearby { id: on_nas.id })
+        .await
+        .unwrap_err();
+    assert!(err.contains("not looking"), "{err}");
+}
+
+fn create_set(name: &str, src: &Path, target: Target) -> Request {
+    Request::CreateSet(CreateSet {
+        name: name.into(),
+        paths: vec![src.to_path_buf()],
+        target,
+        recovery_passphrase: "a long recovery phrase".into(),
+        debounce_secs: Some(1),
+        rescan_secs: None,
+        upload_limit: None,
+        window: None,
+        retention: None,
+        excludes: Vec::new(),
+    })
+}
+
+fn pending_deletions(state: &Path) -> Vec<serde_json::Value> {
+    let config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(state.join("config.json")).unwrap()).unwrap();
+    config["pending_deletions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn deleted(reply: Reply) -> kinvault_daemon::api::DeletedSet {
+    match reply {
+        Reply::SetDeleted(d) => d,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_set_erases_its_backups_wherever_they_are() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("documents");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("notes.md"), b"# notes").unwrap();
+    let pc_state = tmp.path().join("pc");
+    let pc = start(&pc_state, SecretKey::generate()).await;
+    let host_state = tmp.path().join("host");
+    let host = start(&host_state, SecretKey::generate()).await;
+    call(
+        &host,
+        Request::PeerAllow {
+            id: pc.id().to_string(),
+            name: None,
+            grant: GrantSpec::default(),
+        },
+    )
+    .await;
+    let peer = |d: &Daemon| Target::Peer {
+        id: d.id().to_string(),
+        addrs: vec![d.endpoint().bound_sockets()[0]],
+    };
+
+    // On a host that's online: hidden there now, erased in a week.
+    call(&pc, create_set("remote", &src, peer(&host))).await;
+    let backed_up = wait_for_backup(&pc, None).await;
+    let set_id = set_named(&pc, "remote").await.id;
+    let d = deleted(
+        call(
+            &pc,
+            Request::DeleteSet {
+                set: "remote".into(),
+            },
+        )
+        .await,
+    );
+    let week_from_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 7 * 24 * 60 * 60;
+    assert!(
+        (d.erase_after_unix.unwrap() - week_from_now).abs() < 60,
+        "{d:?}"
+    );
+    assert!(d.error.is_none() && !d.retrying);
+    let Reply::Status(status) = call(&pc, Request::Status).await else {
+        panic!()
+    };
+    assert!(status.sets.is_empty());
+    assert!(!pc_state.join("sets").join(&set_id).exists(), "key erased");
+    assert!(!pc_state.join("removed-sets").join(&set_id).exists());
+    assert!(pending_deletions(&pc_state).is_empty());
+    let hosted = host_state.join("hosted").join(pc.id().to_string());
+    let gone: Vec<_> = fs::read_dir(hosted.join(".deleted")).unwrap().collect();
+    assert_eq!(gone.len(), 1);
+    assert!(backed_up.bytes_uploaded > 0);
+    // The host still counts it, as marked for deletion.
+    let on_host = peers(&host).await;
+    assert!(on_host[0].used_bytes > 0);
+    assert_eq!(on_host[0].deleting_bytes, on_host[0].used_bytes);
+
+    // On a host that's gone: deleted here anyway, and it's asked again later.
+    call(&pc, create_set("orphan", &src, peer(&host))).await;
+    wait_for_backup(&pc, None).await;
+    host.shutdown().await;
+    let d = deleted(
+        call(
+            &pc,
+            Request::DeleteSet {
+                set: "orphan".into(),
+            },
+        )
+        .await,
+    );
+    assert!(d.retrying && d.error.is_some(), "{d:?}");
+    let Reply::Status(status) = call(&pc, Request::Status).await else {
+        panic!()
+    };
+    assert!(status.sets.is_empty());
+    let pending = pending_deletions(&pc_state);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0]["set_name"], "orphan");
+
+    // In a local folder: left alone for a week, then erased by the daemon.
+    let folder = tmp.path().join("usb");
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(folder.join("unrelated.txt"), b"keep me").unwrap();
+    call(
+        &pc,
+        create_set(
+            "local",
+            &src,
+            Target::Local {
+                path: folder.clone(),
+            },
+        ),
+    )
+    .await;
+    wait_for_backup(&pc, None).await;
+    let d = deleted(
+        call(
+            &pc,
+            Request::DeleteSet {
+                set: "local".into(),
+            },
+        )
+        .await,
+    );
+    assert!(
+        (d.erase_after_unix.unwrap() - week_from_now).abs() < 60,
+        "{d:?}"
+    );
+    assert!(folder.join("packs").exists());
+    assert_eq!(pending_deletions(&pc_state).len(), 2);
+
+    // A week later (the deadline moved back) the next start erases the folder.
+    pc.shutdown().await;
+    let path = pc_state.join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    for p in config["pending_deletions"].as_array_mut().unwrap() {
+        if p["set_name"] == "local" {
+            p["erase_after_unix"] = 1.into();
+        }
+    }
+    fs::write(&path, serde_json::to_string(&config).unwrap()).unwrap();
+    let pc = start(&pc_state, SecretKey::generate()).await;
+    for _ in 0..100 {
+        if !folder.join("packs").exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!folder.join("packs").exists());
+    assert!(!folder.join("snapshots").exists());
+    assert_eq!(fs::read(folder.join("unrelated.txt")).unwrap(), b"keep me");
+    // Only the unreachable host is still waiting to be told.
+    let pending = pending_deletions(&pc_state);
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    assert_eq!(pending[0]["set_name"], "orphan");
+    pc.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn devices_can_be_removed_once_no_backup_uses_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("documents");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("notes.md"), b"# notes").unwrap();
+    let nas_state = tmp.path().join("nas");
+    let nas = start(&nas_state, SecretKey::generate()).await;
+    let laptop = start(&tmp.path().join("laptop"), SecretKey::generate()).await;
+    let Reply::Invite { ticket, .. } = call(
+        &nas,
+        Request::CreateInvite(CreateInvite {
+            name: Some("laptop".into()),
+            mine: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    else {
+        panic!()
+    };
+    call(
+        &laptop,
+        Request::RedeemInvite {
+            ticket,
+            name: Some("nas".into()),
+            offer: None,
+            mine: true,
+        },
+    )
+    .await;
+    call(
+        &laptop,
+        create_set(
+            "docs",
+            &src,
+            Target::Peer {
+                id: nas.id().to_string(),
+                addrs: vec![nas.endpoint().bound_sockets()[0]],
+            },
+        ),
+    )
+    .await;
+    wait_for_backup(&laptop, None).await;
+
+    // The laptop backs up to the NAS, so it can't forget the NAS yet.
+    let err = laptop
+        .handle(Request::PeerRemove { id: "nas".into() })
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("docs") && err.contains("Delete them first"),
+        "{err}"
+    );
+    assert_eq!(peers(&laptop).await.len(), 1);
+
+    // The NAS can forget the laptop: what it stored there is erased in a week.
+    call(
+        &nas,
+        Request::PeerRemove {
+            id: "laptop".into(),
+        },
+    )
+    .await;
+    assert!(peers(&nas).await.is_empty());
+    let hosted = nas_state.join("hosted").join(laptop.id().to_string());
+    let left: Vec<_> = fs::read_dir(&hosted)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(left, vec![".deleted".to_string()]);
+    assert_eq!(fs::read_dir(hosted.join(".deleted")).unwrap().count(), 1);
+
+    // Once its backup is deleted, the laptop can forget the NAS too.
+    call(&laptop, Request::DeleteSet { set: "docs".into() }).await;
+    call(&laptop, Request::PeerRemove { id: "nas".into() }).await;
+    assert!(peers(&laptop).await.is_empty());
+    let err = laptop
+        .handle(Request::PeerRemove { id: "nas".into() })
+        .await
+        .unwrap_err();
+    assert!(err.contains("no peer"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restores_run_in_the_background_with_progress() {
+    use kinvault_daemon::api::Event;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("documents");
+    fs::create_dir_all(&src).unwrap();
+    let mut big = vec![0u8; 48 * 1024 * 1024];
+    blake3::Hasher::new()
+        .update(b"big")
+        .finalize_xof()
+        .fill(&mut big);
+    fs::write(src.join("big.bin"), &big).unwrap();
+    fs::write(src.join("notes.md"), b"# notes").unwrap();
+    let pc = start(&tmp.path().join("pc"), SecretKey::generate()).await;
+    let store = tmp.path().join("usb");
+    call(&pc, create_set("docs", &src, Target::Local { path: store })).await;
+    wait_for_backup(&pc, None).await;
+
+    let restore = |target: &str| Request::StartRestore {
+        set: "docs".into(),
+        snapshot: "latest".into(),
+        target: tmp.path().join(target),
+        include: None,
+    };
+
+    // It answers at once; progress and the result arrive as events.
+    let mut events = pc.subscribe();
+    let Reply::RestoreStarted { id } = call(&pc, restore("out")).await else {
+        panic!()
+    };
+    let Reply::Status(status) = call(&pc, Request::Status).await else {
+        panic!()
+    };
+    assert_eq!(status.restores.len(), 1);
+    assert_eq!(status.restores[0].id, id);
+    let mut progress = Vec::new();
+    let summary = loop {
+        match tokio::time::timeout(Duration::from_secs(60), events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Event::RestoreProgress(job) if job.id == id => progress.push(job),
+            Event::RestoreFinished {
+                id: done, summary, ..
+            } if done == id => break summary,
+            Event::RestoreFailed { error, .. } => panic!("{error}"),
+            _ => {}
+        }
+    };
+    assert_eq!(summary.files, 2);
+    assert!(!progress.is_empty());
+    let last = progress.last().unwrap();
+    assert_eq!(last.total_files, 2);
+    assert_eq!(last.total_bytes, big.len() as u64 + 7);
+    let root = kinvault_core::snapshot_root_name(&fs::canonicalize(&src).unwrap());
+    assert_eq!(
+        fs::read(tmp.path().join("out").join(&root).join("big.bin")).unwrap(),
+        big
+    );
+    let Reply::Status(status) = call(&pc, Request::Status).await else {
+        panic!()
+    };
+    assert!(status.restores.is_empty());
+
+    // Cancelled as soon as it starts reporting.
+    let Reply::RestoreStarted { id } = call(&pc, restore("cancelled")).await else {
+        panic!()
+    };
+    call(&pc, Request::CancelRestore { id: id.clone() }).await;
+    let cancelled = loop {
+        match tokio::time::timeout(Duration::from_secs(60), events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Event::RestoreFailed {
+                id: done,
+                cancelled,
+                ..
+            } if done == id => break cancelled,
+            Event::RestoreFinished { id: done, .. } if done == id => {
+                panic!("finished despite cancel")
+            }
+            _ => {}
+        }
+    };
+    assert!(cancelled);
+    let err = pc.handle(Request::CancelRestore { id }).await.unwrap_err();
+    assert!(err.contains("no restore"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn excluded_files_are_left_out_and_dont_trigger_backups() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::create_dir_all(repo.join("target/debug")).unwrap();
+    fs::write(repo.join("src/main.rs"), b"fn main() {}").unwrap();
+    fs::write(repo.join("target/debug/app"), b"binary").unwrap();
+    fs::write(repo.join("notes.log"), b"log").unwrap();
+    let pc = start(&tmp.path().join("pc"), SecretKey::generate()).await;
+    let usb = tmp.path().join("usb");
+    let set_with = |excludes: &[&str]| {
+        let Request::CreateSet(mut req) =
+            create_set("code", &repo, Target::Local { path: usb.clone() })
+        else {
+            unreachable!()
+        };
+        req.excludes = excludes.iter().map(|s| s.to_string()).collect();
+        Request::CreateSet(req)
+    };
+
+    let err = pc.handle(set_with(&["/media/../x"])).await.unwrap_err();
+    assert!(err.contains("..."), "{err}");
+    call(&pc, set_with(&["target/...", " ", "*.log"])).await;
+    let first = wait_for_backup(&pc, None).await;
+    assert_eq!(first.files, 1, "only src/main.rs: {first:?}");
+    let st = set_named(&pc, "code").await;
+    assert_eq!(st.excludes, vec!["target/...", "*.log"]);
+
+    // Rebuilding doesn't call for a backup.
+    fs::write(repo.join("target/debug/app"), b"rebuilt binary").unwrap();
+    fs::write(repo.join("notes.log"), b"more log").unwrap();
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let st = set_named(&pc, "code").await;
+    assert_eq!(st.last_backup.unwrap().snapshot, first.snapshot);
+
+    // Changing the patterns applies from the next backup.
+    call(
+        &pc,
+        Request::SetExcludes {
+            set: "code".into(),
+            excludes: vec!["target/".into()],
+        },
+    )
+    .await;
+    fs::write(repo.join("src/main.rs"), b"fn main() { println!(); }").unwrap();
+    let second = wait_for_backup(&pc, Some(&first.snapshot)).await;
+    assert_eq!(second.files, 2, "src/main.rs and notes.log: {second:?}");
 }

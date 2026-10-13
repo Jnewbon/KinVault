@@ -10,8 +10,15 @@ Self-hosted, encrypted backups between your own machines and your friends'.
   backs up only what changed, once changes settle.
 - **Friends.** Invite a friend with a one-time code, give them a quota, a speed
   limit and upload hours, and optionally store your backups with them in return.
+- **Your own devices.** Pair your computers and servers as "mine": they keep
+  each other's backups without limits, listed apart from friends. On the same
+  network they can find each other: press "Find nearby devices" on both,
+  check the code matches, and confirm on both.
 - **History.** Versioned snapshots with keep rules (hourly, daily, weekly…),
   periodic integrity checks, and a recovery kit to restore onto a new machine.
+- **Deleting for good.** Deleting a backup erases its key at once; wherever
+  it's stored erases the backups a week later. A host that's offline or gone
+  doesn't stop the deletion; it's asked again for up to a month.
 
 ## Parts
 
@@ -108,10 +115,37 @@ kinvault invite create --name me --quota 500G --ask-reciprocal
 # On yours: accept, offering them 200 GB back
 kinvault invite redeem kvinvite1… --offer 200G
 kinvault set create documents ~/Documents --peer their-name
+kinvault set create code ~/src --peer their-name --exclude 'target/...' --exclude '*.o'
+
+# Your own devices: no limits either way, listed under Mine
+kinvault invite create --mine --name laptop     # on the NAS
+kinvault invite redeem --mine kvinvite1…        # on the laptop
+# …or, on the same network, on both devices:
+kinvault nearby find              # lists devices and their codes for 3 minutes
+kinvault nearby pair laptop       # after checking both show the same code
 
 kinvault status
 kinvault recovery export ~/kinvault-recovery.json   # keep this off this machine
 ```
+
+### Leaving files out
+
+Each backup can leave out files and folders matching patterns (one per line in
+the app, `--exclude` or `kinvault set exclude <set> <patterns>…` on the command
+line; quote them so the shell doesn't expand them):
+
+| Pattern | Leaves out |
+|---|---|
+| `*.bat` | every `.bat` file, anywhere |
+| `/media/*.bat` | `.bat` files directly in `/media` |
+| `/media/.../*.bat` | `.bat` files in `/media` and all its subfolders |
+| `/media/*` | the files in `/media`, but not its subfolders |
+| `/media/...` | everything in `/media` |
+| `target/...` or `target/` | every folder named `target`, with its contents |
+
+`*` and `?` match within one name, `...` matches any number of folders, and a
+pattern without a leading `/` matches at any depth. Changes apply from the next
+backup: versions already made keep those files until they're cleaned up.
 
 ### Reaching your instance at your own address
 

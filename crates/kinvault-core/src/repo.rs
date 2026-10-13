@@ -9,6 +9,7 @@ use fastcdc::v2020::StreamCDC;
 use crate::backend::Backend;
 use crate::crypto::{Keys, MasterKey};
 use crate::error::{Error, Result};
+use crate::exclude::Excludes;
 use crate::ids::{ChunkId, PackId, SnapshotId};
 use crate::index::{CachedFile, Index};
 use crate::pack::{self, BlobKind, PackBuilder};
@@ -33,6 +34,15 @@ pub struct BackupProgress {
 }
 
 pub type ProgressFn = Arc<dyn Fn(&BackupProgress) + Send + Sync>;
+
+/// How far a restore got, out of what it restores in total.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RestoreProgress {
+    pub files: u64,
+    pub bytes: u64,
+    pub total_files: u64,
+    pub total_bytes: u64,
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct BackupStats {
@@ -64,6 +74,7 @@ pub struct Repository<B: Backend> {
     index: Index,
     pack_target: usize,
     excludes: Vec<PathBuf>,
+    exclude_patterns: Excludes,
     progress: Option<ProgressFn>,
 }
 
@@ -75,6 +86,7 @@ impl<B: Backend> Repository<B> {
             index,
             pack_target: DEFAULT_PACK_TARGET,
             excludes: Vec::new(),
+            exclude_patterns: Excludes::default(),
             progress: None,
         }
     }
@@ -83,14 +95,20 @@ impl<B: Backend> Repository<B> {
         self.pack_target = bytes;
     }
 
-    /// Absolute paths (and everything below them) to leave out of backups.
     /// Called after each file during backups; keep it cheap.
     pub fn set_progress(&mut self, progress: Option<ProgressFn>) {
         self.progress = progress;
     }
 
+    /// Absolute paths (and everything below them) to leave out of backups.
     pub fn set_excludes(&mut self, excludes: Vec<PathBuf>) {
         self.excludes = excludes;
+    }
+
+    /// Patterns for files and folders to leave out of backups. Earlier
+    /// snapshots keep what they hold until retention removes them.
+    pub fn set_exclude_patterns(&mut self, patterns: Excludes) {
+        self.exclude_patterns = patterns;
     }
 
     pub fn backend(&self) -> &B {
@@ -244,6 +262,19 @@ impl<B: Backend> Repository<B> {
         target: &Path,
         include: Option<&str>,
     ) -> Result<RestoreStats> {
+        self.restore_with_progress(id, target, include, &mut |_| true)
+    }
+
+    /// Like [`Self::restore`], reporting progress as data is written.
+    /// `progress` returning false cancels the restore with [`Error::Cancelled`]
+    /// (files restored so far are left in place).
+    pub fn restore_with_progress(
+        &mut self,
+        id: &SnapshotId,
+        target: &Path,
+        include: Option<&str>,
+        progress: &mut dyn FnMut(&RestoreProgress) -> bool,
+    ) -> Result<RestoreStats> {
         let snapshot = self.load_snapshot(id)?;
         if !self.index.has_chunk(&snapshot.root)? {
             self.sync_index()?;
@@ -251,13 +282,64 @@ impl<B: Backend> Repository<B> {
         let include = include
             .map(|s| s.trim_matches('/').to_string())
             .filter(|s| !s.is_empty());
-        fs::create_dir_all(target)?;
         let mut ctx = RestoreCtx {
             cache: VecDeque::new(),
             stats: RestoreStats::default(),
+            progress: RestoreProgress {
+                total_files: snapshot.file_count,
+                total_bytes: snapshot.total_bytes,
+                ..Default::default()
+            },
+            report: progress,
         };
+        if let Some(inc) = include.as_deref() {
+            // Only part of the snapshot: count what that part holds.
+            let (files, bytes) = self.count_tree(&snapshot.root, "", Some(inc), &mut ctx.cache)?;
+            ctx.progress.total_files = files;
+            ctx.progress.total_bytes = bytes;
+        }
+        if !(ctx.report)(&ctx.progress) {
+            return Err(Error::Cancelled);
+        }
+        fs::create_dir_all(target)?;
         self.restore_tree(&snapshot.root, target, "", include.as_deref(), &mut ctx)?;
         Ok(ctx.stats)
+    }
+
+    /// Files and bytes under `rel` that `include` selects.
+    fn count_tree(
+        &self,
+        tree_id: &ChunkId,
+        rel: &str,
+        include: Option<&str>,
+        cache: &mut VecDeque<(PackId, Vec<u8>)>,
+    ) -> Result<(u64, u64)> {
+        let tree: Tree = postcard::from_bytes(&self.read_blob(tree_id, cache)?)?;
+        let (mut files, mut bytes) = (0, 0);
+        for node in &tree.nodes {
+            let node_rel = if rel.is_empty() {
+                node.name.clone()
+            } else {
+                format!("{rel}/{}", node.name)
+            };
+            let Some(child_include) = included(include, &node_rel) else {
+                continue;
+            };
+            match &node.kind {
+                NodeKind::Dir { tree } => {
+                    let (f, b) = self.count_tree(tree, &node_rel, child_include, cache)?;
+                    files += f;
+                    bytes += b;
+                }
+                _ if child_include.is_some() => {}
+                NodeKind::File { size, .. } => {
+                    files += 1;
+                    bytes += size;
+                }
+                NodeKind::Symlink { .. } => {}
+            }
+        }
+        Ok((files, bytes))
     }
 
     fn read_blob(&self, id: &ChunkId, cache: &mut VecDeque<(PackId, Vec<u8>)>) -> Result<Vec<u8>> {
@@ -292,13 +374,8 @@ impl<B: Backend> Repository<B> {
             } else {
                 format!("{rel}/{}", node.name)
             };
-            let child_include = match include {
-                None => None,
-                Some(inc) if inc == node_rel || inc.starts_with(&format!("{node_rel}/")) => {
-                    if inc == node_rel { None } else { Some(inc) }
-                }
-                Some(inc) if node_rel.starts_with(&format!("{inc}/")) => None,
-                Some(_) => continue,
+            let Some(child_include) = included(include, &node_rel) else {
+                continue;
             };
             let path = dir.join(&node.name);
             match &node.kind {
@@ -319,11 +396,19 @@ impl<B: Backend> Repository<B> {
                         let data = self.read_blob(chunk, &mut ctx.cache)?;
                         std::io::Write::write_all(&mut file, &data)?;
                         ctx.stats.bytes += data.len() as u64;
+                        ctx.progress.bytes += data.len() as u64;
+                        if !(ctx.report)(&ctx.progress) {
+                            return Err(Error::Cancelled);
+                        }
                     }
                     file.set_modified(from_mtime_ns(node.mtime_ns))?;
                     drop(file);
                     set_mode(&path, node.mode)?;
                     ctx.stats.files += 1;
+                    ctx.progress.files += 1;
+                    if !(ctx.report)(&ctx.progress) {
+                        return Err(Error::Cancelled);
+                    }
                 }
                 NodeKind::Symlink { target } => {
                     if let Some(parent) = path.parent() {
@@ -341,9 +426,24 @@ impl<B: Backend> Repository<B> {
     }
 }
 
-struct RestoreCtx {
+struct RestoreCtx<'a> {
     cache: VecDeque<(PackId, Vec<u8>)>,
     stats: RestoreStats,
+    progress: RestoreProgress,
+    report: &'a mut dyn FnMut(&RestoreProgress) -> bool,
+}
+
+/// Whether a node at `node_rel` is restored when only `include` (a path in
+/// the snapshot) is wanted: `None` to skip it, otherwise the include to apply
+/// to its children (`Some(None)`: everything below it).
+fn included<'a>(include: Option<&'a str>, node_rel: &str) -> Option<Option<&'a str>> {
+    match include {
+        None => Some(None),
+        Some(inc) if inc == node_rel => Some(None),
+        Some(inc) if inc.starts_with(&format!("{node_rel}/")) => Some(Some(inc)),
+        Some(inc) if node_rel.starts_with(&format!("{inc}/")) => Some(None),
+        Some(_) => None,
+    }
 }
 
 /// Buffers new blobs into packs and uploads them when full. Data and trees
@@ -466,6 +566,14 @@ impl<B: Backend> BackupRun<'_, B> {
             }
         };
         let ft = meta.file_type();
+        let left_out = if ft.is_dir() {
+            self.repo.exclude_patterns.excludes_dir(path)
+        } else {
+            self.repo.exclude_patterns.excludes_file(path)
+        };
+        if left_out {
+            return Ok(None);
+        }
         let kind = if ft.is_symlink() {
             match fs::read_link(path) {
                 Ok(t) => NodeKind::Symlink {

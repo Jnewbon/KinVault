@@ -391,6 +391,8 @@ async fn window_rate_limit_and_trash() {
     .await
     .unwrap();
     assert_eq!(remote.status().await.unwrap().used_bytes, used);
+    let usage = host.receiver.usage_detail(&ep.id()).await.unwrap();
+    assert_eq!((usage.used_bytes, usage.deleting_bytes), (used, 400_000));
     assert_eq!(
         host.receiver
             .purge_trash(std::time::Duration::from_secs(3600))
@@ -406,5 +408,82 @@ async fn window_rate_limit_and_trash() {
         400_000
     );
     assert!(remote.status().await.unwrap().used_bytes < used);
+    host.router.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deleted_repositories_are_hidden_then_erased_a_week_later() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = Host::start(tmp.path().join("host")).await;
+    let (ep, remote) = client(&host, "repo").await;
+    host.receiver.allow(ep.id(), Grant::default());
+    let (_, other) = {
+        let backend = RemoteBackend::new(
+            ep.clone(),
+            host.addr(),
+            "other",
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+        ((), Arc::new(backend))
+    };
+
+    let data = vec![5u8; 100_000];
+    let id = PackId(*blake3::hash(&data).as_bytes());
+    for r in [remote.clone(), other.clone()] {
+        let d = data.clone();
+        tokio::task::spawn_blocking(move || r.put_pack(&id, &d))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    let erase_after = remote.delete_repo().await.unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let week = kinvault_net::REPO_DELETE_DELAY.as_secs() as i64;
+    assert!((erase_after - now - week).abs() < 60);
+    // Hidden at once; the other repository is untouched; deleting again is fine.
+    let (r, o) = (remote.clone(), other.clone());
+    tokio::task::spawn_blocking(move || {
+        assert!(r.list_packs().unwrap().is_empty());
+        assert_eq!(o.list_packs().unwrap(), vec![id]);
+    })
+    .await
+    .unwrap();
+    remote.delete_repo().await.unwrap();
+    // Still counted, and shown as waiting to be erased.
+    let usage = host.receiver.usage_detail(&ep.id()).await.unwrap();
+    assert_eq!(usage.deleting_bytes, 100_000);
+    assert_eq!(usage.used_bytes, 200_000);
+
+    // Kept until the week is up, then erased.
+    let deleted = host.store.join(ep.id().to_string()).join(".deleted");
+    assert_eq!(
+        host.receiver
+            .purge_trash(std::time::Duration::ZERO)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(fs::read_dir(&deleted).unwrap().count(), 2);
+    for (n, entry) in fs::read_dir(&deleted).unwrap().enumerate() {
+        let entry = entry.unwrap().path();
+        fs::rename(&entry, deleted.join(format!("{}-repo-{n}", now - 1))).unwrap();
+    }
+    assert_eq!(
+        host.receiver
+            .purge_trash(std::time::Duration::ZERO)
+            .await
+            .unwrap(),
+        100_000
+    );
+    assert_eq!(fs::read_dir(&deleted).unwrap().count(), 0);
+    let o = other.clone();
+    tokio::task::spawn_blocking(move || assert_eq!(o.list_packs().unwrap(), vec![id]))
+        .await
+        .unwrap();
     host.router.shutdown().await.unwrap();
 }

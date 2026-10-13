@@ -9,11 +9,12 @@ mod error;
 mod hosts;
 mod identity;
 mod limits;
+pub mod nearby;
 pub mod protocol;
 mod receiver;
 mod ticket;
 
-pub use client::{RemoteBackend, RemoteStatus, redeem_invite};
+pub use client::{RemoteBackend, RemoteStatus, pair, redeem_invite};
 pub use error::NetError;
 pub use hosts::{HostAddr, InvalidHostAddr, with_hosts};
 pub use identity::load_or_create_secret;
@@ -21,7 +22,10 @@ pub use iroh::protocol::Router;
 pub use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 pub use limits::{RateLimiter, TimeWindow};
 pub use protocol::Offer;
-pub use receiver::{Grant, InviteAccepted, InviteHandler, InviteRedemption, Receiver};
+pub use receiver::{
+    Grant, InviteAccepted, InviteHandler, InviteRedemption, PairHandler, PairRequest, PeerUsage,
+    REPO_DELETE_DELAY, Receiver,
+};
 pub use ticket::InviteTicket;
 
 use std::net::{Ipv4Addr, Ipv6Addr};

@@ -40,6 +40,8 @@ pub struct KitSet {
     pub upload_limit: Option<u64>,
     pub window: Option<TimeWindow>,
     pub retention: RetentionPolicy,
+    #[serde(default)]
+    pub excludes: Vec<String>,
     pub key: KeyFile,
 }
 
@@ -64,6 +66,7 @@ pub(crate) fn build(
             upload_limit: set.upload_limit,
             window: set.window,
             retention: set.retention,
+            excludes: set.excludes.clone(),
             key: KeyFile::create(key, passphrase)?,
         });
     }
@@ -168,6 +171,7 @@ pub fn import_offline(
             window: set.window,
             retention: set.retention,
             paused: true,
+            excludes: set.excludes.clone(),
         });
         imported.push(name);
     }

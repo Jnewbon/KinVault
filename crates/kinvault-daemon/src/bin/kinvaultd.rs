@@ -38,9 +38,17 @@ async fn main() -> Result<()> {
             default_state_dir().context("could not determine a data directory; pass --state")?
         }
     };
-    std::fs::create_dir_all(&state_dir)?;
+    std::fs::create_dir_all(&state_dir)
+        .with_context(|| format!("creating the state directory {}", state_dir.display()))?;
 
-    let listener = ipc::Listener::bind(&ipc::endpoint_name(&state_dir)).await?;
+    let listener = ipc::Listener::bind(&ipc::endpoint_name(&state_dir))
+        .await
+        .with_context(|| {
+            format!(
+                "opening the control socket in {} (is it writable by this user?)",
+                state_dir.display()
+            )
+        })?;
     if let Some(port) = args.listen_port {
         let path = state_dir.join("config.json");
         let mut config = Config::load(&path)?;
@@ -63,6 +71,7 @@ async fn main() -> Result<()> {
     let daemon = Daemon::start(DaemonOptions {
         state_dir,
         endpoint: None,
+        nearby: Default::default(),
     })
     .await?;
     tracing::info!(

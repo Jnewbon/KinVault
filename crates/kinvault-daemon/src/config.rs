@@ -31,6 +31,21 @@ pub struct Config {
     pub invites: Vec<PendingInvite>,
     #[serde(default)]
     pub sets: Vec<SetConfig>,
+    /// Deleted sets whose backups still need erasing.
+    #[serde(default)]
+    pub pending_deletions: Vec<PendingDeletion>,
+}
+
+/// A deleted set's backups: a host still to be told to erase them, or a
+/// local folder to erase once `erase_after_unix` has passed.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PendingDeletion {
+    pub set_id: String,
+    pub set_name: String,
+    pub target: StoredTarget,
+    pub requested_unix: i64,
+    #[serde(default)]
+    pub erase_after_unix: Option<i64>,
 }
 
 fn default_grace_days() -> u64 {
@@ -54,6 +69,9 @@ pub struct PeerEntry {
     /// Set if this peer agreed to store our backups.
     #[serde(default)]
     pub hosts_us: Option<api::HostOffer>,
+    /// One of this user's own devices rather than a friend's.
+    #[serde(default)]
+    pub mine: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -65,6 +83,8 @@ pub struct PendingInvite {
     pub grant: api::GrantSpec,
     pub ask_reciprocal: bool,
     pub expires_unix: i64,
+    #[serde(default)]
+    pub mine: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -84,6 +104,9 @@ pub struct SetConfig {
     /// Paused sets don't back up automatically.
     #[serde(default)]
     pub paused: bool,
+    /// Files and folders to leave out; see [`kinvault_core::Excludes`].
+    #[serde(default)]
+    pub excludes: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -127,6 +150,7 @@ impl Config {
                     hosts: Vec::new(),
                     grant: None,
                     hosts_us: None,
+                    mine: false,
                 });
                 self.peers.len() - 1
             }

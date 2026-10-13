@@ -65,6 +65,19 @@ pub enum Op {
         /// reach it for reciprocal backups.
         hosts: Vec<String>,
     },
+    /// Asks to be paired as one of the host owner's own devices, after both
+    /// owners confirmed it while finding nearby devices. Allowed from peers
+    /// the host doesn't know yet; `repo` is ignored.
+    Pair {
+        /// The requesting instance's name.
+        name: String,
+        /// Addresses the requesting peer's owner configured.
+        hosts: Vec<String>,
+    },
+    /// Erases the whole repository. The host hides it at once and deletes
+    /// it after [`REPO_DELETE_DELAY`](crate::REPO_DELETE_DELAY), so a
+    /// compromised sender can't destroy backups instantly.
+    DeleteRepo,
 }
 
 /// Storage one peer offers another.
@@ -98,6 +111,13 @@ pub enum Response {
     Redeemed {
         host_name: String,
         quota_bytes: Option<u64>,
+    },
+    Paired {
+        host_name: String,
+    },
+    DeleteScheduled {
+        /// When the host erases the repository (Unix seconds).
+        erase_after_unix: i64,
     },
 }
 

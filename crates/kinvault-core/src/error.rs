@@ -1,5 +1,7 @@
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("cancelled")]
+    Cancelled,
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("index database error: {0}")]

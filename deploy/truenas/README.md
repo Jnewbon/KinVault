@@ -14,6 +14,17 @@ backups) with its web interface. Requires TrueNAS SCALE 24.10 or later
 
 The `apps` user also needs read access to every dataset you want to back up.
 
+KinVault runs as `apps` and fails with `Permission denied (os error 13)` if it
+can't write to its state directory. New datasets and ixVolumes belong to
+root, so either:
+
+- use the YAML below as is: its `permissions` step runs once before KinVault
+  starts, hands the writable mounts to `apps`, and exits (the same way
+  TrueNAS's own apps prepare their storage), or
+- set it up yourself: Datasets → Edit Permissions, or with an ixVolume in the
+  Custom App form, tick **Enable ACL** and add an entry for user `568` with
+  Modify access.
+
 ## 2. Install the app
 
 Apps → Discover Apps → ⋮ → **Install via YAML**. Paste
@@ -39,6 +50,14 @@ connections:
 1. Forward UDP 47100 on your router to the NAS.
 2. In the web interface, Settings → Network → Change…, add your public IP or
    a dynamic DNS name (e.g. `home.example.org`). Invite codes then include it.
+
+## Pairing with your other devices
+
+On the **Mine** page, choose **Find nearby devices** on the NAS and on your
+other device (on the same network), check both show the same code, and add
+each other on both. For three minutes the devices find each other with UDP
+broadcasts on port 47101; this needs `network_mode: host`, as in the example.
+Otherwise use **Add a device** and **Join with a code** instead.
 
 ## Backing up the NAS itself
 

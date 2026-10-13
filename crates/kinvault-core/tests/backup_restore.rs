@@ -278,3 +278,103 @@ fn unchanged_backup_reuses_previous_snapshot() {
     assert_ne!(changed, fresh);
     assert_eq!(repo.list_snapshots().unwrap().len(), 3);
 }
+
+#[test]
+fn restore_reports_progress_and_can_be_cancelled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    make_tree(&src);
+    let master = MasterKey::generate().unwrap();
+    let mut repo = Repository::open(
+        LocalDirBackend::create(tmp.path().join("store")).unwrap(),
+        &master,
+        Index::open_in_memory().unwrap(),
+    );
+    let (snap, stats) = repo
+        .backup(std::slice::from_ref(&src), "test-host")
+        .unwrap();
+    let root_name = kinvault_core::snapshot_root_name(&fs::canonicalize(&src).unwrap());
+
+    // Everything: totals come from the snapshot, and the last report reaches them.
+    let mut seen = Vec::new();
+    repo.restore_with_progress(&snap, &tmp.path().join("all"), None, &mut |p| {
+        seen.push(*p);
+        true
+    })
+    .unwrap();
+    let last = seen.last().unwrap();
+    assert_eq!(
+        (last.total_files, last.total_bytes),
+        (stats.files, stats.total_bytes)
+    );
+    assert_eq!(
+        (last.files, last.bytes),
+        (last.total_files, last.total_bytes)
+    );
+    assert!(seen.windows(2).all(|w| w[0].bytes <= w[1].bytes));
+
+    // Part of it: totals count only that part.
+    let mut last = None;
+    let part = repo
+        .restore_with_progress(
+            &snap,
+            &tmp.path().join("part"),
+            Some(&format!("{root_name}/docs")),
+            &mut |p| {
+                last = Some(*p);
+                true
+            },
+        )
+        .unwrap();
+    let last = last.unwrap();
+    assert_eq!(last.total_files, part.files);
+    assert_eq!(last.total_bytes, part.bytes);
+    assert!(last.total_files < stats.files);
+
+    // Cancelled after the first file.
+    let err = repo
+        .restore_with_progress(&snap, &tmp.path().join("cancelled"), None, &mut |p| {
+            p.files == 0
+        })
+        .unwrap_err();
+    assert!(matches!(err, kinvault_core::Error::Cancelled), "{err}");
+}
+
+#[test]
+fn excluded_files_are_left_out_of_new_snapshots_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    make_tree(&src);
+    let master = MasterKey::generate().unwrap();
+    let mut repo = Repository::open(
+        LocalDirBackend::create(tmp.path().join("store")).unwrap(),
+        &master,
+        Index::open_in_memory().unwrap(),
+    );
+    let (before, _) = repo
+        .backup(std::slice::from_ref(&src), "test-host")
+        .unwrap();
+
+    // Added after the first backup: binaries anywhere, and one folder.
+    repo.set_exclude_patterns(kinvault_core::Excludes::parse(&["*.bin", "docs/nested/"]).unwrap());
+    let (after, stats) = repo
+        .backup(std::slice::from_ref(&src), "test-host")
+        .unwrap();
+    assert_ne!(before, after);
+
+    let root = kinvault_core::snapshot_root_name(&fs::canonicalize(&src).unwrap());
+    let out = tmp.path().join("after");
+    repo.restore(&after, &out, None).unwrap();
+    let restored = out.join(&root);
+    assert!(restored.join("docs/notes.txt").exists());
+    assert!(!restored.join("big.bin").exists());
+    assert!(!restored.join("empty.bin").exists());
+    assert!(!restored.join("docs/nested").exists());
+    assert!(stats.total_bytes < 1024 * 1024, "{stats:?}");
+
+    // The earlier snapshot still has them until retention removes it.
+    let out = tmp.path().join("before");
+    repo.restore(&before, &out, None).unwrap();
+    assert!(out.join(&root).join("big.bin").exists());
+    assert!(out.join(&root).join("docs/nested/copy.txt").exists());
+}

@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use kinvault_core::{Backend, Index, LocalDirBackend, MasterKey, Repository, SnapshotId};
+use kinvault_core::{Backend, Excludes, Index, LocalDirBackend, MasterKey, Repository, SnapshotId};
 use kinvault_net::{Endpoint, EndpointAddr, EndpointId, RemoteBackend};
 use notify::event::{AccessKind, AccessMode};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -104,6 +104,14 @@ fn unix_now() -> i64 {
 
 impl SetEnv {
     /// Opens the set's repository. Blocking; call from a blocking context.
+    /// The set's exclude patterns (checked when they were saved).
+    pub fn exclude_patterns(&self) -> Excludes {
+        Excludes::parse(&self.set.excludes).unwrap_or_else(|e| {
+            tracing::warn!(set = %self.set.name, "ignoring exclude patterns: {e}");
+            Excludes::default()
+        })
+    }
+
     pub fn open_repository(&self) -> Result<Repository<Box<dyn Backend>>> {
         let master = read_master_key(&self.set_dir)?;
         let backend: Box<dyn Backend> = match &self.set.target {
@@ -127,6 +135,7 @@ impl SetEnv {
         let index = Index::open(&self.set_dir.join("index.db"))?;
         let mut repo = Repository::open(backend, &master, index);
         repo.set_excludes(self.excludes.clone());
+        repo.set_exclude_patterns(self.exclude_patterns());
         Ok(repo)
     }
 
@@ -204,14 +213,15 @@ fn is_change(kind: &EventKind) -> bool {
 
 fn start_watcher(env: &SetEnv, tx: mpsc::Sender<Trigger>) -> Option<RecommendedWatcher> {
     let excludes = env.excludes.clone();
+    let patterns = env.exclude_patterns();
     let handler = move |res: notify::Result<notify::Event>| {
         let relevant = match res {
+            // E.g. a build rewriting its output doesn't call for a backup.
             Ok(ev) => {
                 is_change(&ev.kind)
-                    && !ev
-                        .paths
-                        .iter()
-                        .all(|p| excludes.iter().any(|e| p.starts_with(e)))
+                    && !ev.paths.iter().all(|p| {
+                        excludes.iter().any(|e| p.starts_with(e)) || patterns.excludes_any(p)
+                    })
             }
             // Events may have been lost; a backup rescans everything anyway.
             Err(_) => true,
