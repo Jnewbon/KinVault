@@ -69,6 +69,9 @@ enum Command {
     },
     /// Show live activity until interrupted.
     Watch,
+    /// Show or change how many days deleted data is kept before it's erased:
+    /// backups friends delete here, and backups you stop (`set remove`).
+    KeepDeleted { days: Option<u64> },
     /// Start kinvaultd automatically when you log in.
     #[command(subcommand)]
     Service(ServiceCommand),
@@ -163,10 +166,13 @@ enum SetCommand {
         #[command(flatten)]
         limits: SetLimits,
     },
-    /// Stop backing up a set. Existing backups and the set's key are kept.
+    /// Stop backing up a set. It can still be restored from until deleted
+    /// data's grace period is over (see `keep-deleted`); then its backups
+    /// are erased.
     Remove { set: String },
-    /// Delete a set and its backups for good. The set's key is erased now and
-    /// the backups a week later, wherever they are stored.
+    /// Delete a set (running or stopped) and its backups for good. The set's
+    /// key is erased now and the backups a week later, wherever they are
+    /// stored.
     Delete {
         set: String,
         /// Don't ask to confirm.
@@ -433,6 +439,14 @@ fn kit_passphrase(confirm: bool) -> Result<String> {
     Ok(p)
 }
 
+fn plural_days(days: u64) -> String {
+    if days == 1 {
+        "1 day".to_string()
+    } else {
+        format!("{days} days")
+    }
+}
+
 fn format_unix(secs: i64) -> String {
     format_time(secs * 1_000_000_000)
 }
@@ -602,7 +616,11 @@ async fn main() -> Result<()> {
             };
             println!("instance {} ({})", s.name, s.id);
             println!("hosting store {}", s.hosting_store.display());
-            if s.sets.is_empty() {
+            println!(
+                "keeps deleted data for {}",
+                plural_days(s.keep_deleted_days)
+            );
+            if s.sets.is_empty() && s.stopped_sets.is_empty() {
                 println!("no backup sets; create one with `kinvault set create`");
             }
             for set in s.sets {
@@ -667,6 +685,31 @@ async fn main() -> Result<()> {
                     );
                 }
             }
+            for set in s.stopped_sets {
+                println!(
+                    "\n{} [{}] (stopped {}) -> {}",
+                    set.name,
+                    set.id,
+                    format_unix(set.stopped_unix),
+                    describe_target(&set.target)
+                );
+                println!(
+                    "  can be restored until {}; then its backups are erased",
+                    format_unix(set.erase_after_unix)
+                );
+            }
+        }
+        Command::KeepDeleted { days } => {
+            if let Some(days) = days {
+                client.call(&Request::SetKeepDeletedDays { days }).await?;
+            }
+            let Reply::Status(s) = client.call(&Request::Status).await? else {
+                bail!("unexpected reply")
+            };
+            println!(
+                "Deleted data is kept for {} before it's erased.",
+                plural_days(s.keep_deleted_days)
+            );
         }
         Command::Id => {
             let Reply::Status(s) = client.call(&Request::Status).await? else {
@@ -907,8 +950,26 @@ async fn main() -> Result<()> {
             println!("kinvaultd stopped");
         }
         Command::Set(SetCommand::Remove { set }) => {
-            client.call(&Request::RemoveSet { set }).await?;
-            println!("Set removed. Its backups and key were kept.");
+            client
+                .call(&Request::RemoveSet { set: set.clone() })
+                .await?;
+            let Reply::Status(s) = client.call(&Request::Status).await? else {
+                bail!("unexpected reply")
+            };
+            println!("Stopped backing up {set}.");
+            // The newest stopped set of that name is the one just stopped.
+            if let Some(stopped) = s
+                .stopped_sets
+                .iter()
+                .filter(|st| st.name == set || st.id == set)
+                .max_by_key(|st| st.stopped_unix)
+            {
+                println!(
+                    "Its backups can be restored until {}; then they're erased.",
+                    format_unix(stopped.erase_after_unix)
+                );
+                println!("To erase them sooner: kinvault set delete {}", stopped.id);
+            }
         }
         Command::Set(SetCommand::Delete { set, yes }) => {
             if !yes {

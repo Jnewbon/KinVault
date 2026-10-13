@@ -17,7 +17,7 @@ use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::api::{self, Event, GrantSpec, HostOffer, Reply, Request};
-use crate::config::{Config, PendingInvite, SetConfig, StoredTarget};
+use crate::config::{Config, PendingInvite, SetConfig, StoppedSet, StoredTarget};
 mod deletion;
 mod nearby;
 mod restores;
@@ -30,6 +30,12 @@ pub(crate) const DEFAULT_DEBOUNCE_SECS: u64 = 30;
 pub(crate) const DEFAULT_RESCAN_SECS: u64 = 6 * 60 * 60;
 const DEFAULT_INVITE_SECS: u64 = 7 * 24 * 60 * 60;
 const TRASH_PURGE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+/// Longest `keep_deleted_days` allowed: ten years.
+const MAX_GRACE_DAYS: u64 = 3650;
+
+fn grace_period(days: u64) -> Duration {
+    Duration::from_secs(days.min(MAX_GRACE_DAYS) * 24 * 60 * 60)
+}
 
 pub struct DaemonOptions {
     pub state_dir: PathBuf,
@@ -63,6 +69,9 @@ struct Inner {
     /// Set while looking for nearby devices.
     nearby: std::sync::Mutex<Option<nearby::Session>>,
     restores: std::sync::Mutex<Vec<restores::Running>>,
+    /// Wake the trash purge and the deletion loop early (the grace period changed).
+    wake_purge: Arc<tokio::sync::Notify>,
+    wake_deletions: Arc<tokio::sync::Notify>,
 }
 
 fn unix_now() -> i64 {
@@ -99,7 +108,6 @@ impl Daemon {
             }
         }
         let router = kinvault_net::serve(endpoint.clone(), receiver.clone());
-        let grace = Duration::from_secs(config.trash_grace_days * 24 * 60 * 60);
 
         let daemon = Self {
             inner: Arc::new(Inner {
@@ -117,6 +125,8 @@ impl Daemon {
                 nearby_opts: opts.nearby,
                 nearby: Default::default(),
                 restores: Default::default(),
+                wake_purge: Default::default(),
+                wake_deletions: Default::default(),
             }),
         };
 
@@ -137,30 +147,42 @@ impl Daemon {
             })
         }));
 
-        let receiver = daemon.inner.receiver.clone();
+        let weak = Arc::downgrade(&daemon.inner);
+        let wake = daemon.inner.wake_purge.clone();
         let purge = tokio::spawn(async move {
             loop {
-                match receiver.purge_trash(grace).await {
+                let Some(inner) = weak.upgrade() else { return };
+                let grace = grace_period(inner.config.lock().await.keep_deleted_days);
+                match inner.receiver.purge_trash(grace).await {
                     Ok(0) => {}
                     Ok(freed) => tracing::info!(
                         "removed {freed} bytes of data peers deleted over the grace period ago"
                     ),
                     Err(e) => tracing::warn!("purging deleted peer data failed: {e}"),
                 }
-                tokio::time::sleep(TRASH_PURGE_INTERVAL).await;
+                drop(inner);
+                tokio::select! {
+                    _ = tokio::time::sleep(TRASH_PURGE_INTERVAL) => {}
+                    _ = wake.notified() => {}
+                }
             }
         });
         daemon.inner.background.lock().unwrap().push(purge);
 
-        // Keep asking hosts to erase deleted sets' backups.
+        // Keep asking hosts to erase deleted sets' backups, and erase stopped
+        // sets' once their grace period is over.
         let weak = Arc::downgrade(&daemon.inner);
+        let wake = daemon.inner.wake_deletions.clone();
         let deletions = tokio::spawn(async move {
             loop {
                 let Some(inner) = weak.upgrade() else { return };
                 if let Err(e) = (Daemon { inner }).process_deletions().await {
                     tracing::warn!("erasing deleted sets' backups failed: {e:#}");
                 }
-                tokio::time::sleep(deletion::RETRY_INTERVAL).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(deletion::RETRY_INTERVAL) => {}
+                    _ = wake.notified() => {}
+                }
             }
         });
         daemon.inner.background.lock().unwrap().push(deletions);
@@ -235,12 +257,42 @@ impl Daemon {
             .ok_or_else(|| anyhow!("no backup set named {key:?}"))
     }
 
+    /// Finds a set to read from (list, restore): a running set, or else a
+    /// stopped one whose backups haven't been erased yet.
+    async fn find_readable_set(&self, key: &str) -> Result<SetEnv> {
+        if let Ok(env) = self.find_set(key).await {
+            return Ok(env);
+        }
+        let set = self
+            .find_stopped_set(key)
+            .await
+            .ok_or_else(|| anyhow!("no backup set named {key:?}"))?;
+        let mut env = self.set_env(set.set);
+        env.set_dir = self.removed_set_dir(&env.set.id);
+        Ok(env)
+    }
+
+    async fn find_stopped_set(&self, key: &str) -> Option<StoppedSet> {
+        let config = self.inner.config.lock().await;
+        let stopped = &config.stopped_sets;
+        stopped
+            .iter()
+            .find(|s| s.set.id == key)
+            .or_else(|| stopped.iter().find(|s| s.set.name == key))
+            .cloned()
+    }
+
+    fn removed_set_dir(&self, id: &str) -> PathBuf {
+        self.inner.state_dir.join("removed-sets").join(id)
+    }
+
     pub async fn handle(&self, req: Request) -> Result<Reply, String> {
         let event = match &req {
             Request::SetInstanceName { .. }
             | Request::CreateSet(_)
             | Request::RemoveSet { .. }
             | Request::DeleteSet { .. }
+            | Request::SetKeepDeletedDays { .. }
             | Request::SetLimits { .. }
             | Request::SetExcludes { .. }
             | Request::SetRetention { .. }
@@ -280,6 +332,20 @@ impl Daemon {
             Request::CreateSet(create) => self.create_set(create).await,
             Request::RemoveSet { set } => self.remove_set(&set).await,
             Request::DeleteSet { set } => self.delete_set(&set).await,
+            Request::SetKeepDeletedDays { days } => {
+                ensure!(
+                    days <= MAX_GRACE_DAYS,
+                    "keep deleted data for at most {MAX_GRACE_DAYS} days"
+                );
+                let mut config = self.inner.config.lock().await;
+                config.keep_deleted_days = days;
+                config.save(&self.config_path())?;
+                drop(config);
+                // A shorter period may make data due for erasing now.
+                self.inner.wake_purge.notify_one();
+                self.inner.wake_deletions.notify_one();
+                Ok(Reply::Done)
+            }
             Request::StartRestore {
                 set,
                 snapshot,
@@ -371,7 +437,7 @@ impl Daemon {
                 })
             }
             Request::ListSnapshots { set } => {
-                let env = self.find_set(&set).await?;
+                let env = self.find_readable_set(&set).await?;
                 let snapshots =
                     blocking(move || Ok(env.open_repository()?.list_snapshots()?)).await?;
                 Ok(Reply::Snapshots(
@@ -394,7 +460,7 @@ impl Daemon {
                 target,
                 include,
             } => {
-                let env = self.find_set(&set).await?;
+                let env = self.find_readable_set(&set).await?;
                 let stats = blocking(move || {
                     let mut repo = env.open_repository()?;
                     let id = repo.find_snapshot(&snapshot)?;
@@ -409,7 +475,7 @@ impl Daemon {
                 }))
             }
             Request::RemoteUsage { set } => {
-                let env = self.find_set(&set).await?;
+                let env = self.find_readable_set(&set).await?;
                 let StoredTarget::Peer {
                     id,
                     repo,
@@ -499,6 +565,7 @@ impl Daemon {
                 let using: Vec<&str> = config
                     .sets
                     .iter()
+                    .chain(config.stopped_sets.iter().map(|s| &s.set))
                     .filter(|s| matches!(&s.target, StoredTarget::Peer { id: p, .. } if *p == id))
                     .map(|s| s.name.as_str())
                     .collect();
@@ -686,12 +753,32 @@ impl Daemon {
             })
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
+        drop(sets);
+        let config = self.inner.config.lock().await;
+        let grace = grace_period(config.keep_deleted_days).as_secs() as i64;
+        let mut stopped: Vec<api::StoppedSetStatus> = config
+            .stopped_sets
+            .iter()
+            .map(|s| api::StoppedSetStatus {
+                id: s.set.id.clone(),
+                name: s.set.name.clone(),
+                paths: s.set.paths.clone(),
+                target: s.set.target.to_api(),
+                stopped_unix: s.stopped_unix,
+                erase_after_unix: s.stopped_unix + grace,
+            })
+            .collect();
+        stopped.sort_by(|a, b| a.name.cmp(&b.name));
+        let keep_deleted_days = config.keep_deleted_days;
+        drop(config);
         Ok(Reply::Status(api::DaemonStatus {
             id: self.id().to_string(),
             name,
             version: env!("CARGO_PKG_VERSION").to_string(),
             hosting_store: self.inner.hosting_store.clone(),
             sets: out,
+            stopped_sets: stopped,
+            keep_deleted_days,
             restores: self.restore_jobs(),
         }))
     }
@@ -814,17 +901,22 @@ impl Daemon {
     }
 
     async fn remove_set(&self, key: &str) -> Result<Reply> {
-        let id = self.find_set(key).await?.set.id;
+        let set = self.find_set(key).await?.set;
+        let id = set.id.clone();
         let mut config = self.inner.config.lock().await;
         config.sets.retain(|s| s.id != id);
+        config.stopped_sets.push(StoppedSet {
+            set,
+            stopped_unix: unix_now(),
+        });
         config.save(&self.config_path())?;
         if let Some(handle) = self.inner.sets.lock().await.remove(&id) {
             handle.stop();
         }
-        // Keep the key: it's the only way to read what was already backed up.
-        let removed = self.inner.state_dir.join("removed-sets");
-        fs::create_dir_all(&removed)?;
-        fs::rename(self.set_dir(&id), removed.join(&id))?;
+        // Keep the key until the backups are erased, so they can be restored.
+        let removed = self.removed_set_dir(&id);
+        fs::create_dir_all(removed.parent().expect("removed-sets/<id>"))?;
+        fs::rename(self.set_dir(&id), removed)?;
         Ok(Reply::Done)
     }
 

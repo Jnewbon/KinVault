@@ -21,6 +21,7 @@ const state = {
   progress: {}, // set id -> latest Progress event
   autostart: false,
   restoreSet: null,
+  snapshotsSet: null, // the set whose versions are in `snapshots`
   snapshots: [],
   snapshotsError: null, // why the restore set's versions couldn't be loaded
   snapshotsLoading: false,
@@ -67,6 +68,10 @@ function ago(unixSeconds) {
 
 function dateTime(unixSeconds) {
   return new Date(unixSeconds * 1000).toLocaleString();
+}
+
+function date(unixSeconds) {
+  return new Date(unixSeconds * 1000).toLocaleDateString();
 }
 
 function toast(message, bad = false) {
@@ -465,13 +470,35 @@ function renderBackups() {
   const add = el("button", { class: "btn primary", disabled: !state.connected, onclick: newSetDialog }, "New backup");
   page.replaceChildren(el("div", { class: "page-head" }, el("h1", {}, "Backups"), add));
   const sets = state.status?.sets || [];
+  const stopped = state.status?.stopped_sets || [];
   if (!sets.length) {
     page.append(el("div", { class: "card empty" },
       el("div", {}, state.connected ? "Nothing is being backed up yet." : "Start the background service to see your backups."),
       state.connected ? el("button", { class: "btn primary", onclick: newSetDialog }, "Choose what to back up") : null));
-    return;
   }
   for (const set of sets) page.append(setCard(set));
+  if (stopped.length) {
+    page.append(el("h2", {}, "Stopped"),
+      el("p", { class: "muted" }, "These no longer back up. You can still restore from them until their backups are erased."));
+    for (const set of stopped) page.append(stoppedSetCard(set));
+  }
+}
+
+function stoppedSetCard(set) {
+  return el("div", { class: "card" },
+    el("div", { class: "card-head" }, el("span", { class: "card-title" }, set.name), el("span", { class: "chip warn" }, "Stopped"),
+      el("span", { class: "spacer" }), el("span", { class: "card-sub" }, `→ ${describeTarget(set.target)}`)),
+    el("div", { class: "paths" }, set.paths.join(" · ")),
+    el("div", { class: "lines" },
+      el("div", {}, `Stopped ${dateTime(set.stopped_unix)}. Its backups are erased on ${date(set.erase_after_unix)}.`)),
+    el("div", { class: "actions" },
+      el("button", { class: "btn small", onclick: () => { state.restoreSet = set.id; go("restore"); } }, "Restore…"),
+      el("button", { class: "btn small danger", onclick: () => deleteSet(set) }, "Delete permanently…")));
+}
+
+/** Every set that can be restored from: running ones, then stopped ones. */
+function restorableSets() {
+  return [...(state.status?.sets || []), ...(state.status?.stopped_sets || [])];
 }
 
 function setCard(set) {
@@ -594,8 +621,11 @@ async function setSettingsDialog(set) {
 
 async function removeSet(set) {
   document.getElementById("modal").close();
+  const days = state.status?.keep_deleted_days ?? 30;
+  const until = date(Date.now() / 1000 + days * 86400);
   if (!await confirmDialog(`Stop backing up ${set.name}?`,
-    "Existing backups and this set's key are kept, so they can still be restored with a recovery kit. New changes won't be backed up.",
+    `New changes won't be backed up. You can still restore from its backups until ${until}; then they're erased. ` +
+    "To keep them longer, change how long deleted data is kept in Settings first.",
     "Stop backing up")) return;
   await attempt(() => call("remove_set", { set: set.id }));
 }
@@ -617,7 +647,6 @@ async function deleteSet(set) {
     onSubmit: async () => { result = await call("delete_set", { set: set.id }); },
   });
   if (!v || !result) return;
-  const date = (t) => new Date(t * 1000).toLocaleDateString();
   if (result.erase_after_unix && !result.error) {
     toast(`${set.name} deleted. ${set.target.kind === "local" ? "Its backup folder" : where} will erase the backups on ${date(result.erase_after_unix)}.`);
   } else if (result.retrying) {
@@ -694,6 +723,7 @@ let snapshotsRequest = 0;
 async function loadSnapshots(setId) {
   const request = ++snapshotsRequest;
   state.restoreSet = setId;
+  state.snapshotsSet = setId;
   state.selectedSnapshot = null;
   state.snapshots = [];
   state.snapshotsError = null;
@@ -730,7 +760,7 @@ function renderRestore() {
   const page = document.getElementById("page-restore");
   page.replaceChildren(el("div", { class: "page-head" }, el("h1", {}, "Restore")));
   for (const job of restoreJobs()) page.append(restoreCard(job));
-  const sets = state.status?.sets || [];
+  const sets = restorableSets();
   if (!sets.length) {
     page.append(el("div", { class: "card empty" }, "There's nothing to restore yet."));
     return;
@@ -740,7 +770,8 @@ function renderRestore() {
     return;
   }
   const picker = el("select", { onchange: (e) => loadSnapshots(e.target.value) },
-    sets.map((s) => el("option", { value: s.id, selected: s.id === state.restoreSet }, s.name)));
+    sets.map((s) => el("option", { value: s.id, selected: s.id === state.restoreSet },
+      s.stopped_unix ? `${s.name} (stopped)` : s.name)));
   page.append(el("div", { class: "card" }, el("div", { class: "field", style: "margin-top:0" }, el("label", {}, "Backup"), picker)));
 
   const table = el("table", {}, el("thead", {}, el("tr", {}, el("th", {}, "Version from"), el("th", {}, "Computer"), el("th", {}, "Files"), el("th", {}, "Size"))));
@@ -941,7 +972,7 @@ function renderMine() {
 
 /** Backup sets stored on this peer. */
 function setsOn(id) {
-  return (state.status?.sets || []).filter((s) => s.target.kind === "peer" && s.target.id === id);
+  return restorableSets().filter((s) => s.target.kind === "peer" && s.target.id === id);
 }
 
 async function removeDeviceDialog(peer) {
@@ -1179,6 +1210,14 @@ function renderSettings() {
       el("div", {}), el("div", { class: "actions" }, el("button", { class: "btn small", onclick: networkDialog }, "Change…"))));
   }
 
+  if (s) {
+    page.append(el("h2", {}, "Deleted data"), el("div", { class: "card kv" },
+      el("div", { class: "muted" }, "Keep for"),
+      el("div", {}, plural(s.keep_deleted_days, "day"),
+        el("div", { class: "muted small" }, "Backups you stop can be restored for this long. What friends delete here is kept this long too, and still counts toward their storage.")),
+      el("div", {}), el("div", { class: "actions" }, el("button", { class: "btn small", onclick: graceDialog }, "Change…"))));
+  }
+
   page.append(el("h2", {}, "Recovery"));
   const exportBtn = el("button", { class: "btn primary", disabled: !state.connected, onclick: exportKit }, "Export recovery kit…");
   const importBtn = WEB ? null : el("button", { class: "btn", disabled: state.connected, onclick: importKit }, "Import recovery kit…");
@@ -1191,6 +1230,19 @@ function renderSettings() {
       "To set up a new server from a kit, import it with the kinvault command before the server first starts (see the README).")
     : state.connected ? el("div", { class: "muted small", style: "margin-top:8px" },
       "To import a kit on a new computer, do it before the background service first starts (stop it if it's running).") : null));
+}
+
+async function graceDialog() {
+  const v = await form({
+    title: "Keep deleted data",
+    intro: "How long to keep backups you stop, so you can still restore from them, and data friends delete from this computer, " +
+      "so a problem on their side can't wipe their history at once. After that, it's erased.",
+    fields: [{ name: "days", label: "Days", type: "number", min: "0", max: "3650", step: "1", value: state.status.keep_deleted_days }],
+    ok: "Save",
+    validate: (v) => (/^\d+$/.test(v.days) && Number(v.days) <= 3650 ? null : "Enter a whole number of days, from 0 to 3650."),
+    onSubmit: (v) => call("set_keep_deleted_days", { days: Number(v.days) }),
+  });
+  if (v) toast("Saved");
 }
 
 async function networkDialog() {
@@ -1269,7 +1321,10 @@ function go(page) {
   for (const b of document.querySelectorAll(".nav-item")) b.classList.toggle("active", b.dataset.page === page);
   if (page === "mine" || page === "friends" || page === "backups") refreshPeers();
   if (page === "mine") refreshNearby();
-  if (page === "restore" && state.snapshotsError && state.restoreSet) loadSnapshots(state.restoreSet);
+  // Load the chosen backup's versions unless they're already shown (e.g. a card's Restore… chose another).
+  if (page === "restore" && state.restoreSet && (state.snapshotsError || state.snapshotsSet !== state.restoreSet)) {
+    loadSnapshots(state.restoreSet);
+  }
   if (page === "settings") refreshNetwork();
   render();
   document.getElementById("main").scrollTop = 0;

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::api;
 
 /// Persistent daemon configuration (`config.json` in the state directory).
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Config {
     /// Name friends see for this instance (defaults to the hostname).
     #[serde(default)]
@@ -16,9 +16,14 @@ pub struct Config {
     /// Where hosted peers' data is stored; defaults to `<state>/hosted`.
     #[serde(default)]
     pub hosting_store: Option<PathBuf>,
-    /// Days that data a peer deletes is kept before it is really removed.
+    /// Days that deleted data is kept before it is really removed: data a
+    /// peer deletes here, and our own sets that were stopped.
     #[serde(default = "default_grace_days")]
-    pub trash_grace_days: u64,
+    pub keep_deleted_days: u64,
+    /// What older versions saved instead. New installs saved 0 by mistake
+    /// (meaning "erase at once"), so only a value chosen by hand carries over.
+    #[serde(default, rename = "trash_grace_days", skip_serializing)]
+    legacy_trash_grace_days: Option<u64>,
     /// Fixed UDP port to listen on (random if unset), for port forwarding.
     #[serde(default)]
     pub listen_port: Option<u16>,
@@ -34,6 +39,17 @@ pub struct Config {
     /// Deleted sets whose backups still need erasing.
     #[serde(default)]
     pub pending_deletions: Vec<PendingDeletion>,
+    /// Sets that stopped backing up. They can still be restored from until
+    /// `keep_deleted_days` have passed; then their backups are erased.
+    #[serde(default)]
+    pub stopped_sets: Vec<StoppedSet>,
+}
+
+/// A set that no longer backs up. Its key is in `removed-sets/<id>`.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct StoppedSet {
+    pub set: SetConfig,
+    pub stopped_unix: i64,
 }
 
 /// A deleted set's backups: a host still to be told to erase them, or a
@@ -48,8 +64,10 @@ pub struct PendingDeletion {
     pub erase_after_unix: Option<i64>,
 }
 
+pub const DEFAULT_GRACE_DAYS: u64 = 30;
+
 fn default_grace_days() -> u64 {
-    30
+    DEFAULT_GRACE_DAYS
 }
 
 /// Another instance we know, in either direction.
@@ -138,6 +156,13 @@ impl StoredTarget {
     }
 }
 
+impl Default for Config {
+    /// The same defaults as a config file that sets nothing.
+    fn default() -> Self {
+        serde_json::from_str("{}").expect("every field has a default")
+    }
+}
+
 impl Config {
     pub fn peer_mut(&mut self, id: &str) -> &mut PeerEntry {
         let pos = match self.peers.iter().position(|p| p.id == id) {
@@ -160,7 +185,15 @@ impl Config {
 
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         match fs::read_to_string(path) {
-            Ok(text) => Ok(serde_json::from_str(&text)?),
+            Ok(text) => {
+                let mut config: Self = serde_json::from_str(&text)?;
+                if let Some(days) = config.legacy_trash_grace_days.take()
+                    && days > 0
+                {
+                    config.keep_deleted_days = days;
+                }
+                Ok(config)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e.into()),
         }
@@ -183,4 +216,29 @@ pub fn write_private(path: &Path, data: &[u8]) -> anyhow::Result<()> {
     f.sync_all()?;
     fs::rename(&tmp, path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deleted_data_is_kept_for_30_days_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        assert_eq!(Config::default().keep_deleted_days, DEFAULT_GRACE_DAYS);
+        assert_eq!(Config::load(&path).unwrap().keep_deleted_days, 30);
+
+        // Older versions saved 0 for new installs by mistake; that isn't kept.
+        fs::write(&path, r#"{"trash_grace_days": 0}"#).unwrap();
+        assert_eq!(Config::load(&path).unwrap().keep_deleted_days, 30);
+        // A value chosen by hand is.
+        fs::write(&path, r#"{"trash_grace_days": 14}"#).unwrap();
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.keep_deleted_days, 14);
+        config.save(&path).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("trash_grace_days"), "{saved}");
+        assert_eq!(Config::load(&path).unwrap().keep_deleted_days, 14);
+    }
 }

@@ -1250,6 +1250,147 @@ async fn deleting_a_set_erases_its_backups_wherever_they_are() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn stopped_sets_can_be_restored_until_their_grace_period_ends() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("documents");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("notes.md"), b"# notes").unwrap();
+    let pc_state = tmp.path().join("pc");
+    let pc = start(&pc_state, SecretKey::generate()).await;
+    let host = start(&tmp.path().join("host"), SecretKey::generate()).await;
+    call(
+        &host,
+        Request::PeerAllow {
+            id: pc.id().to_string(),
+            name: None,
+            grant: GrantSpec::default(),
+        },
+    )
+    .await;
+    let target = Target::Peer {
+        id: host.id().to_string(),
+        addrs: vec![host.endpoint().bound_sockets()[0]],
+    };
+    call(&pc, create_set("docs", &src, target.clone())).await;
+    wait_for_backup(&pc, None).await;
+    let set_id = set_named(&pc, "docs").await.id;
+    call(&pc, Request::RemoveSet { set: "docs".into() }).await;
+
+    // Listed as stopped, erased after the grace period (30 days by default).
+    let Reply::Status(status) = call(&pc, Request::Status).await else {
+        panic!()
+    };
+    assert!(status.sets.is_empty());
+    assert_eq!(status.keep_deleted_days, 30);
+    let stopped = &status.stopped_sets[0];
+    assert_eq!(
+        (stopped.id.as_str(), stopped.name.as_str()),
+        (set_id.as_str(), "docs")
+    );
+    assert_eq!(
+        stopped.erase_after_unix - stopped.stopped_unix,
+        30 * 24 * 60 * 60
+    );
+    assert!(pc_state.join("removed-sets").join(&set_id).exists());
+
+    // Still restorable, by name or id.
+    let Reply::Snapshots(snaps) = call(&pc, Request::ListSnapshots { set: "docs".into() }).await
+    else {
+        panic!()
+    };
+    assert_eq!(snaps.len(), 1);
+    let out = tmp.path().join("restored");
+    call(
+        &pc,
+        Request::Restore {
+            set: set_id.clone(),
+            snapshot: "latest".into(),
+            target: out.clone(),
+            include: None,
+        },
+    )
+    .await;
+    let restored = out.join(kinvault_core::snapshot_root_name(
+        &fs::canonicalize(&src).unwrap(),
+    ));
+    assert_eq!(fs::read(restored.join("notes.md")).unwrap(), b"# notes");
+
+    // Its host can't be removed while it keeps the stopped set.
+    call(
+        &pc,
+        Request::PeerAllow {
+            id: host.id().to_string(),
+            name: None,
+            grant: GrantSpec::default(),
+        },
+    )
+    .await;
+    let refused = pc
+        .handle(Request::PeerRemove {
+            id: host.id().to_string(),
+        })
+        .await;
+    let refused = refused.unwrap_err();
+    assert!(refused.contains("docs"), "{refused}");
+
+    // With no grace period left, the host is asked to erase it, then the key goes.
+    call(&pc, Request::SetKeepDeletedDays { days: 0 }).await;
+    let hidden = tmp
+        .path()
+        .join("host/hosted")
+        .join(pc.id().to_string())
+        .join(".deleted");
+    for _ in 0..100 {
+        if !pc_state.join("removed-sets").join(&set_id).exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!pc_state.join("removed-sets").join(&set_id).exists());
+    assert_eq!(fs::read_dir(&hidden).unwrap().count(), 1);
+    assert!(pending_deletions(&pc_state).is_empty());
+    let Reply::Status(status) = call(&pc, Request::Status).await else {
+        panic!()
+    };
+    assert!(status.stopped_sets.is_empty());
+    assert!(
+        pc.handle(Request::ListSnapshots { set: "docs".into() })
+            .await
+            .is_err()
+    );
+
+    // A stopped set can also be deleted for good straight away.
+    call(&pc, Request::SetKeepDeletedDays { days: 30 }).await;
+    call(&pc, create_set("photos", &src, target)).await;
+    wait_for_backup(&pc, None).await;
+    let photos = set_named(&pc, "photos").await.id;
+    call(
+        &pc,
+        Request::RemoveSet {
+            set: "photos".into(),
+        },
+    )
+    .await;
+    deleted(
+        call(
+            &pc,
+            Request::DeleteSet {
+                set: "photos".into(),
+            },
+        )
+        .await,
+    );
+    assert!(!pc_state.join("removed-sets").join(&photos).exists());
+    let Reply::Status(status) = call(&pc, Request::Status).await else {
+        panic!()
+    };
+    assert!(status.stopped_sets.is_empty());
+    assert_eq!(fs::read_dir(&hidden).unwrap().count(), 2);
+    pc.shutdown().await;
+    host.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn devices_can_be_removed_once_no_backup_uses_them() {
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("documents");

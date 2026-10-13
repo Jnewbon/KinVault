@@ -19,6 +19,9 @@ Self-hosted, encrypted backups between your own machines and your friends'.
 - **Deleting for good.** Deleting a backup erases its key at once; wherever
   it's stored erases the backups a week later. A host that's offline or gone
   doesn't stop the deletion; it's asked again for up to a month.
+  Stopping a backup instead keeps it restorable for 30 days (`kinvault
+  keep-deleted <days>` changes this, and how long hosts keep data their
+  friends delete), then deletes it the same way.
 
 ## Parts
 

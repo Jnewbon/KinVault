@@ -31,7 +31,7 @@ impl Daemon {
             !target.as_os_str().is_empty(),
             "choose a folder to restore into"
         );
-        let env = self.find_set(set).await?;
+        let env = self.find_readable_set(set).await?;
         let id = hex::encode(kinvault_core::crypto::random_bytes::<4>()?);
         let job = RestoreJob {
             id: id.clone(),

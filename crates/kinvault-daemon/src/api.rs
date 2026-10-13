@@ -17,15 +17,23 @@ pub enum Request {
         name: String,
     },
     CreateSet(CreateSet),
-    /// Stops a backup set. Its keys are kept locally; remote data is untouched.
+    /// Stops a backup set. It can still be restored from until the grace
+    /// period (`keep_deleted_days`) is over; then its backups are erased, as
+    /// for [`Request::DeleteSet`], and its key once they're gone.
     RemoveSet {
         set: String,
     },
-    /// Deletes a set and its backups for good: its key is erased here, and
-    /// the place it backs up to erases the backups a week later. Succeeds
-    /// even if that place can't be reached; it is asked again later.
+    /// Deletes a set (running or stopped) and its backups for good: its key
+    /// is erased here, and the place it backs up to erases the backups a
+    /// week later. Succeeds even if that place can't be reached; it is asked
+    /// again later.
     DeleteSet {
         set: String,
+    },
+    /// Sets how many days deleted data is kept before it's erased: data
+    /// peers delete here, and sets stopped with [`Request::RemoveSet`].
+    SetKeepDeletedDays {
+        days: u64,
     },
     /// Changes a set's upload limit and time window.
     SetLimits {
@@ -361,6 +369,12 @@ pub struct DaemonStatus {
     pub version: String,
     pub hosting_store: PathBuf,
     pub sets: Vec<SetStatus>,
+    /// Sets that no longer back up but can still be restored from.
+    #[serde(default)]
+    pub stopped_sets: Vec<StoppedSetStatus>,
+    /// Days deleted data is kept before it's erased.
+    #[serde(default)]
+    pub keep_deleted_days: u64,
     /// Restores running in the background.
     #[serde(default)]
     pub restores: Vec<RestoreJob>,
@@ -398,6 +412,18 @@ pub struct SetStatus {
     pub last_error: Option<String>,
     pub last_prune: Option<PruneSummary>,
     pub last_verify: Option<VerifySummary>,
+}
+
+/// A set that stopped backing up, kept for restoring until `erase_after_unix`.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct StoppedSetStatus {
+    pub id: String,
+    pub name: String,
+    pub paths: Vec<PathBuf>,
+    pub target: Target,
+    pub stopped_unix: i64,
+    /// When its backups are due to be erased (Unix seconds).
+    pub erase_after_unix: i64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]

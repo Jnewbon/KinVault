@@ -2,6 +2,9 @@
 //! backups are erased a week later, by the host they're stored on or, for a
 //! local folder, by this daemon. A host that can't be reached doesn't stop the
 //! deletion: it is asked again until it answers or a month has passed.
+//!
+//! Stopped sets go the same way once their grace period is over, except that
+//! their key is kept until the host has answered (or been given up on).
 
 use std::fs;
 use std::io;
@@ -13,7 +16,7 @@ use kinvault_net::{NetError, REPO_DELETE_DELAY, RemoteBackend};
 
 use super::{Daemon, unix_now};
 use crate::api::{DeletedSet, Reply};
-use crate::config::{PendingDeletion, StoredTarget};
+use crate::config::{PendingDeletion, SetConfig, StoredTarget};
 use crate::worker::peer_addr;
 
 /// How often hosts that couldn't be reached are asked again.
@@ -35,30 +38,33 @@ struct Progress {
 
 impl Daemon {
     pub(super) async fn delete_set(&self, key: &str) -> Result<Reply> {
-        let set = self.find_set(key).await?.set;
-        let now = unix_now();
-        let pending = PendingDeletion {
-            set_id: set.id.clone(),
-            set_name: set.name.clone(),
-            erase_after_unix: matches!(set.target, StoredTarget::Local { .. })
-                .then(|| now + REPO_DELETE_DELAY.as_secs() as i64),
-            target: set.target,
-            requested_unix: now,
+        let (set, stopped) = match self.find_set(key).await {
+            Ok(env) => (env.set, false),
+            Err(e) => match self.find_stopped_set(key).await {
+                Some(s) => (s.set, true),
+                None => return Err(e),
+            },
         };
+        let now = unix_now();
+        let pending = pending_deletion(set, now, now + REPO_DELETE_DELAY.as_secs() as i64);
+        let id = pending.set_id.clone();
         let mut config = self.inner.config.lock().await;
-        config.sets.retain(|s| s.id != set.id);
+        config.sets.retain(|s| s.id != id);
+        config.stopped_sets.retain(|s| s.set.id != id);
         config.pending_deletions.push(pending.clone());
         config.save(&self.config_path())?;
         drop(config);
-        if let Some(handle) = self.inner.sets.lock().await.remove(&set.id) {
+        if let Some(handle) = self.inner.sets.lock().await.remove(&id) {
             handle.stop();
         }
         // Without its key, nothing backed up can be read any more.
-        match fs::remove_dir_all(self.set_dir(&set.id)) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
-            _ => {}
-        }
-        tracing::info!(set = set.name, "deleted backup set");
+        let key_dir = if stopped {
+            self.removed_set_dir(&id)
+        } else {
+            self.set_dir(&id)
+        };
+        remove_dir(&key_dir)?;
+        tracing::info!(set = pending.set_name, "deleted backup set");
 
         let progress = self.erase(&pending, ASK_NOW_TIMEOUT).await;
         if progress.finished {
@@ -71,8 +77,10 @@ impl Daemon {
         }))
     }
 
-    /// Works through deleted sets whose backups still need erasing.
+    /// Works through deleted sets whose backups still need erasing, after
+    /// adding stopped sets whose grace period is over.
     pub(super) async fn process_deletions(&self) -> Result<()> {
+        self.expire_stopped_sets().await?;
         let pending = self.inner.config.lock().await.pending_deletions.clone();
         // At once, so a host that doesn't answer doesn't hold up the others.
         let mut tasks = tokio::task::JoinSet::new();
@@ -94,10 +102,37 @@ impl Daemon {
         Ok(())
     }
 
+    /// Queues stopped sets whose grace period is over for erasing. Their
+    /// keys stay until [`Self::forget_deletion`].
+    async fn expire_stopped_sets(&self) -> Result<()> {
+        let now = unix_now();
+        let mut config = self.inner.config.lock().await;
+        let grace = super::grace_period(config.keep_deleted_days).as_secs() as i64;
+        let (due, kept) = std::mem::take(&mut config.stopped_sets)
+            .into_iter()
+            .partition::<Vec<_>, _>(|s| s.stopped_unix + grace <= now);
+        config.stopped_sets = kept;
+        if due.is_empty() {
+            return Ok(());
+        }
+        for s in due {
+            tracing::info!(set = s.set.name, "erasing a stopped set's backups");
+            // The grace period is over, so a backup folder is erased now.
+            config
+                .pending_deletions
+                .push(pending_deletion(s.set, now, now));
+        }
+        config.save(&self.config_path())
+    }
+
+    /// The set's backups are erased (or given up on): forget it, and the key
+    /// a stopped set kept until now.
     async fn forget_deletion(&self, set_id: &str) -> Result<()> {
         let mut config = self.inner.config.lock().await;
         config.pending_deletions.retain(|p| p.set_id != set_id);
-        config.save(&self.config_path())
+        config.save(&self.config_path())?;
+        drop(config);
+        Ok(remove_dir(&self.removed_set_dir(set_id))?)
     }
 
     async fn erase(&self, p: &PendingDeletion, timeout: Duration) -> Progress {
@@ -187,6 +222,24 @@ impl Daemon {
                 }
             }
         }
+    }
+}
+
+fn pending_deletion(set: SetConfig, now: i64, erase_local_after: i64) -> PendingDeletion {
+    PendingDeletion {
+        set_id: set.id,
+        set_name: set.name,
+        erase_after_unix: matches!(set.target, StoredTarget::Local { .. })
+            .then_some(erase_local_after),
+        target: set.target,
+        requested_unix: now,
+    }
+}
+
+fn remove_dir(path: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
     }
 }
 
