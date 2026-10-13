@@ -4,14 +4,15 @@
 //! deletion: it is asked again until it answers or a month has passed.
 //!
 //! Stopped sets go the same way once their grace period is over, except that
-//! their key is kept until the host has answered (or been given up on).
+//! their key (still in the set's directory) is kept until the host has
+//! answered (or been given up on).
 
 use std::fs;
 use std::io;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use kinvault_net::{NetError, REPO_DELETE_DELAY, RemoteBackend};
 
 use super::{Daemon, unix_now};
@@ -38,13 +39,20 @@ struct Progress {
 
 impl Daemon {
     pub(super) async fn delete_set(&self, key: &str) -> Result<Reply> {
-        let (set, stopped) = match self.find_set(key).await {
-            Ok(env) => (env.set, false),
+        let set = match self.find_set(key).await {
+            Ok(env) => env.set,
             Err(e) => match self.find_stopped_set(key).await {
-                Some(s) => (s.set, true),
+                Some(s) => s.set,
                 None => return Err(e),
             },
         };
+        // A restore keeps the set's files open, and erasing its key would
+        // pull it out from under the restore.
+        ensure!(
+            !self.restoring(&set.id),
+            "{} is being restored from; wait for that to finish or cancel it first",
+            set.name
+        );
         let now = unix_now();
         let pending = pending_deletion(set, now, now + REPO_DELETE_DELAY.as_secs() as i64);
         let id = pending.set_id.clone();
@@ -54,16 +62,13 @@ impl Daemon {
         config.pending_deletions.push(pending.clone());
         config.save(&self.config_path())?;
         drop(config);
-        if let Some(handle) = self.inner.sets.lock().await.remove(&id) {
-            handle.stop();
+        let handle = self.inner.sets.lock().await.remove(&id);
+        if let Some(handle) = handle {
+            // Wait until its files are closed, or they can't be removed on Windows.
+            handle.stop().await;
         }
         // Without its key, nothing backed up can be read any more.
-        let key_dir = if stopped {
-            self.removed_set_dir(&id)
-        } else {
-            self.set_dir(&id)
-        };
-        remove_dir(&key_dir)?;
+        remove_dir(&self.set_dir(&id))?;
         tracing::info!(set = pending.set_name, "deleted backup set");
 
         let progress = self.erase(&pending, ASK_NOW_TIMEOUT).await;
@@ -125,14 +130,17 @@ impl Daemon {
         config.save(&self.config_path())
     }
 
-    /// The set's backups are erased (or given up on): forget it, and the key
-    /// a stopped set kept until now.
+    /// The set's backups are erased (or given up on): erase the key a
+    /// stopped set kept until now, and forget it. If the key can't be erased
+    /// yet (a restore has it open), it's tried again next time.
     async fn forget_deletion(&self, set_id: &str) -> Result<()> {
+        if let Err(e) = remove_dir(&self.set_dir(set_id)) {
+            tracing::warn!(set = set_id, "couldn't erase a stopped set's key yet: {e}");
+            return Ok(());
+        }
         let mut config = self.inner.config.lock().await;
         config.pending_deletions.retain(|p| p.set_id != set_id);
-        config.save(&self.config_path())?;
-        drop(config);
-        Ok(remove_dir(&self.removed_set_dir(set_id))?)
+        config.save(&self.config_path())
     }
 
     async fn erase(&self, p: &PendingDeletion, timeout: Duration) -> Progress {

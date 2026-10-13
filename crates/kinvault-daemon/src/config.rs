@@ -45,7 +45,8 @@ pub struct Config {
     pub stopped_sets: Vec<StoppedSet>,
 }
 
-/// A set that no longer backs up. Its key is in `removed-sets/<id>`.
+/// A set that no longer backs up. Its key stays in `sets/<id>` until its
+/// backups are erased.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct StoppedSet {
     pub set: SetConfig,

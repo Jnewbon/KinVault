@@ -1256,7 +1256,8 @@ async fn stopped_sets_can_be_restored_until_their_grace_period_ends() {
     fs::create_dir_all(&src).unwrap();
     fs::write(src.join("notes.md"), b"# notes").unwrap();
     let pc_state = tmp.path().join("pc");
-    let pc = start(&pc_state, SecretKey::generate()).await;
+    let pc_secret = SecretKey::generate();
+    let pc = start(&pc_state, pc_secret.clone()).await;
     let host = start(&tmp.path().join("host"), SecretKey::generate()).await;
     call(
         &host,
@@ -1291,7 +1292,7 @@ async fn stopped_sets_can_be_restored_until_their_grace_period_ends() {
         stopped.erase_after_unix - stopped.stopped_unix,
         30 * 24 * 60 * 60
     );
-    assert!(pc_state.join("removed-sets").join(&set_id).exists());
+    assert!(pc_state.join("sets").join(&set_id).exists());
 
     // Still restorable, by name or id.
     let Reply::Snapshots(snaps) = call(&pc, Request::ListSnapshots { set: "docs".into() }).await
@@ -1333,6 +1334,22 @@ async fn stopped_sets_can_be_restored_until_their_grace_period_ends() {
     let refused = refused.unwrap_err();
     assert!(refused.contains("docs"), "{refused}");
 
+    // A stopped set whose key an earlier version moved to removed-sets/ is
+    // moved back when the daemon starts.
+    pc.shutdown().await;
+    fs::create_dir_all(pc_state.join("removed-sets")).unwrap();
+    fs::rename(
+        pc_state.join("sets").join(&set_id),
+        pc_state.join("removed-sets").join(&set_id),
+    )
+    .unwrap();
+    let pc = start(&pc_state, pc_secret).await;
+    let Reply::Snapshots(snaps) = call(&pc, Request::ListSnapshots { set: "docs".into() }).await
+    else {
+        panic!()
+    };
+    assert_eq!(snaps.len(), 1);
+
     // With no grace period left, the host is asked to erase it, then the key goes.
     call(&pc, Request::SetKeepDeletedDays { days: 0 }).await;
     let hidden = tmp
@@ -1341,12 +1358,12 @@ async fn stopped_sets_can_be_restored_until_their_grace_period_ends() {
         .join(pc.id().to_string())
         .join(".deleted");
     for _ in 0..100 {
-        if !pc_state.join("removed-sets").join(&set_id).exists() {
+        if !pc_state.join("sets").join(&set_id).exists() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(!pc_state.join("removed-sets").join(&set_id).exists());
+    assert!(!pc_state.join("sets").join(&set_id).exists());
     assert_eq!(fs::read_dir(&hidden).unwrap().count(), 1);
     assert!(pending_deletions(&pc_state).is_empty());
     let Reply::Status(status) = call(&pc, Request::Status).await else {
@@ -1380,7 +1397,7 @@ async fn stopped_sets_can_be_restored_until_their_grace_period_ends() {
         )
         .await,
     );
-    assert!(!pc_state.join("removed-sets").join(&photos).exists());
+    assert!(!pc_state.join("sets").join(&photos).exists());
     let Reply::Status(status) = call(&pc, Request::Status).await else {
         panic!()
     };

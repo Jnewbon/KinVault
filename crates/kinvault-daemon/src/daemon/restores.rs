@@ -150,6 +150,12 @@ impl Daemon {
         restores.iter().map(|r| r.job.clone()).collect()
     }
 
+    /// Whether a background restore from this set is running.
+    pub(super) fn restoring(&self, set_id: &str) -> bool {
+        let restores = self.inner.restores.lock().unwrap();
+        restores.iter().any(|r| r.job.set == set_id)
+    }
+
     /// Asks every running restore to stop (e.g. when shutting down).
     pub(super) fn cancel_all_restores(&self) {
         for r in self.inner.restores.lock().unwrap().iter() {

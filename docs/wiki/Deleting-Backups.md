@@ -62,6 +62,10 @@ You're asked to type `DELETE PERMANENTLY` to confirm (skip this with
 3. If the host is offline, or gone, that doesn't stop the deletion: it's
    asked again every hour for up to a month.
 
+A backup can't be deleted while it's being restored from; wait for the
+restore to finish or cancel it first. If it's in the middle of backing up,
+deleting waits for that to finish.
+
 This can't be undone. Recovery kits made earlier still contain the key, so
 destroy those too if you need the backups to be truly unrecoverable.
 

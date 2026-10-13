@@ -34,6 +34,9 @@ pub(crate) const VERIFY_BUDGET_BYTES: u64 = 256 << 20;
 
 type Reply<T> = oneshot::Sender<Result<T, String>>;
 
+/// The set's open repository, shared so stopping can wait until it's closed.
+type RepoSlot = Arc<Mutex<Option<Repository<Box<dyn Backend>>>>>;
+
 pub(crate) enum Trigger {
     Changed,
     Now(Reply<BackupSummary>),
@@ -157,6 +160,7 @@ pub(crate) struct SetHandle {
     pub status: Arc<Mutex<RunStatus>>,
     pub tx: mpsc::Sender<Trigger>,
     task: JoinHandle<()>,
+    repo: RepoSlot,
     _watcher: Option<RecommendedWatcher>,
 }
 
@@ -187,18 +191,36 @@ impl SetHandle {
         } else {
             start_watcher(&env, tx.clone())
         };
-        let task = tokio::spawn(run(env.clone(), status.clone(), rx));
+        let repo = RepoSlot::default();
+        let task = tokio::spawn(run(env.clone(), status.clone(), repo.clone(), rx));
         Self {
             env,
             status,
             tx,
             task,
+            repo,
             _watcher: watcher,
         }
     }
 
-    pub fn stop(self) {
+    /// Stops the set's task without waiting. An operation already under way
+    /// finishes in the background.
+    pub fn abort(self) {
         self.task.abort();
+    }
+
+    /// Stops the set's task and closes its repository, waiting for an
+    /// operation already under way to finish (aborting doesn't stop it).
+    /// Afterwards nothing holds files in the set's directory open, so it can
+    /// be deleted (Windows refuses while a file in it is open).
+    pub async fn stop(self) {
+        self.task.abort();
+        let _ = self.task.await;
+        let repo = self.repo;
+        let _ = tokio::task::spawn_blocking(move || {
+            repo.lock().unwrap_or_else(|e| e.into_inner()).take();
+        })
+        .await;
     }
 }
 
@@ -287,7 +309,7 @@ fn retry_delay(failures: u32) -> Duration {
 struct Worker {
     env: SetEnv,
     status: Arc<Mutex<RunStatus>>,
-    repo: Option<Repository<Box<dyn Backend>>>,
+    repo: RepoSlot,
 }
 
 impl Worker {
@@ -296,22 +318,18 @@ impl Worker {
         &mut self,
         f: impl FnOnce(&mut Repository<Box<dyn Backend>>) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        let existing = self.repo.take();
+        let slot = self.repo.clone();
         let env = self.env.clone();
-        let (repo, result) = tokio::task::spawn_blocking(move || {
-            let mut repo = match existing {
+        tokio::task::spawn_blocking(move || {
+            // Held for the whole operation; see `SetHandle::stop`.
+            let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+            let repo = match &mut *slot {
                 Some(r) => r,
-                None => match env.open_repository() {
-                    Ok(r) => r,
-                    Err(e) => return (None, Err(e)),
-                },
+                empty => empty.insert(env.open_repository()?),
             };
-            let result = f(&mut repo);
-            (Some(repo), result)
+            f(repo)
         })
-        .await?;
-        self.repo = repo;
-        result
+        .await?
     }
 
     async fn backup(&mut self) -> Result<BackupSummary> {
@@ -440,14 +458,19 @@ impl Worker {
     }
 }
 
-async fn run(env: SetEnv, status: Arc<Mutex<RunStatus>>, mut rx: mpsc::Receiver<Trigger>) {
+async fn run(
+    env: SetEnv,
+    status: Arc<Mutex<RunStatus>>,
+    repo: RepoSlot,
+    mut rx: mpsc::Receiver<Trigger>,
+) {
     let debounce = Duration::from_secs(env.set.debounce_secs);
     let rescan = Duration::from_secs(env.set.rescan_secs);
     let paused = env.set.paused;
     let mut worker = Worker {
         env,
         status: status.clone(),
-        repo: None,
+        repo,
     };
     let mut waiters: Vec<Reply<BackupSummary>> = Vec::new();
     let mut failures = 0u32;

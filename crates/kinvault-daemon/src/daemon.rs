@@ -187,6 +187,19 @@ impl Daemon {
         });
         daemon.inner.background.lock().unwrap().push(deletions);
 
+        // Stopped sets used to keep their key in removed-sets/<id>.
+        for stopped in &config.stopped_sets {
+            let old = daemon
+                .inner
+                .state_dir
+                .join("removed-sets")
+                .join(&stopped.set.id);
+            let dir = daemon.set_dir(&stopped.set.id);
+            if old.is_dir() && !dir.exists() {
+                fs::rename(&old, &dir).with_context(|| format!("moving {} back", old.display()))?;
+            }
+        }
+
         let mut sets = daemon.inner.sets.lock().await;
         for set in config.sets {
             sets.insert(set.id.clone(), SetHandle::start(daemon.set_env(set)));
@@ -210,7 +223,7 @@ impl Daemon {
             task.abort();
         }
         for (_, set) in self.inner.sets.lock().await.drain() {
-            set.stop();
+            set.abort();
         }
         if let Err(e) = self.inner.router.shutdown().await {
             tracing::warn!("error shutting down network: {e}");
@@ -267,9 +280,7 @@ impl Daemon {
             .find_stopped_set(key)
             .await
             .ok_or_else(|| anyhow!("no backup set named {key:?}"))?;
-        let mut env = self.set_env(set.set);
-        env.set_dir = self.removed_set_dir(&env.set.id);
-        Ok(env)
+        Ok(self.set_env(set.set))
     }
 
     async fn find_stopped_set(&self, key: &str) -> Option<StoppedSet> {
@@ -280,10 +291,6 @@ impl Daemon {
             .find(|s| s.set.id == key)
             .or_else(|| stopped.iter().find(|s| s.set.name == key))
             .cloned()
-    }
-
-    fn removed_set_dir(&self, id: &str) -> PathBuf {
-        self.inner.state_dir.join("removed-sets").join(id)
     }
 
     pub async fn handle(&self, req: Request) -> Result<Reply, String> {
@@ -716,7 +723,7 @@ impl Daemon {
         config.save(&self.config_path())?;
         let mut sets = self.inner.sets.lock().await;
         if let Some(old) = sets.remove(&id) {
-            old.stop();
+            old.abort();
         }
         sets.insert(id, SetHandle::start(self.set_env(updated)));
         Ok(Reply::Done)
@@ -910,13 +917,12 @@ impl Daemon {
             stopped_unix: unix_now(),
         });
         config.save(&self.config_path())?;
-        if let Some(handle) = self.inner.sets.lock().await.remove(&id) {
-            handle.stop();
+        // Its key stays in the set's directory until the backups are erased,
+        // so they can still be restored.
+        let handle = self.inner.sets.lock().await.remove(&id);
+        if let Some(handle) = handle {
+            handle.abort();
         }
-        // Keep the key until the backups are erased, so they can be restored.
-        let removed = self.removed_set_dir(&id);
-        fs::create_dir_all(removed.parent().expect("removed-sets/<id>"))?;
-        fs::rename(self.set_dir(&id), removed)?;
         Ok(Reply::Done)
     }
 
