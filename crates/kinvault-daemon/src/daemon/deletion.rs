@@ -67,6 +67,7 @@ impl Daemon {
             // Wait until its files are closed, or they can't be removed on Windows.
             handle.stop().await;
         }
+        self.wait_closed(&id).await;
         // Without its key, nothing backed up can be read any more.
         remove_dir(&self.set_dir(&id))?;
         tracing::info!(set = pending.set_name, "deleted backup set");
@@ -134,6 +135,7 @@ impl Daemon {
     /// stopped set kept until now, and forget it. If the key can't be erased
     /// yet (a restore has it open), it's tried again next time.
     async fn forget_deletion(&self, set_id: &str) -> Result<()> {
+        self.wait_closed(set_id).await;
         if let Err(e) = remove_dir(&self.set_dir(set_id)) {
             tracing::warn!(set = set_id, "couldn't erase a stopped set's key yet: {e}");
             return Ok(());

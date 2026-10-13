@@ -72,6 +72,8 @@ struct Inner {
     /// Wake the trash purge and the deletion loop early (the grace period changed).
     wake_purge: Arc<tokio::sync::Notify>,
     wake_deletions: Arc<tokio::sync::Notify>,
+    /// Stopped sets whose worker is still closing its files, by set id.
+    closing: std::sync::Mutex<HashMap<String, JoinHandle<()>>>,
 }
 
 fn unix_now() -> i64 {
@@ -127,6 +129,7 @@ impl Daemon {
                 restores: Default::default(),
                 wake_purge: Default::default(),
                 wake_deletions: Default::default(),
+                closing: Default::default(),
             }),
         };
 
@@ -921,9 +924,21 @@ impl Daemon {
         // so they can still be restored.
         let handle = self.inner.sets.lock().await.remove(&id);
         if let Some(handle) = handle {
-            handle.abort();
+            // Closes its files in the background; see `wait_closed`.
+            let closing = tokio::spawn(handle.stop());
+            self.inner.closing.lock().unwrap().insert(id, closing);
         }
         Ok(Reply::Done)
+    }
+
+    /// Waits until a stopped set's worker has closed the files in its
+    /// directory, so the directory can be removed (Windows refuses while
+    /// they're open).
+    async fn wait_closed(&self, id: &str) {
+        let closing = self.inner.closing.lock().unwrap().remove(id);
+        if let Some(closing) = closing {
+            let _ = closing.await;
+        }
     }
 
     async fn create_invite(&self, mut req: api::CreateInvite) -> Result<Reply> {
