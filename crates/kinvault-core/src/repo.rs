@@ -402,9 +402,6 @@ impl<B: Backend> Repository<B> {
                 // The include path points inside a file; nothing to restore here.
                 _ if child_include.is_some() => continue,
                 NodeKind::File { chunks, .. } => {
-                    if let Some(parent) = path.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
                     let mut file = fs::File::create(&path)?;
                     for chunk in chunks {
                         let data = self.read_blob(chunk, &mut ctx.cache)?;
@@ -425,9 +422,6 @@ impl<B: Backend> Repository<B> {
                     }
                 }
                 NodeKind::Symlink { target } => {
-                    if let Some(parent) = path.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
                     if path.symlink_metadata().is_ok() {
                         fs::remove_file(&path)?;
                     }
@@ -670,15 +664,28 @@ impl<B: Backend> BackupRun<'_, B> {
             }));
         }
 
-        let mut file = match fs::File::open(path) {
-            Ok(f) => f,
+        match fs::File::open(path) {
+            Ok(file) => self.store_contents(path, file, size, mtime, inode),
             Err(e) => {
                 self.warn(path, e);
-                return Ok(None);
+                Ok(None)
             }
-        };
+        }
+    }
+
+    /// Chunks and stores what `reader` holds for the file at `path`, whose
+    /// metadata before reading was `size`, `mtime` and `inode`. A read error
+    /// skips the file with a warning.
+    fn store_contents(
+        &mut self,
+        path: &Path,
+        mut reader: impl Read,
+        size: u64,
+        mtime: i64,
+        inode: u64,
+    ) -> Result<Option<NodeKind>> {
         let mut head = Vec::new();
-        if let Err(e) = (&mut file)
+        if let Err(e) = (&mut reader)
             .take(CHUNK_MIN as u64 + 1)
             .read_to_end(&mut head)
         {
@@ -696,7 +703,7 @@ impl<B: Backend> BackupRun<'_, B> {
                 chunks.push(self.store_blob(BlobKind::Data, &head)?);
             }
         } else {
-            let rest = io::Cursor::new(head).chain(file);
+            let rest = io::Cursor::new(head).chain(reader);
             for chunk in StreamCDC::new(rest, CHUNK_MIN, CHUNK_AVG, CHUNK_MAX) {
                 let chunk = match chunk {
                     Ok(c) => c,
@@ -717,7 +724,7 @@ impl<B: Backend> BackupRun<'_, B> {
         // Cache keyed on the metadata seen *before* reading, so a file modified
         // mid-read gets a new mtime and is re-read next time.
         self.repo.index.put_cached_file(
-            &key,
+            &path.to_string_lossy(),
             &CachedFile {
                 size,
                 mtime_ns: mtime,
@@ -758,13 +765,13 @@ fn validate_name(name: &str) -> Result<()> {
 }
 
 fn mtime_ns(meta: &fs::Metadata) -> i64 {
-    match meta.modified() {
-        Ok(t) => match t.duration_since(UNIX_EPOCH) {
+    // Every supported platform records modification times.
+    meta.modified()
+        .map_or(0, |t| match t.duration_since(UNIX_EPOCH) {
             Ok(d) => d.as_nanos() as i64,
+            // Before 1970.
             Err(e) => -(e.duration().as_nanos() as i64),
-        },
-        Err(_) => 0,
-    }
+        })
 }
 
 fn from_mtime_ns(ns: i64) -> SystemTime {
@@ -843,5 +850,61 @@ mod tests {
             assert!(validate_name(bad).is_err(), "{bad:?} should be rejected");
         }
         validate_name("home/me/file.txt").unwrap();
+    }
+
+    /// Yields zeros, then fails once `left` bytes have been read.
+    struct FailsAfter {
+        left: usize,
+    }
+
+    impl Read for FailsAfter {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.left == 0 {
+                return Err(io::Error::other("disk went away"));
+            }
+            let n = buf.len().min(self.left);
+            buf[..n].fill(0);
+            self.left -= n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn read_errors_skip_the_file_with_a_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut repo = Repository::open(
+            crate::backend::LocalDirBackend::create(tmp.path()).unwrap(),
+            &MasterKey::generate().unwrap(),
+            Index::open_in_memory().unwrap(),
+        );
+        let mut run = BackupRun {
+            repo: &mut repo,
+            writer: PackWriter::default(),
+            stats: BackupStats::default(),
+        };
+        // Fails within the first chunk, then after it.
+        for left in [10, CHUNK_MIN as usize + 100_000] {
+            let stored = run
+                .store_contents(Path::new("/f"), FailsAfter { left }, 0, 0, 0)
+                .unwrap();
+            assert!(stored.is_none());
+        }
+        assert_eq!(run.stats.warnings.len(), 2);
+        assert!(run.stats.warnings[0].contains("disk went away"));
+        assert_eq!(run.stats.files, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_mode_leaves_permissions_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("f");
+        fs::write(&f, b"").unwrap();
+        set_mode(&f, 0o640).unwrap();
+        // Backups made on Windows record no mode.
+        set_mode(&f, 0).unwrap();
+        let mode = fs::metadata(&f).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o640);
     }
 }

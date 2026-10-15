@@ -2,7 +2,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use kinvault_core::{Index, LocalDirBackend, MasterKey, Repository, RetentionPolicy};
+use kinvault_core::{
+    Backend, Index, LocalDirBackend, MasterKey, PackId, Repository, RetentionPolicy, SnapshotId,
+};
 
 fn random(len: usize, seed: &str) -> Vec<u8> {
     let mut buf = vec![0u8; len];
@@ -201,4 +203,131 @@ fn verify_budget_rotates_through_packs() {
         checked += r.packs_checked;
     }
     assert_eq!(checked, total);
+}
+
+#[test]
+fn prune_and_verify_walk_shared_folders_and_symlinks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, _, _, mut repo) = setup(tmp.path(), 256 << 10);
+    // Identical folders share one listing.
+    for dir in ["one", "two"] {
+        fs::create_dir_all(src.join(dir)).unwrap();
+        let f = fs::File::create(src.join(dir).join("f")).unwrap();
+        f.set_modified(SystemTime::UNIX_EPOCH).unwrap();
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("one/f", src.join("link")).unwrap();
+    repo.backup(std::slice::from_ref(&src), "h").unwrap();
+    write(&src.join("new"), b"new");
+    repo.backup(std::slice::from_ref(&src), "h").unwrap();
+
+    let report = repo.verify(u64::MAX).unwrap();
+    assert!(report.is_ok(), "{report:?}");
+    let stats = repo
+        .prune(&RetentionPolicy {
+            last: Some(1),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!((stats.snapshots_kept, stats.snapshots_removed), (1, 1));
+    assert!(repo.verify(u64::MAX).unwrap().is_ok());
+}
+
+#[test]
+fn verify_reports_unreadable_snapshots_and_listings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, store, master, mut repo) = setup(tmp.path(), 256 << 10);
+    write(&src.join("a"), b"a");
+    let (first, _) = repo.backup(std::slice::from_ref(&src), "h").unwrap();
+    write(&src.join("b"), b"b");
+    repo.backup(std::slice::from_ref(&src), "h").unwrap();
+
+    // One snapshot record damaged, and the folder listings lost.
+    fs::write(store.join("snapshots").join(first.to_hex()), b"junk").unwrap();
+    let keys = master.derive_keys();
+    for path in pack_files(&store) {
+        let entries = kinvault_core::pack::read_header(&keys, &fs::read(&path).unwrap()).unwrap();
+        if entries[0].kind == kinvault_core::pack::BlobKind::Tree {
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    let report = repo.verify(u64::MAX).unwrap();
+    assert_eq!(report.snapshots, 1);
+    assert_eq!(report.errors.len(), 2, "{report:?}");
+    let has = |start: &str| report.errors.iter().any(|e| e.starts_with(start));
+    assert!(has(&format!("snapshot {first}")), "{report:?}");
+    assert!(has("directory listing"), "{report:?}");
+}
+
+/// Fails every download once `broken` is set, like a lost connection.
+struct Flaky {
+    inner: LocalDirBackend,
+    broken: std::sync::atomic::AtomicBool,
+}
+
+impl Flaky {
+    fn check(&self) -> kinvault_core::Result<()> {
+        if self.broken.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::other("connection lost").into());
+        }
+        Ok(())
+    }
+}
+
+impl Backend for Flaky {
+    fn put_pack(&self, id: &PackId, data: &[u8]) -> kinvault_core::Result<()> {
+        self.inner.put_pack(id, data)
+    }
+    fn get_pack(&self, id: &PackId) -> kinvault_core::Result<Vec<u8>> {
+        self.check()?;
+        self.inner.get_pack(id)
+    }
+    fn list_packs(&self) -> kinvault_core::Result<Vec<PackId>> {
+        self.inner.list_packs()
+    }
+    fn delete_pack(&self, id: &PackId) -> kinvault_core::Result<()> {
+        self.inner.delete_pack(id)
+    }
+    fn put_snapshot(&self, id: &SnapshotId, data: &[u8]) -> kinvault_core::Result<()> {
+        self.inner.put_snapshot(id, data)
+    }
+    fn get_snapshot(&self, id: &SnapshotId) -> kinvault_core::Result<Vec<u8>> {
+        self.inner.get_snapshot(id)
+    }
+    fn list_snapshots(&self) -> kinvault_core::Result<Vec<SnapshotId>> {
+        self.inner.list_snapshots()
+    }
+    fn delete_snapshot(&self, id: &SnapshotId) -> kinvault_core::Result<()> {
+        self.inner.delete_snapshot(id)
+    }
+}
+
+#[test]
+fn verify_stops_when_storage_is_unreachable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    write(&src.join("a"), b"a");
+    let mut repo = Repository::open(
+        Flaky {
+            inner: LocalDirBackend::create(tmp.path().join("store")).unwrap(),
+            broken: false.into(),
+        },
+        &MasterKey::generate().unwrap(),
+        Index::open_in_memory().unwrap(),
+    );
+    repo.backup(std::slice::from_ref(&src), "h").unwrap();
+    repo.backend()
+        .broken
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    // Not a sign of damage: nothing is marked damaged or removed.
+    assert!(matches!(
+        repo.verify(u64::MAX),
+        Err(kinvault_core::Error::Io(_))
+    ));
+    repo.backend()
+        .broken
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    assert!(repo.verify(u64::MAX).unwrap().is_ok());
 }

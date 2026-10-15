@@ -158,11 +158,13 @@ mod tests {
             assert!(TimeWindow::parse(bad).is_err(), "{bad}");
         }
         assert_eq!(String::from(night), "22:00-06:00");
+        assert_eq!(TimeWindow::try_from("22:00-06:00".to_string()), Ok(night));
     }
 
     #[tokio::test(start_paused = true)]
     async fn rate_limiter_paces() {
         let limiter = RateLimiter::new(100_000);
+        assert_eq!(limiter.bytes_per_sec(), 100_000);
         let start = Instant::now();
         for _ in 0..10 {
             limiter.consume(50_000).await;

@@ -88,7 +88,8 @@ pub fn seal(key: &[u8; KEY_LEN], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>
                 aad,
             },
         )
-        .map_err(|_| Error::Invalid("plaintext too large to encrypt".into()))?;
+        // Only fails beyond 256 GiB, far more than any blob held in memory.
+        .expect("plaintext fits the cipher's limit");
     let mut out = Vec::with_capacity(NONCE_LEN + ct.len());
     out.extend_from_slice(&nonce);
     out.extend_from_slice(&ct);
@@ -204,6 +205,72 @@ mod tests {
         let unlocked = kf.unlock("correct horse").unwrap();
         assert_eq!(unlocked.0, master.0);
         assert!(matches!(kf.unlock("wrong"), Err(Error::WrongPassphrase)));
+    }
+
+    #[test]
+    fn keyfile_with_default_cost() {
+        let master = MasterKey::generate().unwrap();
+        let kf = KeyFile::create(&master, "pass").unwrap();
+        assert_eq!((kf.m_cost_kib, kf.t_cost, kf.p_cost), (64 * 1024, 3, 1));
+        assert_eq!(kf.unlock("pass").unwrap().to_bytes(), master.to_bytes());
+    }
+
+    #[test]
+    fn damaged_keyfiles_are_rejected() {
+        let master = MasterKey::generate().unwrap();
+        let good = KeyFile::create_with_params(&master, "pass", 64, 1, 1).unwrap();
+
+        let future = KeyFile {
+            version: 2,
+            ..good.clone()
+        };
+        assert!(matches!(future.unlock("pass"), Err(Error::Invalid(_))));
+        let bad_salt = KeyFile {
+            salt: "zz".into(),
+            ..good.clone()
+        };
+        assert!(matches!(bad_salt.unlock("pass"), Err(Error::Corrupt(_))));
+        let bad_key = KeyFile {
+            wrapped: "zz".into(),
+            ..good.clone()
+        };
+        assert!(matches!(bad_key.unlock("pass"), Err(Error::Corrupt(_))));
+        // Argon2 refuses salts shorter than 8 bytes.
+        let short_salt = KeyFile {
+            salt: "00".into(),
+            ..good.clone()
+        };
+        assert!(matches!(short_salt.unlock("pass"), Err(Error::Invalid(_))));
+        let bad_cost = KeyFile {
+            m_cost_kib: 0,
+            ..good.clone()
+        };
+        assert!(matches!(bad_cost.unlock("pass"), Err(Error::Invalid(_))));
+        let short = KeyFile {
+            wrapped: "00".into(),
+            ..good.clone()
+        };
+        assert!(matches!(short.unlock("pass"), Err(Error::WrongPassphrase)));
+
+        // Correctly sealed, but not a whole key.
+        let salt = hex::decode(&good.salt).unwrap();
+        let kek = derive_kek("pass", &salt, 64, 1, 1).unwrap();
+        let wrapped = seal(&kek, KEYFILE_AAD, &[1; 16]).unwrap();
+        let truncated = KeyFile {
+            wrapped: hex::encode(wrapped),
+            ..good
+        };
+        assert!(matches!(truncated.unlock("pass"), Err(Error::Corrupt(_))));
+    }
+
+    #[test]
+    fn master_key_bytes_roundtrip() {
+        let master = MasterKey::generate().unwrap();
+        let again = MasterKey::from_bytes(master.to_bytes());
+        assert_eq!(
+            again.derive_keys().chunk_id(b"x"),
+            master.derive_keys().chunk_id(b"x")
+        );
     }
 
     #[test]

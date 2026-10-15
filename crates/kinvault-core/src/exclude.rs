@@ -11,7 +11,6 @@
 //! Examples: `*.bat`, `/media/*.bat`, `/media/.../*.bat`, `/media/*`,
 //! `/media/...`, `target/...`, `node_modules/`.
 
-use std::fmt;
 use std::path::{Component, Path};
 
 use crate::error::{Error, Result};
@@ -44,10 +43,6 @@ impl Excludes {
             .map(|p| parse_pattern(p.as_ref()))
             .collect::<Result<_>>()?;
         Ok(Self { patterns })
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.patterns.is_empty()
     }
 
     /// Whether a file (or symlink) at this absolute path is left out.
@@ -183,33 +178,41 @@ fn match_glob(glob: &str, name: &str) -> bool {
 
 /// Splits an absolute path into its drive (Windows) and element names.
 fn split_path(path: &Path) -> (Option<String>, Vec<String>) {
-    let mut drive = None;
-    let mut names = Vec::new();
-    for c in path.components() {
-        match c {
-            Component::Prefix(p) => {
-                drive = Some(p.as_os_str().to_string_lossy().to_ascii_lowercase())
-            }
-            Component::Normal(n) => names.push(fold_case(&n.to_string_lossy())),
-            _ => {}
-        }
-    }
-    (drive, names)
+    let names = path
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(n) => Some(fold_case(&n.to_string_lossy())),
+            _ => None,
+        })
+        .collect();
+    (drive(path), names)
 }
 
-/// Windows paths ignore case; elsewhere case matters.
+/// The lowercased drive (`c:`) a Windows path starts with.
+#[cfg(windows)]
+fn drive(path: &Path) -> Option<String> {
+    match path.components().next() {
+        Some(Component::Prefix(p)) => Some(p.as_os_str().to_string_lossy().to_ascii_lowercase()),
+        _ => None,
+    }
+}
+
+/// Other systems have no drives.
+#[cfg(not(windows))]
+fn drive(_path: &Path) -> Option<String> {
+    None
+}
+
+/// Windows paths ignore case.
+#[cfg(windows)]
 fn fold_case(s: &str) -> String {
-    if cfg!(windows) {
-        s.to_lowercase()
-    } else {
-        s.to_string()
-    }
+    s.to_lowercase()
 }
 
-impl fmt::Display for Excludes {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} exclude pattern(s)", self.patterns.len())
-    }
+/// Elsewhere case matters.
+#[cfg(not(windows))]
+fn fold_case(s: &str) -> String {
+    s.to_string()
 }
 
 #[cfg(all(test, unix))]
@@ -321,5 +324,23 @@ mod tests {
             assert!(Excludes::parse(&[bad]).is_err(), "{bad:?}");
         }
         assert!(Excludes::parse(&["*"]).is_ok());
+    }
+
+    #[test]
+    fn current_folder_elements_are_ignored() {
+        let e = ex(&["/media/./photos/"]);
+        assert!(dir(&e, "/media/photos"));
+    }
+
+    #[test]
+    fn drive_letters_limit_a_pattern_to_that_drive() {
+        let e = ex(&["D:\\Games\\..."]);
+        let p = &e.patterns[0];
+        assert_eq!(p.drive.as_deref(), Some("d:"));
+        let names = vec!["Games".to_string()];
+        assert!(p.matches(Some("d:"), &names));
+        assert!(!p.matches(Some("c:"), &names));
+        // Paths without a drive (not Windows) aren't limited.
+        assert!(p.matches(None, &names));
     }
 }

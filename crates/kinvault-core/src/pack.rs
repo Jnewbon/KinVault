@@ -232,4 +232,53 @@ mod tests {
             Err(Error::Decrypt)
         ));
     }
+
+    #[test]
+    fn damaged_blobs_are_rejected() {
+        let keys = MasterKey::generate().unwrap().derive_keys();
+        let id = keys.chunk_id(b"y");
+        let unknown_frame = keys.seal_data(&id.0, &[9, b'y']).unwrap();
+        assert!(matches!(
+            decode_blob(&keys, &id, &unknown_frame),
+            Err(Error::Corrupt(_))
+        ));
+        let wrong_content = keys.seal_data(&id.0, &[FRAME_RAW, b'x']).unwrap();
+        assert!(matches!(
+            decode_blob(&keys, &id, &wrong_content),
+            Err(Error::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn damaged_packs_are_rejected() {
+        let keys = MasterKey::generate().unwrap().derive_keys();
+        assert!(matches!(header_tail_len(b"short"), Err(Error::Corrupt(_))));
+
+        let mut b = PackBuilder::new();
+        b.add(&keys, keys.chunk_id(b"a"), BlobKind::Data, b"a")
+            .unwrap();
+        let pack = b.finish(&keys).unwrap();
+        // The header claims more bytes than the pack has.
+        assert!(matches!(
+            read_header_tail(&keys, 5, &pack.data),
+            Err(Error::Corrupt(_))
+        ));
+
+        // A header whose entry points past the blobs.
+        let outside = BlobEntry {
+            id: keys.chunk_id(b"a"),
+            kind: BlobKind::Data,
+            offset: 1000,
+            len: 10,
+        };
+        let header = postcard::to_allocvec(&vec![outside]).unwrap();
+        let mut data = keys.seal_meta(HEADER_AAD, &header).unwrap();
+        data.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        data.extend_from_slice(MAGIC);
+        assert!(matches!(read_header(&keys, &data), Err(Error::Corrupt(_))));
+        assert!(matches!(
+            blob_bytes(&pack.data, &outside),
+            Err(Error::Corrupt(_))
+        ));
+    }
 }

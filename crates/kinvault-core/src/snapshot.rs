@@ -54,3 +54,29 @@ pub fn decode_snapshot(keys: &Keys, id: &SnapshotId, data: &[u8]) -> Result<Snap
     }
     Ok(postcard::from_bytes(&keys.open_meta(SNAPSHOT_AAD, data)?)?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::MasterKey;
+
+    #[test]
+    fn snapshot_must_match_its_id() {
+        let keys = MasterKey::generate().unwrap().derive_keys();
+        let snapshot = Snapshot {
+            time_ns: 1,
+            hostname: "host".into(),
+            paths: vec!["/home".into()],
+            root: ChunkId([1; 32]),
+            file_count: 2,
+            total_bytes: 3,
+        };
+        let (id, data) = encode_snapshot(&keys, &snapshot).unwrap();
+        assert_eq!(decode_snapshot(&keys, &id, &data).unwrap().hostname, "host");
+        let other = SnapshotId([0; 32]);
+        assert!(matches!(
+            decode_snapshot(&keys, &other, &data),
+            Err(Error::Corrupt(_))
+        ));
+    }
+}

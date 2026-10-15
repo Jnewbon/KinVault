@@ -267,13 +267,71 @@ impl Index {
         let mut stmt = self.conn.prepare_cached(
             "INSERT OR REPLACE INTO files (path, size, mtime_ns, inode, chunks) VALUES (?1, ?2, ?3, ?4, ?5)",
         )?;
+        let chunks = postcard::to_allocvec(&file.chunks)?;
         stmt.execute(params![
             path,
             file.size as i64,
             file.mtime_ns,
             file.inode as i64,
-            postcard::to_allocvec(&file.chunks)?
+            chunks
         ])?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(id: u8, offset: u64) -> BlobEntry {
+        BlobEntry {
+            id: ChunkId([id; 32]),
+            kind: BlobKind::Data,
+            offset,
+            len: 10,
+        }
+    }
+
+    #[test]
+    fn batches_nest_safely() {
+        let mut index = Index::open_in_memory().unwrap();
+        // Outside a batch, committing does nothing.
+        index.commit_batch().unwrap();
+        index.end_batch().unwrap();
+        index.begin_batch().unwrap();
+        // Already batching: no second transaction.
+        index.begin_batch().unwrap();
+        index.add_pack(&PackId([1; 32]), &[entry(1, 0)]).unwrap();
+        index.commit_batch().unwrap();
+        index.end_batch().unwrap();
+        assert!(index.has_chunk(&ChunkId([1; 32])).unwrap());
+    }
+
+    #[test]
+    fn unknown_entries_are_none() {
+        let index = Index::open_in_memory().unwrap();
+        assert!(index.locate(&ChunkId([9; 32])).unwrap().is_none());
+        assert!(index.cached_file("/nowhere").unwrap().is_none());
+    }
+
+    #[test]
+    fn damaged_rows_are_errors() {
+        let index = Index::open_in_memory().unwrap();
+        index
+            .conn
+            .execute(
+                "INSERT INTO chunks (id, pack, kind, offset, len) VALUES (?1, x'00', 0, 0, -1)",
+                [&[2u8; 32][..]],
+            )
+            .unwrap();
+        assert!(index.locate(&ChunkId([2; 32])).is_err());
+        index
+            .conn
+            .execute(
+                "INSERT INTO files (path, size, mtime_ns, inode, chunks) VALUES ('/f', 'big', 0, 0, x'')",
+                [],
+            )
+            .unwrap();
+        assert!(index.cached_file("/f").is_err());
     }
 }

@@ -57,3 +57,22 @@ id_type!(
     /// BLAKE3 hash of an encrypted snapshot record.
     SnapshotId
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_and_bytes_are_checked() {
+        let id = PackId([0xab; 32]);
+        assert_eq!(PackId::from_hex(&id.to_hex()).unwrap(), id);
+        assert!(matches!(PackId::from_hex("abc"), Err(Error::Invalid(_))));
+        assert_eq!(PackId::from_slice(&[0xab; 32]).unwrap(), id);
+        assert!(matches!(
+            PackId::from_slice(&[0; 31]),
+            Err(Error::Corrupt(_))
+        ));
+        assert_eq!(format!("{id}"), "ab".repeat(32));
+        assert_eq!(format!("{id:?}"), "PackId(abababababab)");
+    }
+}

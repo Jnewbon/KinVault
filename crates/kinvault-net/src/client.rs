@@ -324,3 +324,127 @@ impl Backend for RemoteBackend {
         self.block(self.expect_ok(Op::DeleteSnapshot { id: *id }, None))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::receiver::{Grant, Receiver};
+    use crate::testutil::{FakeHost, Misbehave, addr_of, local_endpoint};
+
+    async fn remote(router: &iroh::protocol::Router) -> RemoteBackend {
+        RemoteBackend::new(
+            local_endpoint().await,
+            addr_of(router),
+            "repo",
+            Handle::current(),
+        )
+        .unwrap()
+    }
+
+    fn ticket(router: &iroh::protocol::Router) -> InviteTicket {
+        InviteTicket {
+            host: addr_of(router),
+            hosts: Vec::new(),
+            host_name: "host".into(),
+            token: [0; 16],
+            quota_bytes: None,
+            ask_reciprocal: false,
+            expires_unix: i64::MAX,
+        }
+    }
+
+    /// Runs the blocking `Backend` calls off the async runtime.
+    async fn blocking<T: Send + 'static>(
+        remote: &Arc<RemoteBackend>,
+        f: impl FnOnce(&RemoteBackend) -> T + Send + 'static,
+    ) -> T {
+        let remote = remote.clone();
+        tokio::task::spawn_blocking(move || f(&remote))
+            .await
+            .unwrap()
+    }
+
+    fn is_protocol_error<T>(r: kinvault_core::Result<T>) -> bool {
+        matches!(r, Err(kinvault_core::Error::Backend(m)) if m.starts_with("protocol error"))
+    }
+
+    #[tokio::test]
+    async fn repository_names_are_checked() {
+        let ep = local_endpoint().await;
+        let addr = EndpointAddr::new(ep.id());
+        let err = RemoteBackend::new(ep, addr, "../x", Handle::current()).err();
+        assert!(matches!(err, Some(NetError::Protocol(_))));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unexpected_responses_are_protocol_errors() {
+        let host = FakeHost::serve(Misbehave::Reply(Response::Ok)).await;
+        let r = Arc::new(remote(&host).await);
+        assert!(matches!(r.status().await, Err(NetError::Protocol(_))));
+        assert!(matches!(r.delete_repo().await, Err(NetError::Protocol(_))));
+        let id = PackId([1; 32]);
+        assert!(blocking(&r, move |r| is_protocol_error(r.get_pack(&id))).await);
+        assert!(blocking(&r, move |r| is_protocol_error(r.get_pack_tail(&id, 1))).await);
+        assert!(blocking(&r, |r| is_protocol_error(r.list_packs())).await);
+        assert!(blocking(&r, |r| is_protocol_error(r.list_snapshots())).await);
+
+        let ep = local_endpoint().await;
+        let err = pair(&ep, addr_of(&host), "me".into(), Vec::new()).await;
+        assert!(matches!(err, Err(NetError::Protocol(_))));
+        let err = redeem_invite(&ep, &ticket(&host), None, None, Vec::new()).await;
+        assert!(matches!(err, Err(NetError::Protocol(_))));
+
+        let host = FakeHost::serve(Misbehave::Reply(Response::PackIds(Vec::new()))).await;
+        let r = Arc::new(remote(&host).await);
+        assert!(blocking(&r, move |r| is_protocol_error(r.delete_pack(&id))).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn oversized_messages_and_objects_are_refused() {
+        let host = FakeHost::serve(Misbehave::HugeMessage).await;
+        let err = remote(&host).await.status().await.unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+
+        let len = MAX_OBJECT_LEN + 1;
+        let host = FakeHost::serve(Misbehave::Reply(Response::Data { len })).await;
+        let r = Arc::new(remote(&host).await);
+        let id = PackId([1; 32]);
+        assert!(blocking(&r, move |r| is_protocol_error(r.get_pack(&id))).await);
+
+        // Refused before anything is sent. Zeroed memory is only reserved, not touched.
+        let huge = vec![0u8; len as usize];
+        let err = blocking(&r, move |r| r.put_pack(&id, &huge)).await;
+        assert!(matches!(err, Err(kinvault_core::Error::Invalid(_))));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_connection_is_retried_once() {
+        let host = FakeHost::serve(Misbehave::DropFirstConnection).await;
+        let r = Arc::new(remote(&host).await);
+        blocking(&r, |r| r.delete_pack(&PackId([1; 32])))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uploads_can_be_paced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let receiver = Receiver::new(tmp.path());
+        let host = crate::serve(local_endpoint().await, receiver.clone());
+        let ep = local_endpoint().await;
+        receiver.allow(ep.id(), Grant::default());
+        let r = RemoteBackend::new(ep, addr_of(&host), "repo", Handle::current())
+            .unwrap()
+            .with_upload_limit(Some(10_000_000))
+            .with_hosts(vec!["not an address".into()]);
+        let r = Arc::new(r);
+        let data = vec![7u8; 200_000];
+        let id = PackId(*blake3::hash(&data).as_bytes());
+        blocking(&r, move |r| r.put_pack(&id, &data)).await.unwrap();
+        assert_eq!(blocking(&r, |r| r.list_packs()).await.unwrap(), vec![id]);
+        // Error codes from the host come through as such.
+        let missing = PackId([2; 32]);
+        let err = blocking(&r, move |r| r.get_pack(&missing)).await;
+        assert!(matches!(err, Err(kinvault_core::Error::NotFound(_))));
+    }
+}
