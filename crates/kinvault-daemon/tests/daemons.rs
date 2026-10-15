@@ -1312,8 +1312,16 @@ async fn deleting_a_set_erases_its_backups_wherever_they_are() {
     assert!(!folder.join("packs").exists());
     assert!(!folder.join("snapshots").exists());
     assert_eq!(fs::read(folder.join("unrelated.txt")).unwrap(), b"keep me");
-    // Only the unreachable host is still waiting to be told.
-    let pending = pending_deletions(&pc_state);
+    // Only the unreachable host is still waiting to be told. (It's
+    // forgotten just after the folder is erased.)
+    let mut pending = pending_deletions(&pc_state);
+    for _ in 0..100 {
+        if pending.len() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        pending = pending_deletions(&pc_state);
+    }
     assert_eq!(pending.len(), 1, "{pending:?}");
     assert_eq!(pending[0]["set_name"], "orphan");
     pc.shutdown().await;
