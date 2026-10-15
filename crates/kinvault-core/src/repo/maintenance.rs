@@ -103,6 +103,7 @@ impl<B: Backend> Repository<B> {
             if !seen.insert(tree_id) {
                 continue;
             }
+            self.check_cancelled()?;
             trees += 1;
             report(progress, MaintenanceStep::Listings, trees, total);
             for node in self.read_tree(&tree_id, cache)?.nodes {
@@ -179,6 +180,7 @@ impl<B: Backend> Repository<B> {
             report(&mut progress, MaintenanceStep::Repacking, 0, repack_total);
         }
         for (pack, size) in &to_repack {
+            self.check_cancelled()?;
             let data = self.fetch_pack(pack)?;
             stats.bytes_downloaded += data.len() as u64;
             for entry in contents[pack].iter().filter(|e| live.contains(&e.id)) {
@@ -209,6 +211,7 @@ impl<B: Backend> Repository<B> {
                 n as u64,
                 delete_total,
             );
+            self.check_cancelled()?;
             self.backend.delete_pack(pack)?;
             self.index.remove_pack(pack)?;
             stats.bytes_deleted += size;
@@ -251,6 +254,7 @@ impl<B: Backend> Repository<B> {
                 if !trees.insert(tree_id) {
                     continue;
                 }
+                self.check_cancelled()?;
                 self::report(
                     &mut progress,
                     MaintenanceStep::Listings,
@@ -301,6 +305,7 @@ impl<B: Backend> Repository<B> {
             if report.bytes_checked >= max_bytes {
                 break;
             }
+            self.check_cancelled()?;
             match self.check_pack(&pack) {
                 Ok(len) => {
                     report.packs_checked += 1;

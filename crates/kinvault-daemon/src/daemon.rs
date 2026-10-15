@@ -765,10 +765,10 @@ impl Daemon {
         let updated = entry.clone();
         config.save(&self.config_path())?;
         let mut sets = self.inner.sets.lock().await;
-        if let Some(old) = sets.remove(&id) {
-            old.abort();
-        }
-        sets.insert(id, SetHandle::start(self.set_env(updated)));
+        // The old worker's operation is cancelled, and the new one starts
+        // once it has stopped.
+        let old = sets.remove(&id);
+        sets.insert(id, SetHandle::start_after(self.set_env(updated), old));
         Ok(Reply::Done)
     }
 

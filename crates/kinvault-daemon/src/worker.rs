@@ -9,6 +9,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -179,11 +180,20 @@ pub(crate) struct SetHandle {
     pub tx: mpsc::Sender<Trigger>,
     task: JoinHandle<()>,
     repo: RepoSlot,
+    /// Tells an operation under way to stop; see [`Repository::set_cancel`].
+    cancel: Arc<AtomicBool>,
     _watcher: Option<RecommendedWatcher>,
 }
 
 impl SetHandle {
     pub fn start(env: SetEnv) -> Self {
+        Self::start_after(env, None)
+    }
+
+    /// Starts the set's task once `previous` (the same set's old task, e.g.
+    /// before a settings change) has stopped, so two never use the set's
+    /// backups at once.
+    pub fn start_after(env: SetEnv, previous: Option<SetHandle>) -> Self {
         let status = Arc::new(Mutex::new(RunStatus {
             state: if env.set.paused {
                 SetState::Paused
@@ -210,28 +220,45 @@ impl SetHandle {
             start_watcher(&env, tx.clone())
         };
         let repo = RepoSlot::default();
-        let task = tokio::spawn(run(env.clone(), status.clone(), repo.clone(), rx));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let run = run(
+            env.clone(),
+            status.clone(),
+            repo.clone(),
+            cancel.clone(),
+            rx,
+        );
+        let task = tokio::spawn(async move {
+            if let Some(previous) = previous {
+                previous.stop().await;
+            }
+            run.await
+        });
         Self {
             env,
             status,
             tx,
             task,
             repo,
+            cancel,
             _watcher: watcher,
         }
     }
 
     /// Stops the set's task without waiting. An operation already under way
-    /// finishes in the background.
+    /// stops soon after, in the background.
     pub fn abort(self) {
+        self.cancel.store(true, Ordering::Relaxed);
         self.task.abort();
     }
 
     /// Stops the set's task and closes its repository, waiting for an
-    /// operation already under way to finish (aborting doesn't stop it).
-    /// Afterwards nothing holds files in the set's directory open, so it can
-    /// be deleted (Windows refuses while a file in it is open).
+    /// operation already under way to stop (it is cancelled; aborting the
+    /// task alone doesn't stop it). Afterwards nothing holds files in the
+    /// set's directory open, so it can be deleted (Windows refuses while a
+    /// file in it is open).
     pub async fn stop(self) {
+        self.cancel.store(true, Ordering::Relaxed);
         self.task.abort();
         let _ = self.task.await;
         let repo = self.repo;
@@ -326,14 +353,15 @@ fn maintenance_reporter(
     }
 }
 
-/// Forwards backup progress to subscribers, at most four times a second.
+/// Forwards backup progress to subscribers, at most four times a second,
+/// and always the final totals once every file has been looked at.
 fn progress_reporter(env: &SetEnv) -> kinvault_core::ProgressFn {
     let events = env.events.clone();
     let set = env.set.id.clone();
     let last = Mutex::new(std::time::Instant::now() - Duration::from_secs(1));
     Arc::new(move |p: &kinvault_core::BackupProgress| {
         let mut last = last.lock().unwrap();
-        if last.elapsed() >= Duration::from_millis(250) {
+        if p.scanned || last.elapsed() >= Duration::from_millis(250) {
             *last = std::time::Instant::now();
             let _ = events.send(Event::Progress {
                 set: set.clone(),
@@ -356,6 +384,7 @@ struct Worker {
     env: SetEnv,
     status: Arc<Mutex<RunStatus>>,
     repo: RepoSlot,
+    cancel: Arc<AtomicBool>,
 }
 
 impl Worker {
@@ -366,12 +395,17 @@ impl Worker {
     ) -> Result<T> {
         let slot = self.repo.clone();
         let env = self.env.clone();
+        let cancel = self.cancel.clone();
         tokio::task::spawn_blocking(move || {
             // Held for the whole operation; see `SetHandle::stop`.
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
             let repo = match &mut *slot {
                 Some(r) => r,
-                empty => empty.insert(env.open_repository()?),
+                empty => {
+                    let mut repo = env.open_repository()?;
+                    repo.set_cancel(Some(cancel));
+                    empty.insert(repo)
+                }
             };
             f(repo)
         })
@@ -514,6 +548,7 @@ async fn run(
     env: SetEnv,
     status: Arc<Mutex<RunStatus>>,
     repo: RepoSlot,
+    cancel: Arc<AtomicBool>,
     mut rx: mpsc::Receiver<Trigger>,
 ) {
     let debounce = Duration::from_secs(env.set.debounce_secs);
@@ -525,6 +560,7 @@ async fn run(
         env,
         status: status.clone(),
         repo,
+        cancel,
     };
     let mut waiters: Vec<Reply<BackupSummary>> = Vec::new();
     let mut failures = 0u32;

@@ -1786,3 +1786,67 @@ async fn sets_wait_for_an_offline_host_and_back_up_when_it_returns() {
     pc.shutdown().await;
     host.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pausing_stops_a_running_backup_and_resuming_finishes_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("documents");
+    fs::create_dir_all(&src).unwrap();
+    // Random, so reading and storing it takes a while.
+    for i in 0..200u8 {
+        let mut data = vec![0u8; 256 << 10];
+        blake3::Hasher::new()
+            .update(&[i])
+            .finalize_xof()
+            .fill(&mut data);
+        fs::write(src.join(format!("f{i:03}")), data).unwrap();
+    }
+    let d = start(&tmp.path().join("state"), SecretKey::generate()).await;
+    let mut events = d.subscribe();
+    let target = Target::Local {
+        path: tmp.path().join("disk"),
+    };
+    call(&d, create_set("docs", &src, target)).await;
+
+    // Pause as soon as the first backup is under way.
+    loop {
+        match events.recv().await.unwrap() {
+            Event::Progress { .. } => break,
+            Event::BackupFinished { .. } => panic!("finished before it could be paused"),
+            _ => {}
+        }
+    }
+    call(&d, Request::PauseSet { set: "docs".into() }).await;
+    wait_for_set(&d, |s| s.state == SetState::Paused).await;
+
+    // It stops: no more progress once it has noticed.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    while events.try_recv().is_ok() {}
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    while let Ok(ev) = events.try_recv() {
+        assert!(
+            !matches!(ev, Event::Progress { .. } | Event::BackupFinished { .. }),
+            "{ev:?}"
+        );
+    }
+
+    // Resuming backs up everything, once: the paused backup didn't finish on
+    // the side.
+    call(
+        &d,
+        Request::ResumeSet {
+            set: "docs".into(),
+            paths: None,
+        },
+    )
+    .await;
+    let backup = wait_for_backup(&d, None).await;
+    assert_eq!(backup.files, 200);
+    let Reply::Snapshots(snapshots) = call(&d, Request::ListSnapshots { set: "docs".into() }).await
+    else {
+        panic!()
+    };
+    assert_eq!(snapshots.len(), 1, "{snapshots:?}");
+
+    d.shutdown().await;
+}

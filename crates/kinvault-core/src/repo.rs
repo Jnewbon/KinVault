@@ -2,6 +2,7 @@ use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fastcdc::v2020::StreamCDC;
@@ -31,6 +32,8 @@ pub struct BackupProgress {
     pub total_bytes: u64,
     pub bytes_read: u64,
     pub bytes_uploaded: u64,
+    /// Every file has been looked at: `files` and `total_bytes` are final.
+    pub scanned: bool,
 }
 
 pub type ProgressFn = Arc<dyn Fn(&BackupProgress) + Send + Sync>;
@@ -76,6 +79,7 @@ pub struct Repository<B: Backend> {
     excludes: Vec<PathBuf>,
     exclude_patterns: Excludes,
     progress: Option<ProgressFn>,
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl<B: Backend> Repository<B> {
@@ -88,6 +92,7 @@ impl<B: Backend> Repository<B> {
             excludes: Vec::new(),
             exclude_patterns: Excludes::default(),
             progress: None,
+            cancel: None,
         }
     }
 
@@ -98,6 +103,20 @@ impl<B: Backend> Repository<B> {
     /// Called after each file during backups; keep it cheap.
     pub fn set_progress(&mut self, progress: Option<ProgressFn>) {
         self.progress = progress;
+    }
+
+    /// Once `flag` is set, a running backup, prune or verify stops soon with
+    /// [`Error::Cancelled`], leaving the repository consistent: data already
+    /// stored is reused next time.
+    pub fn set_cancel(&mut self, flag: Option<Arc<AtomicBool>>) {
+        self.cancel = flag;
+    }
+
+    fn check_cancelled(&self) -> Result<()> {
+        match &self.cancel {
+            Some(flag) if flag.load(Ordering::Relaxed) => Err(Error::Cancelled),
+            _ => Ok(()),
+        }
     }
 
     /// Absolute paths (and everything below them) to leave out of backups.
@@ -185,6 +204,7 @@ impl<B: Backend> Repository<B> {
         nodes.sort_by(|a, b| a.name.cmp(&b.name));
         let root = run.store_tree(Tree { nodes })?;
         run.flush()?;
+        run.report_progress(true);
         let stats = run.stats;
 
         if let Some(prev) = previous
@@ -537,13 +557,14 @@ impl<B: Backend> BackupRun<'_, B> {
         Ok(())
     }
 
-    fn report_progress(&self) {
+    fn report_progress(&self, scanned: bool) {
         if let Some(progress) = &self.repo.progress {
             progress(&BackupProgress {
                 files: self.stats.files,
                 total_bytes: self.stats.total_bytes,
                 bytes_read: self.stats.bytes_read,
                 bytes_uploaded: self.writer.bytes,
+                scanned,
             });
         }
     }
@@ -555,6 +576,7 @@ impl<B: Backend> BackupRun<'_, B> {
     /// Returns `None` for entries that are skipped (unreadable or special files).
     /// Errors are only returned for failures that should abort the backup.
     fn store_path(&mut self, path: &Path, name: String) -> Result<Option<Node>> {
+        self.repo.check_cancelled()?;
         if self.repo.excludes.iter().any(|e| path.starts_with(e)) {
             return Ok(None);
         }
@@ -639,6 +661,7 @@ impl<B: Backend> BackupRun<'_, B> {
         {
             self.stats.files += 1;
             self.stats.total_bytes += size;
+            self.report_progress(false);
             return Ok(Some(NodeKind::File {
                 size,
                 chunks: cached.chunks,
@@ -662,14 +685,15 @@ impl<B: Backend> BackupRun<'_, B> {
                     return Ok(None);
                 }
             };
+            self.repo.check_cancelled()?;
             read += chunk.length as u64;
             chunks.push(self.store_blob(BlobKind::Data, &chunk.data)?);
         }
         self.stats.files += 1;
         self.stats.files_changed += 1;
         self.stats.bytes_read += read;
-        self.report_progress();
         self.stats.total_bytes += read;
+        self.report_progress(false);
         // Cache keyed on the metadata seen *before* reading, so a file modified
         // mid-read gets a new mtime and is re-read next time.
         self.repo.index.put_cached_file(

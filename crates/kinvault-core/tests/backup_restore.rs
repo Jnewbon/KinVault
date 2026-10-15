@@ -378,3 +378,95 @@ fn excluded_files_are_left_out_of_new_snapshots_only() {
     assert!(out.join(&root).join("big.bin").exists());
     assert!(out.join(&root).join("docs/nested/copy.txt").exists());
 }
+
+/// Equal-sized files, so every progress report's size must match its count.
+fn equal_files(src: &Path, count: usize, size: usize) {
+    fs::create_dir_all(src).unwrap();
+    for i in 0..count {
+        fs::write(src.join(format!("f{i:02}")), vec![i as u8; size]).unwrap();
+    }
+}
+
+#[test]
+fn backup_progress_counts_files_and_their_size_together() {
+    use std::sync::{Arc, Mutex};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let size = 10_000;
+    equal_files(&src, 20, size);
+    let master = MasterKey::generate().unwrap();
+    let mut repo = Repository::open(
+        LocalDirBackend::create(tmp.path().join("store")).unwrap(),
+        &master,
+        Index::open_in_memory().unwrap(),
+    );
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    repo.set_progress(Some(Arc::new(move |p: &kinvault_core::BackupProgress| {
+        sink.lock().unwrap().push(*p)
+    })));
+
+    // The first run reads every file; the second finds them all unchanged.
+    for run in 0..2 {
+        seen.lock().unwrap().clear();
+        let (_, stats) = repo.backup(std::slice::from_ref(&src), "h").unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 21, "run {run}: one per file, then the totals");
+        for p in seen.iter() {
+            assert_eq!(p.total_bytes, p.files * size as u64, "run {run}: {p:?}");
+        }
+        let last = seen.last().unwrap();
+        assert!(last.scanned && !seen[..20].iter().any(|p| p.scanned));
+        assert_eq!(
+            (last.files, last.total_bytes),
+            (stats.files, stats.total_bytes)
+        );
+    }
+}
+
+#[test]
+fn a_cancelled_backup_stops_and_the_next_one_finishes_it() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    // Random, so it doesn't compress and fills packs.
+    for i in 0..20 {
+        let mut data = vec![0u8; 300_000];
+        blake3::Hasher::new()
+            .update(&[i])
+            .finalize_xof()
+            .fill(&mut data);
+        fs::write(src.join(format!("f{i:02}")), data).unwrap();
+    }
+    let master = MasterKey::generate().unwrap();
+    let mut repo = Repository::open(
+        LocalDirBackend::create(tmp.path().join("store")).unwrap(),
+        &master,
+        Index::open_in_memory().unwrap(),
+    );
+    // Small packs, so what was stored before cancelling is kept.
+    repo.set_pack_target(1 << 20);
+    let cancel = Arc::new(AtomicBool::new(false));
+    repo.set_cancel(Some(cancel.clone()));
+    let flag = cancel.clone();
+    repo.set_progress(Some(Arc::new(move |p: &kinvault_core::BackupProgress| {
+        if p.files == 10 {
+            flag.store(true, Ordering::Relaxed);
+        }
+    })));
+    let err = repo.backup(std::slice::from_ref(&src), "h").unwrap_err();
+    assert!(matches!(err, kinvault_core::Error::Cancelled), "{err}");
+    assert!(repo.list_snapshots().unwrap().is_empty());
+
+    cancel.store(false, Ordering::Relaxed);
+    repo.set_progress(None);
+    let (id, stats) = repo.backup(std::slice::from_ref(&src), "h").unwrap();
+    assert_eq!(stats.files, 20);
+    assert!(stats.files_changed < 20, "stored data is reused: {stats:?}");
+    let out = tmp.path().join("out");
+    repo.restore(&id, &out, None).unwrap();
+}
