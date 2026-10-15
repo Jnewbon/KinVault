@@ -596,9 +596,12 @@ impl<B: Backend> BackupRun<'_, B> {
         if self.repo.excludes.iter().any(|e| path.starts_with(e)) {
             return Ok(None);
         }
-        // A listing's entry doesn't follow symlinks either, and on Windows
-        // already holds the metadata, saving an open of every file.
-        let meta = match entry.map_or_else(|| fs::symlink_metadata(path), |e| e.metadata()) {
+        // A listing's entry doesn't follow symlinks either. On Windows it
+        // holds the metadata the listing saw, which can be out of date for a
+        // file written moments ago, and a stale size or time could hide a
+        // change, so ask the file itself there.
+        let listed = entry.filter(|_| cfg!(unix));
+        let meta = match listed.map_or_else(|| fs::symlink_metadata(path), |e| e.metadata()) {
             Ok(m) => m,
             Err(e) => {
                 self.warn(path, e);
