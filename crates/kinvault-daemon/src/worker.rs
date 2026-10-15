@@ -298,6 +298,34 @@ fn set_state(env: &SetEnv, status: &Mutex<RunStatus>, state: SetState) {
     }
 }
 
+/// Forwards maintenance progress to subscribers, at most four times a
+/// second (and always when a step starts or ends).
+fn maintenance_reporter(
+    env: &SetEnv,
+) -> impl FnMut(&kinvault_core::MaintenanceProgress) + Send + use<> {
+    let events = env.events.clone();
+    let set = env.set.id.clone();
+    let mut last: Option<(kinvault_core::MaintenanceStep, std::time::Instant)> = None;
+    move |p| {
+        let edge = p.done == 0 || p.done == p.total;
+        let due = match last {
+            Some((step, at)) => {
+                step != p.step || edge || at.elapsed() >= Duration::from_millis(250)
+            }
+            None => true,
+        };
+        if due {
+            last = Some((p.step, std::time::Instant::now()));
+            let _ = events.send(Event::MaintenanceProgress {
+                set: set.clone(),
+                step: p.step.into(),
+                done: p.done,
+                total: p.total,
+            });
+        }
+    }
+}
+
 /// Forwards backup progress to subscribers, at most four times a second.
 fn progress_reporter(env: &SetEnv) -> kinvault_core::ProgressFn {
     let events = env.events.clone();
@@ -390,8 +418,12 @@ impl Worker {
     }
 
     async fn prune(&mut self) -> Result<PruneSummary> {
+        set_state(&self.env, &self.status, SetState::Pruning);
         let policy = self.env.set.retention;
-        let s = self.with_repo(move |repo| Ok(repo.prune(&policy)?)).await?;
+        let mut progress = maintenance_reporter(&self.env);
+        let s = self
+            .with_repo(move |repo| Ok(repo.prune_with_progress(&policy, &mut progress)?))
+            .await?;
         let summary = PruneSummary {
             time_unix: unix_now(),
             snapshots_kept: s.snapshots_kept,
@@ -408,8 +440,10 @@ impl Worker {
     }
 
     async fn verify(&mut self, max_bytes: u64) -> Result<VerifySummary> {
+        set_state(&self.env, &self.status, SetState::Verifying);
+        let mut progress = maintenance_reporter(&self.env);
         let r = self
-            .with_repo(move |repo| Ok(repo.verify(max_bytes)?))
+            .with_repo(move |repo| Ok(repo.verify_with_progress(max_bytes, &mut progress)?))
             .await?;
         let summary = VerifySummary {
             time_unix: unix_now(),
@@ -534,12 +568,10 @@ async fn run(
                     true
                 }
                 Some(Trigger::Prune(reply)) => {
-                    set_state(&worker.env, &status, SetState::Running);
                     let _ = reply.send(worker.prune().await.map_err(|e| format!("{e:#}")));
                     false
                 }
                 Some(Trigger::Verify(max_bytes, reply)) => {
-                    set_state(&worker.env, &status, SetState::Running);
                     let result = worker.verify(max_bytes).await;
                     if matches!(&result, Ok(v) if !v.ok) && !paused {
                         scheduled = Instant::now();

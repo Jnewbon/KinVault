@@ -631,6 +631,8 @@ async fn main() -> Result<()> {
                     SetState::Paused => "paused",
                     SetState::WaitingForHost => "waiting for its backup host to come online",
                     SetState::Running => "backing up",
+                    SetState::Pruning => "cleaning up old versions",
+                    SetState::Verifying => "checking its backups",
                 };
                 let online = match set.target_online {
                     Some(true) => " (online)",
@@ -912,6 +914,31 @@ async fn main() -> Result<()> {
                         format_bytes(total_bytes),
                         format_bytes(bytes_uploaded)
                     ),
+                    Event::MaintenanceProgress {
+                        set,
+                        step,
+                        done,
+                        total,
+                    } => {
+                        use kinvault_daemon::api::MaintenanceStep as S;
+                        let what = match step {
+                            S::Listings => {
+                                format!("reading folder listings, {done} of about {total}")
+                            }
+                            S::Repacking => format!(
+                                "rewriting partly-used data, {} of {}",
+                                format_bytes(done),
+                                format_bytes(total)
+                            ),
+                            S::Deleting => format!("deleting unused data, {done} of {total} packs"),
+                            S::Checking => format!(
+                                "checking data, {} of {}",
+                                format_bytes(done),
+                                format_bytes(total)
+                            ),
+                        };
+                        println!("{}: {what}", name(&set))
+                    }
                     Event::BackupFinished { set, summary } => println!(
                         "{}: backup done, {} changed, uploaded {}",
                         name(&set),

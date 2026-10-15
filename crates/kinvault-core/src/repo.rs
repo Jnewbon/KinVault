@@ -16,7 +16,7 @@ use crate::pack::{self, BlobKind, PackBuilder};
 use crate::snapshot::{self, Node, NodeKind, Snapshot, Tree};
 
 mod maintenance;
-pub use maintenance::{PruneStats, VerifyReport};
+pub use maintenance::{MaintenanceProgress, MaintenanceStep, PruneStats, VerifyReport};
 
 const CHUNK_MIN: u32 = 256 * 1024;
 const CHUNK_AVG: u32 = 1024 * 1024;

@@ -193,6 +193,30 @@ impl Index {
         Ok(out)
     }
 
+    /// How many folder listings (tree blobs) are stored.
+    pub fn tree_count(&self) -> Result<u64> {
+        let n: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM chunks WHERE kind = 1", [], |r| {
+                    r.get(0)
+                })?;
+        Ok(n as u64)
+    }
+
+    /// Roughly how big each pack is: the blobs the index attributes to it.
+    pub fn pack_sizes(&self) -> Result<HashMap<PackId, u64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT pack, SUM(len) FROM chunks GROUP BY pack")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (pack, len) = row?;
+            out.insert(PackId::from_slice(&pack)?, len as u64);
+        }
+        Ok(out)
+    }
+
     pub fn mark_verified(&self, pack: &PackId, at_unix: i64) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO verified (pack, at) VALUES (?1, ?2)",

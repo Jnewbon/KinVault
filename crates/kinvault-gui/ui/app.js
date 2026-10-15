@@ -19,6 +19,7 @@ const state = {
   network: null, // NetworkInfo
   nearby: { until_unix: null, devices: [] }, // NearbyStatus
   progress: {}, // set id -> latest Progress event
+  maintenance: {}, // set id -> latest MaintenanceProgress event, plus when its step started
   autostart: false,
   restoreSet: null,
   snapshotsSet: null, // the set whose versions are in `snapshots`
@@ -473,8 +474,63 @@ function renderBanner() {
   banner.hidden = false;
 }
 
+/** Backing up, cleaning up or checking: the set's backups are in use. */
+function busy(set) {
+  return ["running", "pruning", "verifying"].includes(set.state);
+}
+
+/** "less than a minute", "12 min", "1.5 h". */
+function duration(seconds) {
+  if (seconds < 60) return "less than a minute";
+  if (seconds < 3600) return `${Math.ceil(seconds / 60)} min`;
+  return `${(seconds / 3600).toFixed(1)} h`;
+}
+
+const MAINTENANCE_STEPS = {
+  pruning: ["listings", "repacking", "deleting"],
+  verifying: ["listings", "checking"],
+};
+
+/** Records a MaintenanceProgress event, remembering when its step started for the time left. */
+function noteMaintenance(ev) {
+  const prev = state.maintenance[ev.set];
+  const sameStep = prev && prev.step === ev.step;
+  state.maintenance[ev.set] = {
+    ...ev,
+    stepStart: sameStep ? prev.stepStart : Date.now(),
+    stepStartDone: sameStep ? prev.stepStartDone : ev.done,
+  };
+}
+
+/** What cleaning up or checking is doing, how far it got, and roughly how long is left. */
+function maintenanceLines(set) {
+  const title = set.state === "pruning" ? "Cleaning up old versions" : "Checking the backups";
+  const m = state.maintenance[set.id];
+  if (!m) return [el("div", {}, `${title}…`), el("div", { class: "progress indeterminate" }, el("div"))];
+  const steps = MAINTENANCE_STEPS[set.state] || [];
+  const n = steps.indexOf(m.step) + 1;
+  const what = {
+    listings: `reading folder listings, ${m.done} of about ${m.total}`,
+    repacking: `rewriting partly-used data, ${bytes(m.done)} of ${bytes(m.total)}`,
+    deleting: `deleting unused data, ${m.done} of ${plural(m.total, "pack")}`,
+    checking: `downloading and checking data, ${bytes(m.done)} of ${bytes(m.total)}`,
+  }[m.step];
+  let left = "";
+  // Listings' total is only an upper bound, so no estimate for it.
+  const elapsed = (Date.now() - m.stepStart) / 1000;
+  const rate = (m.done - m.stepStartDone) / elapsed;
+  if (m.step !== "listings" && elapsed >= 3 && rate > 0) left = ` · about ${duration((m.total - m.done) / rate)} left`;
+  const percent = m.total ? Math.min(100, (100 * m.done) / m.total) : 0;
+  return [
+    el("div", {}, `${title}: ${n ? `step ${n} of ${steps.length}, ` : ""}${what}${left}`),
+    el("div", { class: "progress" }, el("div", { style: `width:${percent.toFixed(1)}%` })),
+  ];
+}
+
 function stateChip(set) {
   if (set.state === "running") return el("span", { class: "chip run" }, "Backing up");
+  if (set.state === "pruning") return el("span", { class: "chip run" }, "Cleaning up");
+  if (set.state === "verifying") return el("span", { class: "chip run" }, "Checking");
   if (set.state === "paused") return el("span", { class: "chip warn" }, "Paused");
   if (set.state === "waiting_for_host") return el("span", { class: "chip warn" }, "Waiting for destination");
   if (set.last_error) return el("span", { class: "chip bad" }, "Needs attention");
@@ -530,6 +586,7 @@ function setCard(set) {
       : "Starting…"));
     lines.append(el("div", { class: "progress indeterminate" }, el("div")));
   }
+  if (set.state === "pruning" || set.state === "verifying") lines.append(...maintenanceLines(set));
   if (set.last_backup) {
     const b = set.last_backup;
     lines.append(el("div", {},
@@ -548,7 +605,7 @@ function setCard(set) {
   if (set.excludes?.length) limits.push(`leaves out ${set.excludes.join(", ")}`);
   lines.append(el("div", { class: "muted small" }, limits.join(" · ")));
 
-  const backup = el("button", { class: "btn primary small", disabled: set.state === "running" || set.state === "paused" }, "Back up now");
+  const backup = el("button", { class: "btn primary small", disabled: busy(set) || set.state === "paused" }, "Back up now");
   backup.addEventListener("click", () => attempt(async () => {
     const b = await call("backup_now", { set: set.id });
     toast(`${set.name}: backed up, ${b.files_changed} changed, sent ${bytes(b.bytes_uploaded)}`);
@@ -556,13 +613,13 @@ function setCard(set) {
   const pause = set.state === "paused"
     ? el("button", { class: "btn small", onclick: () => resumeSet(set) }, "Resume")
     : el("button", { class: "btn small", onclick: () => attempt(() => call("pause_set", { set: set.id })) }, "Pause");
-  const check = el("button", { class: "btn small" }, "Check now");
+  const check = el("button", { class: "btn small", disabled: busy(set) }, "Check now");
   check.addEventListener("click", () => attempt(async () => {
     const v = await call("verify", { set: set.id, max_bytes: null });
     if (v.ok) toast(`${set.name}: checked ${bytes(v.bytes_checked)}, all good`);
     else toast(`${set.name}: problems found — ${v.errors.slice(0, 2).join("; ")}`, true);
   }, check));
-  const prune = el("button", { class: "btn small" }, "Clean up old versions");
+  const prune = el("button", { class: "btn small", disabled: busy(set) }, "Clean up old versions");
   prune.addEventListener("click", () => attempt(async () => {
     const p = await call("prune", { set: set.id });
     toast(`${set.name}: removed ${p.snapshots_removed} old version(s), freed about ${bytes(p.bytes_deleted)}`);
@@ -1369,6 +1426,7 @@ async function setConnected(connected) {
     state.network = null;
     state.nearby = { until_unix: null, devices: [] };
     state.progress = {};
+    state.maintenance = {};
   }
   render();
 }
@@ -1381,10 +1439,19 @@ listen("daemon-event", (e) => {
       state.progress[ev.set] = ev;
       if (state.page === "backups") renderBackups();
       break;
+    case "maintenance_progress":
+      noteMaintenance(ev);
+      if (state.page === "backups") renderBackups();
+      break;
+    case "backup_finished":
+      delete state.progress[ev.set];
+      refreshSoon();
+      break;
     case "set_state": {
       const set = state.status?.sets.find((s) => s.id === ev.set);
       if (set) set.state = ev.state;
       if (ev.state !== "running") delete state.progress[ev.set];
+      if (ev.state !== "pruning" && ev.state !== "verifying") delete state.maintenance[ev.set];
       render();
       refreshSoon();
       break;

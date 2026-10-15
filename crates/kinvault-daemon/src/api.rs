@@ -329,6 +329,15 @@ pub enum Event {
         bytes_read: u64,
         bytes_uploaded: u64,
     },
+    /// How far cleaning up old versions or checking the backups got.
+    MaintenanceProgress {
+        set: String,
+        step: MaintenanceStep,
+        /// Done and total in this step: bytes for `Repacking` and
+        /// `Checking`, otherwise items.
+        done: u64,
+        total: u64,
+    },
     BackupFinished {
         set: String,
         summary: BackupSummary,
@@ -448,6 +457,38 @@ pub enum SetState {
     /// The host it backs up to can't be reached; will back up when it's back.
     WaitingForHost,
     Running,
+    /// Removing old versions the retention policy doesn't keep.
+    Pruning,
+    /// Checking the backups are complete and intact.
+    Verifying,
+}
+
+/// A step of cleaning up (`Listings`, `Repacking`, `Deleting`) or checking
+/// (`Listings`, `Checking`).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceStep {
+    /// Reading the folder listings of every version. The total counts every
+    /// listing stored, so the step may end short of it.
+    Listings,
+    /// Rewriting partly-used data so the unused part can be freed.
+    Repacking,
+    /// Deleting data no version uses any more.
+    Deleting,
+    /// Downloading and decrypting data to check it.
+    Checking,
+}
+
+impl From<kinvault_core::MaintenanceStep> for MaintenanceStep {
+    fn from(step: kinvault_core::MaintenanceStep) -> Self {
+        use kinvault_core::MaintenanceStep as S;
+        match step {
+            S::Listings => Self::Listings,
+            S::Repacking => Self::Repacking,
+            S::Deleting => Self::Deleting,
+            S::Checking => Self::Checking,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

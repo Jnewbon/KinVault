@@ -71,6 +71,8 @@ This runs even outside the backup's hours (below) and waits until it's done.
 | Up to date | Everything is backed up |
 | Changes waiting | Changes noticed, backing up shortly |
 | Backing up | A backup is running |
+| Cleaning up | Removing old versions it no longer keeps; shows how far it got and roughly how long is left |
+| Checking | Checking the stored backups are complete and intact; shows progress the same way |
 | Waiting for its hours | Changes are waiting for the backup's time window |
 | Waiting for destination | The computer it backs up to is offline; it backs up when it's back |
 | Not backed up yet | No backup has finished yet |

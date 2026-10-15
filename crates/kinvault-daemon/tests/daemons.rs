@@ -761,6 +761,63 @@ async fn subscribers_see_state_changes_and_results() {
     };
     assert_eq!(summary.files, 50);
 
+    // Checking and cleaning up say so, report how far they got, and end
+    // back at up to date.
+    for (req, busy) in [
+        (
+            Request::Verify {
+                set: "local".into(),
+                max_bytes: None,
+            },
+            SetState::Verifying,
+        ),
+        (
+            Request::Prune {
+                set: "local".into(),
+            },
+            SetState::Pruning,
+        ),
+    ] {
+        call(&daemon, req).await;
+        let mut seen = Vec::new();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(event) = events.next().await {
+                // Skip what was still queued from before.
+                if seen.is_empty()
+                    && !matches!(&event, Event::SetState { state, .. } if *state == busy)
+                {
+                    continue;
+                }
+                let idle = matches!(
+                    event,
+                    Event::SetState {
+                        state: SetState::Idle,
+                        ..
+                    }
+                );
+                seen.push(event);
+                if idle {
+                    return;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("never back to idle: {seen:?}"));
+        assert!(
+            matches!(&seen[0], Event::SetState { state, .. } if *state == busy),
+            "{seen:?}"
+        );
+        let progress: Vec<_> = seen
+            .iter()
+            .filter_map(|e| match e {
+                Event::MaintenanceProgress { done, total, .. } => Some((*done, *total)),
+                _ => None,
+            })
+            .collect();
+        assert!(!progress.is_empty(), "{seen:?}");
+        assert!(progress.iter().all(|(d, t)| d <= t), "{progress:?}");
+    }
+
     server.abort();
     daemon.shutdown().await;
 }

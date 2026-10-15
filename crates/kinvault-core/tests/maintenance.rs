@@ -202,3 +202,53 @@ fn verify_budget_rotates_through_packs() {
     }
     assert_eq!(checked, total);
 }
+
+#[test]
+fn prune_and_verify_report_their_progress() {
+    use kinvault_core::{MaintenanceProgress, MaintenanceStep};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, _, _, mut repo) = setup(tmp.path(), 1 << 20);
+    write(&src.join("big.bin"), &random(3 << 20, "big"));
+    repo.backup(std::slice::from_ref(&src), "h").unwrap();
+    write(&src.join("big.bin"), &random(3 << 20, "other"));
+    repo.backup(std::slice::from_ref(&src), "h").unwrap();
+
+    let check = |seen: &[MaintenanceProgress], steps: &[MaintenanceStep]| {
+        let mut order: Vec<MaintenanceStep> = seen.iter().map(|p| p.step).collect();
+        order.dedup();
+        assert_eq!(order, steps, "{seen:?}");
+        assert!(seen.iter().all(|p| p.done <= p.total), "{seen:?}");
+    };
+
+    let mut seen = Vec::new();
+    let report = repo
+        .verify_with_progress(u64::MAX, &mut |p| seen.push(*p))
+        .unwrap();
+    assert!(report.is_ok());
+    check(
+        &seen,
+        &[MaintenanceStep::Listings, MaintenanceStep::Checking],
+    );
+    let last = seen.last().unwrap();
+    assert!(last.total > 2 << 20 && last.done == last.total, "{last:?}");
+
+    // Dropping the first snapshot leaves its data unused, to be deleted.
+    let mut seen = Vec::new();
+    let stats = repo
+        .prune_with_progress(
+            &RetentionPolicy {
+                last: Some(1),
+                ..Default::default()
+            },
+            &mut |p| seen.push(*p),
+        )
+        .unwrap();
+    assert!(stats.packs_deleted > 0, "{stats:?}");
+    check(
+        &seen,
+        &[MaintenanceStep::Listings, MaintenanceStep::Deleting],
+    );
+    let deleting = seen.last().unwrap();
+    assert_eq!(deleting.total, stats.packs_deleted + stats.packs_repacked);
+}

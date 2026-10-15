@@ -48,6 +48,38 @@ impl VerifyReport {
     }
 }
 
+/// A step of pruning or verifying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintenanceStep {
+    /// Reading the snapshots' folder listings, counted in listings. The total
+    /// is every listing stored, so it may finish short of it.
+    Listings,
+    /// Prune: rewriting mostly-unused packs, in bytes.
+    Repacking,
+    /// Prune: deleting unused packs, counted in packs.
+    Deleting,
+    /// Verify: downloading and decrypting packs, in bytes.
+    Checking,
+}
+
+/// How far a step of pruning or verifying got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaintenanceProgress {
+    pub step: MaintenanceStep,
+    pub done: u64,
+    pub total: u64,
+}
+
+type ProgressSink<'a> = &'a mut dyn FnMut(&MaintenanceProgress);
+
+fn report(progress: &mut ProgressSink, step: MaintenanceStep, done: u64, total: u64) {
+    progress(&MaintenanceProgress {
+        step,
+        done: done.min(total),
+        total,
+    });
+}
+
 type PackCache = VecDeque<(PackId, Vec<u8>)>;
 
 impl<B: Backend> Repository<B> {
@@ -57,13 +89,22 @@ impl<B: Backend> Repository<B> {
 
     /// Every tree and data chunk reachable from `roots`. Fails if any tree
     /// can't be read, so callers never act on an incomplete picture.
-    fn reachable(&self, roots: &[ChunkId], cache: &mut PackCache) -> Result<HashSet<ChunkId>> {
+    fn reachable(
+        &self,
+        roots: &[ChunkId],
+        cache: &mut PackCache,
+        progress: &mut ProgressSink,
+    ) -> Result<HashSet<ChunkId>> {
+        let total = self.index.tree_count()?;
+        let mut trees = 0;
         let mut seen = HashSet::new();
         let mut stack = roots.to_vec();
         while let Some(tree_id) = stack.pop() {
             if !seen.insert(tree_id) {
                 continue;
             }
+            trees += 1;
+            report(progress, MaintenanceStep::Listings, trees, total);
             for node in self.read_tree(&tree_id, cache)?.nodes {
                 match node.kind {
                     NodeKind::Dir { tree } => stack.push(tree),
@@ -78,6 +119,15 @@ impl<B: Backend> Repository<B> {
     /// Removes snapshots the policy doesn't keep, then frees the space only
     /// they used: unused packs are deleted, mostly-unused packs are rewritten.
     pub fn prune(&mut self, policy: &RetentionPolicy) -> Result<PruneStats> {
+        self.prune_with_progress(policy, &mut |_| {})
+    }
+
+    /// Like [`Self::prune`], reporting how far each step got.
+    pub fn prune_with_progress(
+        &mut self,
+        policy: &RetentionPolicy,
+        mut progress: ProgressSink,
+    ) -> Result<PruneStats> {
         self.sync_index()?;
         let mut stats = PruneStats::default();
         let snapshots = self.list_snapshots()?;
@@ -91,7 +141,7 @@ impl<B: Backend> Repository<B> {
             .map(|(_, s)| s.root)
             .collect();
         let mut cache = PackCache::new();
-        let live = self.reachable(&roots, &mut cache)?;
+        let live = self.reachable(&roots, &mut cache, &mut progress)?;
         drop(cache);
 
         for (id, _) in &snapshots {
@@ -123,7 +173,12 @@ impl<B: Backend> Repository<B> {
         // Copy the live blobs of mostly-dead packs into new packs first, so
         // nothing that is still needed is ever missing.
         let mut writer = PackWriter::default();
-        for (pack, _) in &to_repack {
+        let repack_total: u64 = to_repack.iter().map(|(_, size)| size).sum();
+        let mut repacked = 0;
+        if !to_repack.is_empty() {
+            report(&mut progress, MaintenanceStep::Repacking, 0, repack_total);
+        }
+        for (pack, size) in &to_repack {
             let data = self.fetch_pack(pack)?;
             stats.bytes_downloaded += data.len() as u64;
             for entry in contents[pack].iter().filter(|e| live.contains(&e.id)) {
@@ -134,12 +189,26 @@ impl<B: Backend> Repository<B> {
                     pack::decode_blob(&self.keys, &entry.id, pack::blob_bytes(&data, entry)?)?;
                 writer.add(self, entry.id, entry.kind, &plaintext)?;
             }
+            repacked += size;
+            report(
+                &mut progress,
+                MaintenanceStep::Repacking,
+                repacked,
+                repack_total,
+            );
         }
         writer.flush(self)?;
         stats.bytes_uploaded = writer.bytes;
         stats.packs_repacked = to_repack.len() as u64;
 
-        for (pack, size) in to_delete.iter().chain(&to_repack) {
+        let delete_total = (to_delete.len() + to_repack.len()) as u64;
+        for (n, (pack, size)) in to_delete.iter().chain(&to_repack).enumerate() {
+            report(
+                &mut progress,
+                MaintenanceStep::Deleting,
+                n as u64,
+                delete_total,
+            );
             self.backend.delete_pack(pack)?;
             self.index.remove_pack(pack)?;
             stats.bytes_deleted += size;
@@ -152,7 +221,17 @@ impl<B: Backend> Repository<B> {
     /// fully decrypts up to `max_bytes` of packs, least recently checked
     /// first, so repeated runs eventually cover everything.
     pub fn verify(&mut self, max_bytes: u64) -> Result<VerifyReport> {
+        self.verify_with_progress(max_bytes, &mut |_| {})
+    }
+
+    /// Like [`Self::verify`], reporting how far each step got.
+    pub fn verify_with_progress(
+        &mut self,
+        max_bytes: u64,
+        mut progress: ProgressSink,
+    ) -> Result<VerifyReport> {
         self.sync_index()?;
+        let listings = self.index.tree_count()?;
         let mut report = VerifyReport::default();
         let mut cache = PackCache::new();
         let mut trees = HashSet::new();
@@ -172,6 +251,12 @@ impl<B: Backend> Repository<B> {
                 if !trees.insert(tree_id) {
                     continue;
                 }
+                self::report(
+                    &mut progress,
+                    MaintenanceStep::Listings,
+                    trees.len() as u64,
+                    listings,
+                );
                 match self.read_tree(&tree_id, &mut cache) {
                     Ok(tree) => {
                         for node in tree.nodes {
@@ -201,7 +286,18 @@ impl<B: Backend> Repository<B> {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        for pack in self.index.packs_by_verify_age()? {
+        // The packs this run gets to, for the total to check.
+        let packs = self.index.packs_by_verify_age()?;
+        let sizes = self.index.pack_sizes()?;
+        let mut to_check = 0u64;
+        for pack in &packs {
+            if to_check >= max_bytes {
+                break;
+            }
+            to_check += sizes.get(pack).copied().unwrap_or(0);
+        }
+        self::report(&mut progress, MaintenanceStep::Checking, 0, to_check);
+        for pack in packs {
             if report.bytes_checked >= max_bytes {
                 break;
             }
@@ -210,6 +306,12 @@ impl<B: Backend> Repository<B> {
                     report.packs_checked += 1;
                     report.bytes_checked += len;
                     self.index.mark_verified(&pack, now)?;
+                    self::report(
+                        &mut progress,
+                        MaintenanceStep::Checking,
+                        report.bytes_checked,
+                        to_check,
+                    );
                 }
                 Err(
                     e @ (Error::Corrupt(_)
