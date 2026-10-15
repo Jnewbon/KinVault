@@ -147,6 +147,13 @@ mod tests {
     }
 
     #[test]
+    fn default_options_broadcast_and_multicast() {
+        let opts = NearbyOptions::default();
+        assert_eq!(opts.port, NEARBY_PORT);
+        assert_eq!(opts.targets.len(), 2);
+    }
+
+    #[test]
     fn code_is_symmetric_and_specific() {
         let a = iroh::SecretKey::generate().public();
         let b = iroh::SecretKey::generate().public();
@@ -165,9 +172,18 @@ mod tests {
             .port();
         let opts = NearbyOptions {
             port,
-            targets: vec![SocketAddr::from((Ipv4Addr::LOCALHOST, port))],
+            // An IPv6 target can't be reached from this socket; it's skipped.
+            targets: vec![
+                "[::1]:9".parse().unwrap(),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+            ],
         };
         let socket = NearbySocket::bind(&opts).unwrap();
+        // Stray traffic on the port is ignored.
+        std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .send_to(b"not a beacon", (Ipv4Addr::LOCALHOST, port))
+            .unwrap();
         let id = iroh::SecretKey::generate().public();
         let beacon = Beacon {
             addr: EndpointAddr::new(id).with_ip_addr("192.0.2.1:4433".parse().unwrap()),

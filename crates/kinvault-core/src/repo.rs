@@ -1,5 +1,6 @@
 use std::collections::{HashSet, VecDeque};
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -181,31 +182,11 @@ impl<B: Backend> Repository<B> {
         previous: Option<&SnapshotId>,
     ) -> Result<(SnapshotId, BackupStats)> {
         self.sync_index()?;
-        let mut run = BackupRun {
-            repo: self,
-            writer: PackWriter::default(),
-            stats: BackupStats::default(),
-        };
-
-        let mut nodes: Vec<Node> = Vec::new();
-        let mut paths = Vec::new();
-        for src in sources {
-            let abs = fs::canonicalize(src)
-                .map_err(|e| Error::NotFound(format!("backup source {}: {e}", src.display())))?;
-            let name = snapshot_root_name(&abs);
-            if nodes.iter().any(|n| n.name == name) {
-                continue;
-            }
-            paths.push(abs.to_string_lossy().into_owned());
-            if let Some(node) = run.store_path(&abs, name)? {
-                nodes.push(node);
-            }
-        }
-        nodes.sort_by(|a, b| a.name.cmp(&b.name));
-        let root = run.store_tree(Tree { nodes })?;
-        run.flush()?;
-        run.report_progress(true);
-        let stats = run.stats;
+        self.index.begin_batch()?;
+        let walked = self.store_sources(sources);
+        // Keep what was written even if the backup failed part way.
+        self.index.end_batch()?;
+        let (root, paths, stats) = walked?;
 
         if let Some(prev) = previous
             // Gone (e.g. pruned) or unreadable: just store a new one.
@@ -232,6 +213,39 @@ impl<B: Backend> Repository<B> {
         let (id, data) = snapshot::encode_snapshot(&self.keys, &snapshot)?;
         self.backend.put_snapshot(&id, &data)?;
         Ok((id, stats))
+    }
+
+    /// Stores every source and returns the root tree, the absolute source
+    /// paths and the totals.
+    fn store_sources(
+        &mut self,
+        sources: &[PathBuf],
+    ) -> Result<(ChunkId, Vec<String>, BackupStats)> {
+        let mut run = BackupRun {
+            repo: self,
+            writer: PackWriter::default(),
+            stats: BackupStats::default(),
+        };
+
+        let mut nodes: Vec<Node> = Vec::new();
+        let mut paths = Vec::new();
+        for src in sources {
+            let abs = fs::canonicalize(src)
+                .map_err(|e| Error::NotFound(format!("backup source {}: {e}", src.display())))?;
+            let name = snapshot_root_name(&abs);
+            if nodes.iter().any(|n| n.name == name) {
+                continue;
+            }
+            paths.push(abs.to_string_lossy().into_owned());
+            if let Some(node) = run.store_path(&abs, name, None)? {
+                nodes.push(node);
+            }
+        }
+        nodes.sort_by(|a, b| a.name.cmp(&b.name));
+        let root = run.store_tree(Tree { nodes })?;
+        run.flush()?;
+        run.report_progress(true);
+        Ok((root, paths, run.stats))
     }
 
     pub fn load_snapshot(&self, id: &SnapshotId) -> Result<Snapshot> {
@@ -408,9 +422,6 @@ impl<B: Backend> Repository<B> {
                 // The include path points inside a file; nothing to restore here.
                 _ if child_include.is_some() => continue,
                 NodeKind::File { chunks, .. } => {
-                    if let Some(parent) = path.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
                     let mut file = fs::File::create(&path)?;
                     for chunk in chunks {
                         let data = self.read_blob(chunk, &mut ctx.cache)?;
@@ -431,9 +442,6 @@ impl<B: Backend> Repository<B> {
                     }
                 }
                 NodeKind::Symlink { target } => {
-                    if let Some(parent) = path.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
                     if path.symlink_metadata().is_ok() {
                         fs::remove_file(&path)?;
                     }
@@ -512,6 +520,8 @@ impl PackWriter {
         let finished = builder.finish(&repo.keys)?;
         repo.backend.put_pack(&finished.id, &finished.data)?;
         repo.index.add_pack(&finished.id, &finished.entries)?;
+        // The pack is uploaded; make the index say so before going on.
+        repo.index.commit_batch()?;
         self.packs += 1;
         self.bytes += finished.data.len() as u64;
         Ok(())
@@ -575,12 +585,20 @@ impl<B: Backend> BackupRun<'_, B> {
 
     /// Returns `None` for entries that are skipped (unreadable or special files).
     /// Errors are only returned for failures that should abort the backup.
-    fn store_path(&mut self, path: &Path, name: String) -> Result<Option<Node>> {
+    /// `entry` is the directory listing's entry for `path`, if there is one.
+    fn store_path(
+        &mut self,
+        path: &Path,
+        name: String,
+        entry: Option<&fs::DirEntry>,
+    ) -> Result<Option<Node>> {
         self.repo.check_cancelled()?;
         if self.repo.excludes.iter().any(|e| path.starts_with(e)) {
             return Ok(None);
         }
-        let meta = match fs::symlink_metadata(path) {
+        // A listing's entry doesn't follow symlinks either, and on Windows
+        // already holds the metadata, saving an open of every file.
+        let meta = match entry.map_or_else(|| fs::symlink_metadata(path), |e| e.metadata()) {
             Ok(m) => m,
             Err(e) => {
                 self.warn(path, e);
@@ -639,7 +657,7 @@ impl<B: Backend> BackupRun<'_, B> {
         let mut nodes = Vec::with_capacity(entries.len());
         for entry in entries {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if let Some(node) = self.store_path(&entry.path(), name)? {
+            if let Some(node) = self.store_path(&entry.path(), name, Some(&entry))? {
                 nodes.push(node);
             }
         }
@@ -668,26 +686,58 @@ impl<B: Backend> BackupRun<'_, B> {
             }));
         }
 
-        let file = match fs::File::open(path) {
-            Ok(f) => f,
+        match fs::File::open(path) {
+            Ok(file) => self.store_contents(path, file, size, mtime, inode),
             Err(e) => {
                 self.warn(path, e);
-                return Ok(None);
+                Ok(None)
             }
-        };
+        }
+    }
+
+    /// Chunks and stores what `reader` holds for the file at `path`, whose
+    /// metadata before reading was `size`, `mtime` and `inode`. A read error
+    /// skips the file with a warning.
+    fn store_contents(
+        &mut self,
+        path: &Path,
+        mut reader: impl Read,
+        size: u64,
+        mtime: i64,
+        inode: u64,
+    ) -> Result<Option<NodeKind>> {
+        let mut head = Vec::new();
+        if let Err(e) = (&mut reader)
+            .take(CHUNK_MIN as u64 + 1)
+            .read_to_end(&mut head)
+        {
+            self.warn(path, e);
+            return Ok(None);
+        }
         let mut chunks = Vec::new();
         let mut read = 0u64;
-        for chunk in StreamCDC::new(file, CHUNK_MIN, CHUNK_AVG, CHUNK_MAX) {
-            let chunk = match chunk {
-                Ok(c) => c,
-                Err(e) => {
-                    self.warn(path, format!("{e:?}"));
-                    return Ok(None);
-                }
-            };
-            self.repo.check_cancelled()?;
-            read += chunk.length as u64;
-            chunks.push(self.store_blob(BlobKind::Data, &chunk.data)?);
+        if head.len() <= CHUNK_MIN as usize {
+            // No longer than the smallest chunk, so the whole file is one
+            // chunk. Most files are small, and setting up the chunker's
+            // CHUNK_MAX buffer would cost far more than reading them.
+            if !head.is_empty() {
+                read = head.len() as u64;
+                chunks.push(self.store_blob(BlobKind::Data, &head)?);
+            }
+        } else {
+            let rest = io::Cursor::new(head).chain(reader);
+            for chunk in StreamCDC::new(rest, CHUNK_MIN, CHUNK_AVG, CHUNK_MAX) {
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    Err(e) => {
+                        self.warn(path, format!("{e:?}"));
+                        return Ok(None);
+                    }
+                };
+                self.repo.check_cancelled()?;
+                read += chunk.length as u64;
+                chunks.push(self.store_blob(BlobKind::Data, &chunk.data)?);
+            }
         }
         self.stats.files += 1;
         self.stats.files_changed += 1;
@@ -697,7 +747,7 @@ impl<B: Backend> BackupRun<'_, B> {
         // Cache keyed on the metadata seen *before* reading, so a file modified
         // mid-read gets a new mtime and is re-read next time.
         self.repo.index.put_cached_file(
-            &key,
+            &path.to_string_lossy(),
             &CachedFile {
                 size,
                 mtime_ns: mtime,
@@ -738,13 +788,13 @@ fn validate_name(name: &str) -> Result<()> {
 }
 
 fn mtime_ns(meta: &fs::Metadata) -> i64 {
-    match meta.modified() {
-        Ok(t) => match t.duration_since(UNIX_EPOCH) {
+    // Every supported platform records modification times.
+    meta.modified()
+        .map_or(0, |t| match t.duration_since(UNIX_EPOCH) {
             Ok(d) => d.as_nanos() as i64,
+            // Before 1970.
             Err(e) => -(e.duration().as_nanos() as i64),
-        },
-        Err(_) => 0,
-    }
+        })
 }
 
 fn from_mtime_ns(ns: i64) -> SystemTime {
@@ -823,5 +873,61 @@ mod tests {
             assert!(validate_name(bad).is_err(), "{bad:?} should be rejected");
         }
         validate_name("home/me/file.txt").unwrap();
+    }
+
+    /// Yields zeros, then fails once `left` bytes have been read.
+    struct FailsAfter {
+        left: usize,
+    }
+
+    impl Read for FailsAfter {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.left == 0 {
+                return Err(io::Error::other("disk went away"));
+            }
+            let n = buf.len().min(self.left);
+            buf[..n].fill(0);
+            self.left -= n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn read_errors_skip_the_file_with_a_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut repo = Repository::open(
+            crate::backend::LocalDirBackend::create(tmp.path()).unwrap(),
+            &MasterKey::generate().unwrap(),
+            Index::open_in_memory().unwrap(),
+        );
+        let mut run = BackupRun {
+            repo: &mut repo,
+            writer: PackWriter::default(),
+            stats: BackupStats::default(),
+        };
+        // Fails within the first chunk, then after it.
+        for left in [10, CHUNK_MIN as usize + 100_000] {
+            let stored = run
+                .store_contents(Path::new("/f"), FailsAfter { left }, 0, 0, 0)
+                .unwrap();
+            assert!(stored.is_none());
+        }
+        assert_eq!(run.stats.warnings.len(), 2);
+        assert!(run.stats.warnings[0].contains("disk went away"));
+        assert_eq!(run.stats.files, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_mode_leaves_permissions_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("f");
+        fs::write(&f, b"").unwrap();
+        set_mode(&f, 0o640).unwrap();
+        // Backups made on Windows record no mode.
+        set_mode(&f, 0).unwrap();
+        let mode = fs::metadata(&f).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o640);
     }
 }

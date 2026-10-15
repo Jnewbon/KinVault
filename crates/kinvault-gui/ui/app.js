@@ -577,16 +577,22 @@ function restorableSets() {
   return [...(state.status?.sets || []), ...(state.status?.stopped_sets || [])];
 }
 
+function backupProgressText(progress) {
+  return progress
+    ? `Scanned ${plural(progress.files, "file")} (${bytes(progress.total_bytes)}), read ${bytes(progress.bytes_read)}, sent ${bytes(progress.bytes_uploaded)}`
+    : "Starting…";
+}
+
 function setCard(set) {
   const lines = el("div", { class: "lines" });
   const progress = state.progress[set.id];
   if (set.state === "running") {
-    lines.append(el("div", {}, progress
-      ? `Scanned ${plural(progress.files, "file")} (${bytes(progress.total_bytes)}), read ${bytes(progress.bytes_read)}, sent ${bytes(progress.bytes_uploaded)}`
-      : "Starting…"));
+    lines.append(el("div", { id: `backup-progress-${set.id}` }, backupProgressText(progress)));
     lines.append(el("div", { class: "progress indeterminate" }, el("div")));
   }
-  if (set.state === "pruning" || set.state === "verifying") lines.append(...maintenanceLines(set));
+  if (set.state === "pruning" || set.state === "verifying") {
+    lines.append(el("div", { id: `maintenance-${set.id}` }, ...maintenanceLines(set)));
+  }
   if (set.last_backup) {
     const b = set.last_backup;
     lines.append(el("div", {},
@@ -919,6 +925,24 @@ function restoreCard(job) {
     el("div", { class: "muted small" }, `Into ${job.target}`),
     el("div", { class: "progress" }, el("div", { class: "bar", style: `width:${restorePercent(job)}%` })),
     el("div", { class: "muted small text", style: "margin-top:6px" }, restoreText(job)));
+}
+
+/**
+ * Shows a backup's latest progress without redrawing the page, which would
+ * restart the progress bar's animation on every update.
+ */
+function updateBackupProgress(progress) {
+  const line = document.getElementById(`backup-progress-${progress.set}`);
+  if (line) line.textContent = backupProgressText(progress);
+  else if (state.page === "backups") renderBackups();
+}
+
+/** Shows cleaning up's or checking's latest progress without redrawing the page. */
+function updateMaintenance(setId) {
+  const set = state.status?.sets.find((s) => s.id === setId);
+  const box = document.getElementById(`maintenance-${setId}`);
+  if (set && box) box.replaceChildren(...maintenanceLines(set));
+  else if (state.page === "backups") renderBackups();
 }
 
 /** Shows a restore's latest progress without redrawing the page. */
@@ -1437,11 +1461,11 @@ listen("daemon-event", (e) => {
   switch (ev.event) {
     case "progress":
       state.progress[ev.set] = ev;
-      if (state.page === "backups") renderBackups();
+      updateBackupProgress(ev);
       break;
     case "maintenance_progress":
       noteMaintenance(ev);
-      if (state.page === "backups") renderBackups();
+      updateMaintenance(ev.set);
       break;
     case "backup_finished":
       delete state.progress[ev.set];

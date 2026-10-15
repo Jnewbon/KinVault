@@ -53,3 +53,20 @@ impl From<NetError> for kinvault_core::Error {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codes_and_core_errors_map_across() {
+        let window = NetError::from_code(ErrorCode::OutsideWindow, "closed".into());
+        assert_eq!(window.to_string(), "closed");
+        let internal = NetError::from_code(ErrorCode::Internal, "disk full".into());
+        assert_eq!(internal.to_string(), "remote error: disk full");
+        let core: kinvault_core::Error = NetError::Io(io::Error::other("x")).into();
+        assert!(matches!(core, kinvault_core::Error::Io(_)));
+        let core: kinvault_core::Error = transport("reset").into();
+        assert!(matches!(core, kinvault_core::Error::Backend(m) if m == "connection error: reset"));
+    }
+}

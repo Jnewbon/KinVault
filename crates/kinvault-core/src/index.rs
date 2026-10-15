@@ -66,6 +66,33 @@ impl Index {
         Ok(Self { conn })
     }
 
+    /// Groups the writes that follow into one transaction, until
+    /// [`Self::end_batch`]. Committing each write on its own costs several
+    /// file locks and log writes, which dominates scanning many small files.
+    pub fn begin_batch(&self) -> Result<()> {
+        if self.conn.is_autocommit() {
+            self.conn.execute_batch("BEGIN")?;
+        }
+        Ok(())
+    }
+
+    /// Commits what a batch has written so far and keeps batching.
+    /// Does nothing outside a batch.
+    pub fn commit_batch(&self) -> Result<()> {
+        if !self.conn.is_autocommit() {
+            self.conn.execute_batch("COMMIT; BEGIN")?;
+        }
+        Ok(())
+    }
+
+    /// Commits and ends a batch. Does nothing outside one.
+    pub fn end_batch(&self) -> Result<()> {
+        if !self.conn.is_autocommit() {
+            self.conn.execute_batch("COMMIT")?;
+        }
+        Ok(())
+    }
+
     pub fn known_packs(&self) -> Result<HashSet<PackId>> {
         let mut stmt = self.conn.prepare("SELECT id FROM packs")?;
         let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
@@ -77,7 +104,7 @@ impl Index {
     }
 
     pub fn add_pack(&mut self, pack: &PackId, entries: &[BlobEntry]) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         tx.execute(
             "INSERT OR IGNORE INTO packs (id) VALUES (?1)",
             [&pack.0[..]],
@@ -105,7 +132,7 @@ impl Index {
     }
 
     pub fn remove_pack(&mut self, pack: &PackId) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         tx.execute("DELETE FROM chunks WHERE pack = ?1", [&pack.0[..]])?;
         tx.execute("DELETE FROM packs WHERE id = ?1", [&pack.0[..]])?;
         tx.execute("DELETE FROM verified WHERE pack = ?1", [&pack.0[..]])?;
@@ -264,13 +291,71 @@ impl Index {
         let mut stmt = self.conn.prepare_cached(
             "INSERT OR REPLACE INTO files (path, size, mtime_ns, inode, chunks) VALUES (?1, ?2, ?3, ?4, ?5)",
         )?;
+        let chunks = postcard::to_allocvec(&file.chunks)?;
         stmt.execute(params![
             path,
             file.size as i64,
             file.mtime_ns,
             file.inode as i64,
-            postcard::to_allocvec(&file.chunks)?
+            chunks
         ])?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(id: u8, offset: u64) -> BlobEntry {
+        BlobEntry {
+            id: ChunkId([id; 32]),
+            kind: BlobKind::Data,
+            offset,
+            len: 10,
+        }
+    }
+
+    #[test]
+    fn batches_nest_safely() {
+        let mut index = Index::open_in_memory().unwrap();
+        // Outside a batch, committing does nothing.
+        index.commit_batch().unwrap();
+        index.end_batch().unwrap();
+        index.begin_batch().unwrap();
+        // Already batching: no second transaction.
+        index.begin_batch().unwrap();
+        index.add_pack(&PackId([1; 32]), &[entry(1, 0)]).unwrap();
+        index.commit_batch().unwrap();
+        index.end_batch().unwrap();
+        assert!(index.has_chunk(&ChunkId([1; 32])).unwrap());
+    }
+
+    #[test]
+    fn unknown_entries_are_none() {
+        let index = Index::open_in_memory().unwrap();
+        assert!(index.locate(&ChunkId([9; 32])).unwrap().is_none());
+        assert!(index.cached_file("/nowhere").unwrap().is_none());
+    }
+
+    #[test]
+    fn damaged_rows_are_errors() {
+        let index = Index::open_in_memory().unwrap();
+        index
+            .conn
+            .execute(
+                "INSERT INTO chunks (id, pack, kind, offset, len) VALUES (?1, x'00', 0, 0, -1)",
+                [&[2u8; 32][..]],
+            )
+            .unwrap();
+        assert!(index.locate(&ChunkId([2; 32])).is_err());
+        index
+            .conn
+            .execute(
+                "INSERT INTO files (path, size, mtime_ns, inode, chunks) VALUES ('/f', 'big', 0, 0, x'')",
+                [],
+            )
+            .unwrap();
+        assert!(index.cached_file("/f").is_err());
     }
 }

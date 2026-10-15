@@ -4,6 +4,8 @@
 //! connection, so a dynamic-DNS name keeps working when the IP changes.
 
 use std::fmt;
+use std::future::Future;
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::time::Duration;
@@ -47,7 +49,16 @@ impl HostAddr {
             return vec![SocketAddr::new(ip, port)];
         }
         let lookup = tokio::net::lookup_host((self.host.as_str(), port));
-        match tokio::time::timeout(RESOLVE_TIMEOUT, lookup).await {
+        self.await_lookup(lookup, RESOLVE_TIMEOUT).await
+    }
+
+    /// Waits up to `timeout` for a lookup of this address.
+    async fn await_lookup<I: Iterator<Item = SocketAddr>>(
+        &self,
+        lookup: impl Future<Output = io::Result<I>>,
+        timeout: Duration,
+    ) -> Vec<SocketAddr> {
+        match tokio::time::timeout(timeout, lookup).await {
             Ok(Ok(addrs)) => addrs.collect(),
             Ok(Err(e)) => {
                 tracing::debug!("could not resolve {self}: {e}");
@@ -196,6 +207,8 @@ mod tests {
             "[2001:db8::1",
             "[2001:db8::1]4433",
             "http://example.org",
+            "[2001:db8::1]:0",
+            "a:b:80",
         ] {
             assert!(parse(bad).is_err(), "{bad:?} should be rejected");
         }
@@ -206,7 +219,21 @@ mod tests {
         let h: HostAddr = "example.org".parse().unwrap();
         assert_eq!(h.or_port(1234).to_string(), "example.org:1234");
         let h: HostAddr = "example.org:80".parse().unwrap();
+        assert_eq!(h.port(), Some(80));
         assert_eq!(h.or_port(1234).to_string(), "example.org:80");
+    }
+
+    #[tokio::test]
+    async fn unresolvable_names_give_no_addresses() {
+        let h: HostAddr = "no-such-host.invalid:80".parse().unwrap();
+        assert!(h.resolve().await.is_empty());
+        // Gives up on lookups that take too long.
+        let never = std::future::pending::<io::Result<std::vec::IntoIter<SocketAddr>>>();
+        assert!(
+            h.await_lookup(never, Duration::from_millis(1))
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]

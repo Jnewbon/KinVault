@@ -183,10 +183,8 @@ impl<B: Backend> Repository<B> {
             self.check_cancelled()?;
             let data = self.fetch_pack(pack)?;
             stats.bytes_downloaded += data.len() as u64;
+            // Each chunk is listed under one pack only, so none is copied twice.
             for entry in contents[pack].iter().filter(|e| live.contains(&e.id)) {
-                if writer.contains(&entry.id) {
-                    continue;
-                }
                 let plaintext =
                     pack::decode_blob(&self.keys, &entry.id, pack::blob_bytes(&data, entry)?)?;
                 writer.add(self, entry.id, entry.kind, &plaintext)?;

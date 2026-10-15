@@ -227,4 +227,34 @@ mod tests {
             "3 latest, 7 daily"
         );
     }
+
+    #[test]
+    fn monthly_and_yearly_keep_one_per_period() {
+        const DAY: i64 = 24;
+        // 2024-01-10, 2024-01-20, 2024-02-10, 2025-03-01 (in hours since 1970).
+        let days = [19_732, 19_742, 19_763, 20_148];
+        let s = snaps(&days.map(|d| d * DAY));
+        let monthly = RetentionPolicy {
+            monthly: Some(12),
+            ..Default::default()
+        };
+        assert_eq!(
+            kept_hours(monthly, &s),
+            vec![19_742 * DAY, 19_763 * DAY, 20_148 * DAY]
+        );
+        let yearly = RetentionPolicy {
+            yearly: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(kept_hours(yearly, &s), vec![19_763 * DAY, 20_148 * DAY]);
+        assert!(yearly.select(&[]).is_empty());
+    }
+
+    #[test]
+    fn recommended_policy_uses_every_rule() {
+        assert_eq!(
+            RetentionPolicy::recommended().to_string(),
+            "10 latest, 24 hourly, 14 daily, 8 weekly, 12 monthly, 5 yearly"
+        );
+    }
 }

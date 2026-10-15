@@ -549,10 +549,9 @@ impl ProtocolHandler for Receiver {
 async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> kinvault_core::Result<T> + Send + 'static,
 ) -> Result<T, Failure> {
-    match tokio::task::spawn_blocking(f).await {
-        Ok(Ok(v)) => Ok(v),
-        Ok(Err(kinvault_core::Error::NotFound(m))) => Err((ErrorCode::NotFound, m)),
-        Ok(Err(e)) => Err(internal(e)),
+    match tokio::task::spawn_blocking(f).await.map_err(internal)? {
+        Ok(v) => Ok(v),
+        Err(kinvault_core::Error::NotFound(m)) => Err((ErrorCode::NotFound, m)),
         Err(e) => Err(internal(e)),
     }
 }
@@ -618,4 +617,259 @@ fn schedule_erase(peer_dir: &Path, repo: &str, erase_after_unix: i64) -> io::Res
         to = deleted.join(format!("{name}-{n}"));
     }
     fs::rename(&from, &to)
+}
+
+#[cfg(test)]
+mod tests {
+    use iroh::protocol::Router;
+    use iroh::{Endpoint, EndpointAddr};
+    use kinvault_core::{PackId, SnapshotId};
+    use tokio::runtime::Handle;
+
+    use super::*;
+    use crate::client::{RemoteBackend, pair, redeem_invite};
+    use crate::testutil::{addr_of, encode, local_endpoint, raw_call};
+    use crate::ticket::InviteTicket;
+
+    struct Setup {
+        _tmp: tempfile::TempDir,
+        root: PathBuf,
+        receiver: Receiver,
+        host: Router,
+        ep: Endpoint,
+    }
+
+    /// A host, and a client endpoint it accepts with `grant`.
+    async fn setup(grant: Grant) -> Setup {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("host");
+        let receiver = Receiver::new(&root);
+        let host = crate::serve(local_endpoint().await, receiver.clone());
+        let ep = local_endpoint().await;
+        receiver.allow(ep.id(), grant);
+        Setup {
+            _tmp: tmp,
+            root,
+            receiver,
+            host,
+            ep,
+        }
+    }
+
+    impl Setup {
+        fn addr(&self) -> EndpointAddr {
+            addr_of(&self.host)
+        }
+
+        fn remote(&self, repo: &str) -> Arc<RemoteBackend> {
+            let r = RemoteBackend::new(self.ep.clone(), self.addr(), repo, Handle::current());
+            Arc::new(r.unwrap())
+        }
+
+        fn peer_dir(&self) -> PathBuf {
+            self.root.join(self.ep.id().to_string())
+        }
+
+        async fn raw(&self, repo: &str, op: Op, payload: &[u8]) -> Response {
+            let mut bytes = encode(&Request {
+                repo: repo.into(),
+                op,
+            });
+            bytes.extend_from_slice(payload);
+            raw_call(&self.ep, self.addr(), &bytes).await.unwrap()
+        }
+    }
+
+    async fn blocking_call<T: Send + 'static>(
+        remote: &Arc<RemoteBackend>,
+        f: impl FnOnce(&RemoteBackend) -> T + Send + 'static,
+    ) -> T {
+        let remote = remote.clone();
+        tokio::task::spawn_blocking(move || f(&remote))
+            .await
+            .unwrap()
+    }
+
+    fn is_error(resp: &Response, want: ErrorCode) -> bool {
+        matches!(resp, Response::Error { code, .. } if *code == want)
+    }
+
+    #[tokio::test]
+    async fn grants_keep_their_pacing_when_the_rate_is_unchanged() {
+        let receiver = Receiver::new("/nowhere");
+        assert!(format!("{receiver:?}").contains("/nowhere"));
+        let peer = iroh::SecretKey::generate().public();
+        let grant = Grant {
+            upload_limit: Some(1000),
+            ..Default::default()
+        };
+        receiver.allow(peer, grant);
+        let first = receiver.access(&peer).unwrap().1.unwrap();
+        receiver.allow(peer, grant);
+        assert!(Arc::ptr_eq(
+            &first,
+            &receiver.access(&peer).unwrap().1.unwrap()
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pairing_and_invites_need_a_handler() {
+        let s = setup(Grant::default()).await;
+        let ticket = InviteTicket {
+            host: s.addr(),
+            hosts: Vec::new(),
+            host_name: "host".into(),
+            token: [0; 16],
+            quota_bytes: None,
+            ask_reciprocal: false,
+            expires_unix: i64::MAX,
+        };
+        let err = redeem_invite(&s.ep, &ticket, None, None, Vec::new()).await;
+        assert!(matches!(err, Err(NetError::Denied(_))));
+        let err = pair(&s.ep, s.addr(), "phone".into(), Vec::new()).await;
+        assert!(matches!(err, Err(NetError::Denied(_))));
+
+        let handler: PairHandler = Arc::new(|r: PairRequest| {
+            Box::pin(async move {
+                match r.name.as_str() {
+                    "phone" => Ok("laptop".to_string()),
+                    _ => Err("not confirmed".to_string()),
+                }
+            })
+        });
+        s.receiver.set_pair_handler(handler);
+        let name = pair(&s.ep, s.addr(), "phone".into(), Vec::new()).await;
+        assert_eq!(name.unwrap(), "laptop");
+        let err = pair(&s.ep, s.addr(), "stranger".into(), Vec::new()).await;
+        assert!(matches!(err, Err(NetError::Denied(m)) if m == "not confirmed"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn snapshots_are_stored_listed_and_trashed() {
+        let s = setup(Grant::default()).await;
+        let r = s.remote("repo");
+        let data = b"snapshot".to_vec();
+        let id = SnapshotId(*blake3::hash(&data).as_bytes());
+        let put = data.clone();
+        blocking_call(&r, move |r| r.put_snapshot(&id, &put))
+            .await
+            .unwrap();
+        assert_eq!(
+            blocking_call(&r, |r| r.list_snapshots()).await.unwrap(),
+            [id]
+        );
+        assert_eq!(
+            blocking_call(&r, move |r| r.get_snapshot(&id))
+                .await
+                .unwrap(),
+            data
+        );
+        blocking_call(&r, move |r| r.delete_snapshot(&id))
+            .await
+            .unwrap();
+        assert!(
+            blocking_call(&r, |r| r.list_snapshots())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // The content must match the id.
+        let wrong = SnapshotId([0; 32]);
+        let err = blocking_call(&r, move |r| r.put_snapshot(&wrong, b"other")).await;
+        assert!(err.unwrap_err().to_string().contains("does not match"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn malformed_requests_are_rejected() {
+        let s = setup(Grant::default()).await;
+        let resp = s.raw("../escape", Op::ListPacks, b"").await;
+        assert!(is_error(&resp, ErrorCode::BadRequest), "{resp:?}");
+
+        let id = PackId([1; 32]);
+        let too_big = Op::PutPack {
+            id,
+            len: MAX_OBJECT_LEN + 1,
+        };
+        let resp = s.raw("repo", too_big, b"").await;
+        assert!(is_error(&resp, ErrorCode::BadRequest), "{resp:?}");
+        // Promises more than it sends.
+        let short = Op::PutPack { id, len: 100 };
+        let resp = s.raw("repo", short, b"only ten..").await;
+        assert!(is_error(&resp, ErrorCode::BadRequest), "{resp:?}");
+
+        // Not a request at all: the host gives up on the stream.
+        let garbage = [3, 0, 0, 0, 0xff, 0xff, 0xff];
+        assert!(raw_call(&s.ep, s.addr(), &garbage).await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn short_uploads_are_rejected_when_paced_too() {
+        let s = setup(Grant {
+            upload_limit: Some(1_000_000),
+            ..Default::default()
+        })
+        .await;
+        let short = Op::PutPack {
+            id: PackId([1; 32]),
+            len: 100,
+        };
+        let resp = s.raw("repo", short, b"only ten..").await;
+        assert!(is_error(&resp, ErrorCode::BadRequest), "{resp:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn removing_a_peer_hides_its_repositories() {
+        let s = setup(Grant::default()).await;
+        let data = b"pack".to_vec();
+        let id = PackId(*blake3::hash(&data).as_bytes());
+        let r = s.remote("repo");
+        let put = data.clone();
+        blocking_call(&r, move |r| r.put_pack(&id, &put))
+            .await
+            .unwrap();
+        // One deleted before the peer is removed stays as it is.
+        let old = s.remote("old");
+        blocking_call(&old, move |r| r.put_pack(&id, &data))
+            .await
+            .unwrap();
+        old.delete_repo().await.unwrap();
+        // Deleting a repository that was never used is fine.
+        s.remote("unused").delete_repo().await.unwrap();
+        // Folders that can't be repositories are left alone.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let odd = std::ffi::OsStr::from_bytes(b"\xff");
+            fs::create_dir_all(s.peer_dir().join(odd)).unwrap();
+        }
+        fs::create_dir_all(s.peer_dir().join("not-a-repo")).unwrap();
+
+        let erase_after = s.receiver.remove_peer(&s.ep.id()).await.unwrap();
+        assert!(erase_after > unix_now());
+        assert!(!s.peer_dir().join("repo").exists());
+        let deleted: Vec<_> = read_dirs(&s.peer_dir().join(DELETED_DIR)).unwrap();
+        // "old", then "repo" and "not-a-repo".
+        assert_eq!(deleted.len(), 3);
+        assert!(matches!(r.status().await, Err(NetError::Denied(_))));
+        // Nothing is due yet; stray folders are skipped.
+        assert_eq!(s.receiver.purge_trash(Duration::ZERO).await.unwrap(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn storage_failures_are_internal_errors() {
+        let s = setup(Grant::default()).await;
+        // A file where the peer's folder should be.
+        fs::create_dir_all(&s.root).unwrap();
+        fs::write(s.peer_dir(), b"").unwrap();
+        let r = s.remote("repo");
+        assert!(matches!(r.status().await, Err(NetError::Remote(_))));
+        assert!(s.receiver.usage(&s.ep.id()).await.is_err());
+        let err = blocking_call(&r, |r| r.list_packs()).await.unwrap_err();
+        assert!(err.to_string().contains("internal storage error"));
+
+        // A file where the host's storage should be.
+        let broken = Receiver::new(s.peer_dir());
+        assert!(broken.purge_trash(Duration::ZERO).await.is_err());
+    }
 }

@@ -12,6 +12,8 @@ mod limits;
 pub mod nearby;
 pub mod protocol;
 mod receiver;
+#[cfg(test)]
+mod testutil;
 mod ticket;
 
 pub use client::{RemoteBackend, RemoteStatus, pair, ping, redeem_invite};
@@ -56,4 +58,18 @@ pub fn serve(endpoint: Endpoint, receiver: Receiver) -> Router {
     Router::builder(endpoint)
         .accept(protocol::ALPN, receiver)
         .spawn()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn binds_on_a_random_or_chosen_port() {
+        let ep = bind(SecretKey::generate(), None).await.unwrap();
+        ep.close().await;
+        let ep = bind(SecretKey::generate(), Some(0)).await.unwrap();
+        assert!(!ep.bound_sockets().is_empty());
+        ep.close().await;
+    }
 }

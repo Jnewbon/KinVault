@@ -104,9 +104,7 @@ impl LocalDirBackend {
     }
 
     fn move_to_trash(&self, path: &Path, kind: &str) -> Result<()> {
-        let Some(name) = path.file_name() else {
-            return Ok(());
-        };
+        let name = path.file_name().expect("object paths end in their id");
         let dest_dir = self.root.join("trash").join(kind);
         fs::create_dir_all(&dest_dir)?;
         let dest = dest_dir.join(name);
@@ -148,9 +146,10 @@ impl LocalDirBackend {
 }
 
 fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    fs::create_dir_all(
+        path.parent()
+            .expect("object paths are inside the repository"),
+    )?;
     let tmp = path.with_extension("tmp");
     let mut f = fs::File::create(&tmp)?;
     f.write_all(data)?;
@@ -264,5 +263,131 @@ mod tests {
         assert!(tmp.path().join("trash/packs").join(id.to_hex()).exists());
         assert_eq!(b.purge_trash(Duration::ZERO).unwrap(), 4);
         assert!(!tmp.path().join("trash/packs").join(id.to_hex()).exists());
+
+        let snap = SnapshotId([2; 32]);
+        b.put_snapshot(&snap, b"snapshot").unwrap();
+        b.trash_snapshot(&snap).unwrap();
+        assert!(b.list_snapshots().unwrap().is_empty());
+        assert_eq!(b.purge_trash(Duration::ZERO).unwrap(), 8);
+    }
+
+    #[test]
+    fn open_needs_an_existing_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            LocalDirBackend::open(tmp.path()),
+            Err(Error::NotFound(_))
+        ));
+        LocalDirBackend::create(tmp.path()).unwrap();
+        let b = LocalDirBackend::open(tmp.path()).unwrap();
+        assert_eq!(b.root(), tmp.path());
+    }
+
+    /// Uses the trait's own `get_pack_tail`, which downloads the whole pack.
+    struct WholePacks(LocalDirBackend);
+
+    impl Backend for WholePacks {
+        fn put_pack(&self, id: &PackId, data: &[u8]) -> Result<()> {
+            self.0.put_pack(id, data)
+        }
+        fn get_pack(&self, id: &PackId) -> Result<Vec<u8>> {
+            self.0.get_pack(id)
+        }
+        fn list_packs(&self) -> Result<Vec<PackId>> {
+            self.0.list_packs()
+        }
+        fn delete_pack(&self, id: &PackId) -> Result<()> {
+            self.0.delete_pack(id)
+        }
+        fn put_snapshot(&self, id: &SnapshotId, data: &[u8]) -> Result<()> {
+            self.0.put_snapshot(id, data)
+        }
+        fn get_snapshot(&self, id: &SnapshotId) -> Result<Vec<u8>> {
+            self.0.get_snapshot(id)
+        }
+        fn list_snapshots(&self) -> Result<Vec<SnapshotId>> {
+            self.0.list_snapshots()
+        }
+        fn delete_snapshot(&self, id: &SnapshotId) -> Result<()> {
+            self.0.delete_snapshot(id)
+        }
+    }
+
+    /// Runs every operation of the trait against an empty backend.
+    fn exercise(b: &dyn Backend) {
+        let pack = PackId([3; 32]);
+        b.put_pack(&pack, b"0123456789").unwrap();
+        assert_eq!(b.get_pack(&pack).unwrap(), b"0123456789");
+        assert_eq!(b.get_pack_tail(&pack, 4).unwrap(), (10, b"6789".to_vec()));
+        assert_eq!(
+            b.get_pack_tail(&pack, 100).unwrap(),
+            (10, b"0123456789".to_vec())
+        );
+        assert_eq!(b.list_packs().unwrap(), vec![pack]);
+        b.delete_pack(&pack).unwrap();
+        b.delete_pack(&pack).unwrap();
+        assert!(matches!(b.get_pack(&pack), Err(Error::NotFound(_))));
+        assert!(matches!(b.get_pack_tail(&pack, 4), Err(Error::NotFound(_))));
+
+        let snap = SnapshotId([4; 32]);
+        b.put_snapshot(&snap, b"s").unwrap();
+        assert_eq!(b.get_snapshot(&snap).unwrap(), b"s");
+        assert_eq!(b.list_snapshots().unwrap(), vec![snap]);
+        b.delete_snapshot(&snap).unwrap();
+        assert!(matches!(b.get_snapshot(&snap), Err(Error::NotFound(_))));
+        assert!(b.list_snapshots().unwrap().is_empty());
+    }
+
+    #[test]
+    fn every_backend_shape_behaves_the_same() {
+        let tmp = tempfile::tempdir().unwrap();
+        exercise(&LocalDirBackend::create(tmp.path().join("plain")).unwrap());
+        let boxed: Box<dyn Backend> =
+            Box::new(LocalDirBackend::create(tmp.path().join("boxed")).unwrap());
+        exercise(&boxed);
+        exercise(&WholePacks(
+            LocalDirBackend::create(tmp.path().join("whole")).unwrap(),
+        ));
+    }
+
+    #[test]
+    fn stray_files_are_ignored_when_listing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = LocalDirBackend::create(tmp.path()).unwrap();
+        b.put_pack(&PackId([5; 32]), b"p").unwrap();
+        fs::write(tmp.path().join("packs/README"), b"").unwrap();
+        fs::write(tmp.path().join("packs/05/notes.txt"), b"").unwrap();
+        fs::write(tmp.path().join("snapshots/notes.txt"), b"").unwrap();
+        assert_eq!(b.list_packs().unwrap(), vec![PackId([5; 32])]);
+        assert!(b.list_snapshots().unwrap().is_empty());
+    }
+
+    #[test]
+    fn storage_errors_are_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = LocalDirBackend::create(tmp.path()).unwrap();
+        // A folder where an object should be can't be read or removed.
+        let pack = PackId([6; 32]);
+        fs::create_dir_all(b.pack_path(&pack)).unwrap();
+        assert!(matches!(b.get_pack(&pack), Err(Error::Io(_))));
+        assert!(matches!(b.delete_pack(&pack), Err(Error::Io(_))));
+        // A file where the trash folder should be can't be listed.
+        fs::write(tmp.path().join("trash"), b"").unwrap();
+        assert!(matches!(b.purge_trash(Duration::ZERO), Err(Error::Io(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_pack_is_an_error_not_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let b = LocalDirBackend::create(tmp.path()).unwrap();
+        let pack = PackId([7; 32]);
+        b.put_pack(&pack, b"p").unwrap();
+        let path = b.pack_path(&pack);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        // Root can read anything, so there's nothing to check then.
+        let root = fs::read(&path).is_ok();
+        assert!(root || matches!(b.get_pack_tail(&pack, 1), Err(Error::Io(_))));
     }
 }
