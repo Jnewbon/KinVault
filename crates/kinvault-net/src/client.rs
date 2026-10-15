@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr};
@@ -16,6 +17,10 @@ use crate::protocol::{
 };
 use crate::receiver::InviteAccepted;
 use crate::ticket::InviteTicket;
+
+/// Longest wait for a host to accept a new connection. Dialling a host that
+/// is switched off otherwise keeps looking for it for a long time.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RemoteStatus {
@@ -103,11 +108,13 @@ impl RemoteBackend {
         {
             return Ok(conn.clone());
         }
-        let conn = self
-            .endpoint
-            .connect(with_hosts(self.addr.clone(), &self.hosts).await, ALPN)
-            .await
-            .map_err(transport)?;
+        let conn = connect(
+            &self.endpoint,
+            self.addr.clone(),
+            &self.hosts,
+            CONNECT_TIMEOUT,
+        )
+        .await?;
         *guard = Some(conn.clone());
         Ok(conn)
     }
@@ -185,6 +192,42 @@ async fn call_once(
         _ => None,
     };
     Ok((resp, data))
+}
+
+/// Dials a host, giving up after `timeout`.
+async fn connect(
+    endpoint: &Endpoint,
+    addr: EndpointAddr,
+    hosts: &[String],
+    timeout: Duration,
+) -> Result<Connection, NetError> {
+    let dial = async {
+        endpoint
+            .connect(with_hosts(addr, hosts).await, ALPN)
+            .await
+            .map_err(transport)
+    };
+    tokio::time::timeout(timeout, dial)
+        .await
+        .unwrap_or_else(|_| {
+            Err(NetError::Transport(format!(
+                "no answer within {} s; it may be offline",
+                timeout.as_secs()
+            )))
+        })
+}
+
+/// Checks that a host is online and accepting connections, without asking
+/// it anything. `hosts` are its configured addresses.
+pub async fn ping(
+    endpoint: &Endpoint,
+    addr: EndpointAddr,
+    hosts: &[String],
+    timeout: Duration,
+) -> Result<(), NetError> {
+    let conn = connect(endpoint, addr, hosts, timeout).await?;
+    conn.close(0u32.into(), b"ping");
+    Ok(())
 }
 
 /// Claims an invite on the host it was issued by. On success this peer may

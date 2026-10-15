@@ -629,10 +629,18 @@ async fn main() -> Result<()> {
                     SetState::ChangesPending => "changes pending",
                     SetState::WaitingForWindow => "waiting for its time window",
                     SetState::Paused => "paused",
+                    SetState::WaitingForHost => "waiting for its backup host to come online",
                     SetState::Running => "backing up",
+                    SetState::Pruning => "cleaning up old versions",
+                    SetState::Verifying => "checking its backups",
+                };
+                let online = match set.target_online {
+                    Some(true) => " (online)",
+                    Some(false) => " (offline)",
+                    None => "",
                 };
                 println!(
-                    "\n{} ({state}) -> {}",
+                    "\n{} ({state}) -> {}{online}",
                     set.name,
                     describe_target(&set.target)
                 );
@@ -906,6 +914,31 @@ async fn main() -> Result<()> {
                         format_bytes(total_bytes),
                         format_bytes(bytes_uploaded)
                     ),
+                    Event::MaintenanceProgress {
+                        set,
+                        step,
+                        done,
+                        total,
+                    } => {
+                        use kinvault_daemon::api::MaintenanceStep as S;
+                        let what = match step {
+                            S::Listings => {
+                                format!("reading folder listings, {done} of about {total}")
+                            }
+                            S::Repacking => format!(
+                                "rewriting partly-used data, {} of {}",
+                                format_bytes(done),
+                                format_bytes(total)
+                            ),
+                            S::Deleting => format!("deleting unused data, {done} of {total} packs"),
+                            S::Checking => format!(
+                                "checking data, {} of {}",
+                                format_bytes(done),
+                                format_bytes(total)
+                            ),
+                        };
+                        println!("{}: {what}", name(&set))
+                    }
                     Event::BackupFinished { set, summary } => println!(
                         "{}: backup done, {} changed, uploaded {}",
                         name(&set),
@@ -919,6 +952,11 @@ async fn main() -> Result<()> {
                     Event::PeersChanged => println!("(peers changed)"),
                     Event::NetworkChanged => println!("(network settings changed)"),
                     Event::NearbyChanged => println!("(nearby devices changed)"),
+                    Event::PeerOnline { id, online } => println!(
+                        "backup host {}… is {}",
+                        &id[..id.len().min(16)],
+                        if online { "online" } else { "offline" }
+                    ),
                     Event::RestoreProgress(r) => println!(
                         "restoring {}: {} of {} files, {} of {}",
                         r.set_name,
@@ -1225,8 +1263,16 @@ async fn main() -> Result<()> {
                 println!("no peers yet; invite a friend with `kinvault invite create`");
             }
             for p in peers {
+                let online = match (p.online, p.last_seen_unix) {
+                    (Some(true), _) => "  [online]".to_string(),
+                    (Some(false), Some(t)) => {
+                        format!("  [offline, last seen {}]", format_unix(t))
+                    }
+                    (Some(false), None) => "  [offline]".to_string(),
+                    (None, _) => String::new(),
+                };
                 println!(
-                    "{}  {}{}",
+                    "{}  {}{}{online}",
                     p.name.as_deref().unwrap_or("(unnamed)"),
                     p.id,
                     if p.mine { "  (mine)" } else { "" }

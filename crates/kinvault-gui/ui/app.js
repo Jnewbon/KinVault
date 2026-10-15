@@ -19,6 +19,7 @@ const state = {
   network: null, // NetworkInfo
   nearby: { until_unix: null, devices: [] }, // NearbyStatus
   progress: {}, // set id -> latest Progress event
+  maintenance: {}, // set id -> latest MaintenanceProgress event, plus when its step started
   autostart: false,
   restoreSet: null,
   snapshotsSet: null, // the set whose versions are in `snapshots`
@@ -107,6 +108,25 @@ async function attempt(fn, button) {
 function peerName(id) {
   const p = state.peers.find((p) => p.id === id);
   return p?.name || shortId(id);
+}
+
+/** A green or grey "Online"/"Offline" marker, or null before the host has been checked. */
+function presence(online, lastSeen) {
+  if (online === null || online === undefined) return null;
+  const title = online ? "Reachable now"
+    : lastSeen ? `Last online ${dateTime(lastSeen)}` : "Not reachable since KinVault started";
+  return el("span", { class: "presence", title },
+    el("span", { class: `dot ${online ? "on" : "idle"}` }), online ? "Online" : "Offline");
+}
+
+function peerPresence(p) {
+  return presence(p.online, p.last_seen_unix);
+}
+
+/** " (last online 3 days ago)" for a host that's away, if it was ever seen. */
+function lastOnline(id) {
+  const seen = state.peers.find((p) => p.id === id)?.last_seen_unix;
+  return seen ? ` (last online ${ago(seen)})` : "";
 }
 
 function describeTarget(target) {
@@ -454,9 +474,65 @@ function renderBanner() {
   banner.hidden = false;
 }
 
+/** Backing up, cleaning up or checking: the set's backups are in use. */
+function busy(set) {
+  return ["running", "pruning", "verifying"].includes(set.state);
+}
+
+/** "less than a minute", "12 min", "1.5 h". */
+function duration(seconds) {
+  if (seconds < 60) return "less than a minute";
+  if (seconds < 3600) return `${Math.ceil(seconds / 60)} min`;
+  return `${(seconds / 3600).toFixed(1)} h`;
+}
+
+const MAINTENANCE_STEPS = {
+  pruning: ["listings", "repacking", "deleting"],
+  verifying: ["listings", "checking"],
+};
+
+/** Records a MaintenanceProgress event, remembering when its step started for the time left. */
+function noteMaintenance(ev) {
+  const prev = state.maintenance[ev.set];
+  const sameStep = prev && prev.step === ev.step;
+  state.maintenance[ev.set] = {
+    ...ev,
+    stepStart: sameStep ? prev.stepStart : Date.now(),
+    stepStartDone: sameStep ? prev.stepStartDone : ev.done,
+  };
+}
+
+/** What cleaning up or checking is doing, how far it got, and roughly how long is left. */
+function maintenanceLines(set) {
+  const title = set.state === "pruning" ? "Cleaning up old versions" : "Checking the backups";
+  const m = state.maintenance[set.id];
+  if (!m) return [el("div", {}, `${title}…`), el("div", { class: "progress indeterminate" }, el("div"))];
+  const steps = MAINTENANCE_STEPS[set.state] || [];
+  const n = steps.indexOf(m.step) + 1;
+  const what = {
+    listings: `reading folder listings, ${m.done} of about ${m.total}`,
+    repacking: `rewriting partly-used data, ${bytes(m.done)} of ${bytes(m.total)}`,
+    deleting: `deleting unused data, ${m.done} of ${plural(m.total, "pack")}`,
+    checking: `downloading and checking data, ${bytes(m.done)} of ${bytes(m.total)}`,
+  }[m.step];
+  let left = "";
+  // Listings' total is only an upper bound, so no estimate for it.
+  const elapsed = (Date.now() - m.stepStart) / 1000;
+  const rate = (m.done - m.stepStartDone) / elapsed;
+  if (m.step !== "listings" && elapsed >= 3 && rate > 0) left = ` · about ${duration((m.total - m.done) / rate)} left`;
+  const percent = m.total ? Math.min(100, (100 * m.done) / m.total) : 0;
+  return [
+    el("div", {}, `${title}: ${n ? `step ${n} of ${steps.length}, ` : ""}${what}${left}`),
+    el("div", { class: "progress" }, el("div", { style: `width:${percent.toFixed(1)}%` })),
+  ];
+}
+
 function stateChip(set) {
   if (set.state === "running") return el("span", { class: "chip run" }, "Backing up");
+  if (set.state === "pruning") return el("span", { class: "chip run" }, "Cleaning up");
+  if (set.state === "verifying") return el("span", { class: "chip run" }, "Checking");
   if (set.state === "paused") return el("span", { class: "chip warn" }, "Paused");
+  if (set.state === "waiting_for_host") return el("span", { class: "chip warn" }, "Waiting for destination");
   if (set.last_error) return el("span", { class: "chip bad" }, "Needs attention");
   if (set.last_verify && !set.last_verify.ok) return el("span", { class: "chip bad" }, "Problems found");
   if (set.state === "changes_pending") return el("span", { class: "chip" }, "Changes waiting");
@@ -514,6 +590,9 @@ function setCard(set) {
     lines.append(el("div", { id: `backup-progress-${set.id}` }, backupProgressText(progress)));
     lines.append(el("div", { class: "progress indeterminate" }, el("div")));
   }
+  if (set.state === "pruning" || set.state === "verifying") {
+    lines.append(el("div", { id: `maintenance-${set.id}` }, ...maintenanceLines(set)));
+  }
   if (set.last_backup) {
     const b = set.last_backup;
     lines.append(el("div", {},
@@ -532,7 +611,7 @@ function setCard(set) {
   if (set.excludes?.length) limits.push(`leaves out ${set.excludes.join(", ")}`);
   lines.append(el("div", { class: "muted small" }, limits.join(" · ")));
 
-  const backup = el("button", { class: "btn primary small", disabled: set.state === "running" || set.state === "paused" }, "Back up now");
+  const backup = el("button", { class: "btn primary small", disabled: busy(set) || set.state === "paused" }, "Back up now");
   backup.addEventListener("click", () => attempt(async () => {
     const b = await call("backup_now", { set: set.id });
     toast(`${set.name}: backed up, ${b.files_changed} changed, sent ${bytes(b.bytes_uploaded)}`);
@@ -540,25 +619,30 @@ function setCard(set) {
   const pause = set.state === "paused"
     ? el("button", { class: "btn small", onclick: () => resumeSet(set) }, "Resume")
     : el("button", { class: "btn small", onclick: () => attempt(() => call("pause_set", { set: set.id })) }, "Pause");
-  const check = el("button", { class: "btn small" }, "Check now");
+  const check = el("button", { class: "btn small", disabled: busy(set) }, "Check now");
   check.addEventListener("click", () => attempt(async () => {
     const v = await call("verify", { set: set.id, max_bytes: null });
     if (v.ok) toast(`${set.name}: checked ${bytes(v.bytes_checked)}, all good`);
     else toast(`${set.name}: problems found — ${v.errors.slice(0, 2).join("; ")}`, true);
   }, check));
-  const prune = el("button", { class: "btn small" }, "Clean up old versions");
+  const prune = el("button", { class: "btn small", disabled: busy(set) }, "Clean up old versions");
   prune.addEventListener("click", () => attempt(async () => {
     const p = await call("prune", { set: set.id });
     toast(`${set.name}: removed ${p.snapshots_removed} old version(s), freed about ${bytes(p.bytes_deleted)}`);
   }, prune));
   const more = el("button", { class: "btn small", onclick: () => setSettingsDialog(set) }, "Settings…");
 
+  const offline = set.target.kind === "peer" && set.target_online === false;
   return el("div", { class: "card" },
     el("div", { class: "card-head" }, el("span", { class: "card-title" }, set.name), stateChip(set),
-      el("span", { class: "spacer" }), el("span", { class: "card-sub" }, `→ ${describeTarget(set.target)}`)),
+      el("span", { class: "spacer" }), el("span", { class: "card-sub" }, `→ ${describeTarget(set.target)}`),
+      presence(set.target_online, null)),
     el("div", { class: "paths" }, set.paths.join(" · ")),
     lines,
     set.last_error ? el("div", { class: "notice bad" }, set.last_error) : null,
+    offline ? el("div", { class: "notice warn" },
+      `${peerName(set.target.id)} can't be reached right now${lastOnline(set.target.id)}. `
+      + "Changes are backed up automatically as soon as it's back online.") : null,
     set.state === "paused" ? el("div", { class: "notice warn" }, "Paused: changes aren't being backed up. Restores still work.") : null,
     el("div", { class: "actions" }, backup,
       el("button", { class: "btn small", onclick: () => { state.restoreSet = set.id; go("restore"); } }, "Restore…"),
@@ -666,7 +750,8 @@ async function newSetDialog() {
   const byHosting = (a, b) => !!b.hosts_us - !!a.hosts_us;
   const mine = state.peers.filter((p) => p.mine).sort(byHosting);
   const friends = state.peers.filter((p) => !p.mine).sort(byHosting);
-  const space = (p) => (p.hosts_us ? ` (${p.hosts_us.quota_bytes ? bytes(p.hosts_us.quota_bytes) : "unlimited"})` : "");
+  const space = (p) => (p.hosts_us ? ` (${p.hosts_us.quota_bytes ? bytes(p.hosts_us.quota_bytes) : "unlimited"})` : "")
+    + (p.online === false ? " · offline" : "");
   const options = [
     ...mine.map((p) => [`peer:${p.id}`, `${p.name || shortId(p.id)}${space(p)}`]),
     ["local", "A folder or external drive…"],
@@ -852,6 +937,14 @@ function updateBackupProgress(progress) {
   else if (state.page === "backups") renderBackups();
 }
 
+/** Shows cleaning up's or checking's latest progress without redrawing the page. */
+function updateMaintenance(setId) {
+  const set = state.status?.sets.find((s) => s.id === setId);
+  const box = document.getElementById(`maintenance-${setId}`);
+  if (set && box) box.replaceChildren(...maintenanceLines(set));
+  else if (state.page === "backups") renderBackups();
+}
+
 /** Shows a restore's latest progress without redrawing the page. */
 function updateRestore(job) {
   const jobs = state.status?.restores;
@@ -911,7 +1004,8 @@ function renderFriends() {
     const revoke = p.grant ? el("button", { class: "btn small danger", onclick: () => revokeDialog(p) }, "Stop hosting…") : null;
     const toMine = el("button", { class: "btn small", onclick: () => moveToMineDialog(p) }, "Move to Mine…");
     page.append(el("div", { class: "card" },
-      el("div", { class: "card-head" }, el("span", { class: "card-title" }, p.name || "Unnamed friend"), el("span", { class: "spacer" }),
+      el("div", { class: "card-head" }, el("span", { class: "card-title" }, p.name || "Unnamed friend"), peerPresence(p),
+        el("span", { class: "spacer" }),
         el("span", { class: "mono muted", title: p.id }, shortId(p.id))),
       lines, el("div", { class: "actions" }, edit, toMine, revoke)));
   }
@@ -975,7 +1069,8 @@ function renderMine() {
     const allow = p.grant ? null : el("button", { class: "btn small" }, "Allow to store here");
     allow?.addEventListener("click", () => attempt(() => call("peer_set_mine", { id: p.id, mine: true }), allow));
     page.append(el("div", { class: "card" },
-      el("div", { class: "card-head" }, el("span", { class: "card-title" }, p.name || "Unnamed device"), el("span", { class: "spacer" }),
+      el("div", { class: "card-head" }, el("span", { class: "card-title" }, p.name || "Unnamed device"), peerPresence(p),
+        el("span", { class: "spacer" }),
         el("span", { class: "mono muted", title: p.id }, shortId(p.id))),
       lines, el("div", { class: "actions" }, allow, toFriends, remove),
       using.length ? el("div", { class: "muted small", style: "margin-top:6px" },
@@ -1355,6 +1450,7 @@ async function setConnected(connected) {
     state.network = null;
     state.nearby = { until_unix: null, devices: [] };
     state.progress = {};
+    state.maintenance = {};
   }
   render();
 }
@@ -1367,10 +1463,19 @@ listen("daemon-event", (e) => {
       state.progress[ev.set] = ev;
       updateBackupProgress(ev);
       break;
+    case "maintenance_progress":
+      noteMaintenance(ev);
+      updateMaintenance(ev.set);
+      break;
+    case "backup_finished":
+      delete state.progress[ev.set];
+      refreshSoon();
+      break;
     case "set_state": {
       const set = state.status?.sets.find((s) => s.id === ev.set);
       if (set) set.state = ev.state;
       if (ev.state !== "running") delete state.progress[ev.set];
+      if (ev.state !== "pruning" && ev.state !== "verifying") delete state.maintenance[ev.set];
       render();
       refreshSoon();
       break;
@@ -1384,6 +1489,18 @@ listen("daemon-event", (e) => {
     case "peers_changed":
       refreshPeers();
       break;
+    case "peer_online": {
+      const peer = state.peers.find((p) => p.id === ev.id);
+      if (peer) {
+        peer.online = ev.online;
+        if (ev.online) peer.last_seen_unix = Math.floor(Date.now() / 1000);
+      }
+      for (const set of state.status?.sets || []) {
+        if (set.target.kind === "peer" && set.target.id === ev.id) set.target_online = ev.online;
+      }
+      render();
+      break;
+    }
     case "network_changed":
       refreshNetwork();
       break;

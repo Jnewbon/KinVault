@@ -20,8 +20,8 @@ pub use exclude::Excludes;
 pub use ids::{ChunkId, PackId, SnapshotId};
 pub use index::Index;
 pub use repo::{
-    BackupProgress, BackupStats, ProgressFn, PruneStats, Repository, RestoreProgress, RestoreStats,
-    VerifyReport, snapshot_root_name,
+    BackupProgress, BackupStats, MaintenanceProgress, MaintenanceStep, ProgressFn, PruneStats,
+    Repository, RestoreProgress, RestoreStats, VerifyReport, snapshot_root_name,
 };
 pub use retention::RetentionPolicy;
 pub use snapshot::Snapshot;

@@ -1,12 +1,15 @@
 //! One task per backup set: watches the sources, waits for changes to
 //! settle, then runs an incremental backup. Also rescans periodically (to
 //! catch anything the watcher missed), retries with backoff on failure, and
-//! runs maintenance (prune, verify) when due. Everything that touches the
-//! repository goes through this task, so operations never overlap.
+//! runs maintenance (prune, verify) when due. While the host it backs up to
+//! is offline it waits, and backs up as soon as the host is back. Everything
+//! that touches the repository goes through this task, so operations never
+//! overlap.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -23,6 +26,7 @@ use tokio::time::Instant;
 
 use crate::api::{BackupSummary, Event, PruneSummary, SetState, VerifySummary};
 use crate::config::{SetConfig, StoredTarget, write_private};
+use crate::reachability::{HostTarget, Hosts};
 
 /// A burst of changes never delays a backup by more than this.
 const MAX_CHANGE_DELAY: Duration = Duration::from_secs(10 * 60);
@@ -71,6 +75,7 @@ pub(crate) struct SetEnv {
     pub runtime: Handle,
     pub excludes: Vec<PathBuf>,
     pub events: broadcast::Sender<Event>,
+    pub hosts: Arc<Hosts>,
 }
 
 pub(crate) fn master_key_path(set_dir: &Path) -> PathBuf {
@@ -142,6 +147,20 @@ impl SetEnv {
         Ok(repo)
     }
 
+    /// The host the set backs up to, unless it's a local folder.
+    pub fn host(&self) -> Option<HostTarget> {
+        match &self.set.target {
+            StoredTarget::Peer {
+                id, addrs, hosts, ..
+            } => Some(HostTarget {
+                id: id.clone(),
+                addrs: addrs.clone(),
+                hosts: hosts.clone(),
+            }),
+            StoredTarget::Local { .. } => None,
+        }
+    }
+
     fn last_backup_path(&self) -> PathBuf {
         self.set_dir.join("last_backup.json")
     }
@@ -161,11 +180,20 @@ pub(crate) struct SetHandle {
     pub tx: mpsc::Sender<Trigger>,
     task: JoinHandle<()>,
     repo: RepoSlot,
+    /// Tells an operation under way to stop; see [`Repository::set_cancel`].
+    cancel: Arc<AtomicBool>,
     _watcher: Option<RecommendedWatcher>,
 }
 
 impl SetHandle {
     pub fn start(env: SetEnv) -> Self {
+        Self::start_after(env, None)
+    }
+
+    /// Starts the set's task once `previous` (the same set's old task, e.g.
+    /// before a settings change) has stopped, so two never use the set's
+    /// backups at once.
+    pub fn start_after(env: SetEnv, previous: Option<SetHandle>) -> Self {
         let status = Arc::new(Mutex::new(RunStatus {
             state: if env.set.paused {
                 SetState::Paused
@@ -192,28 +220,45 @@ impl SetHandle {
             start_watcher(&env, tx.clone())
         };
         let repo = RepoSlot::default();
-        let task = tokio::spawn(run(env.clone(), status.clone(), repo.clone(), rx));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let run = run(
+            env.clone(),
+            status.clone(),
+            repo.clone(),
+            cancel.clone(),
+            rx,
+        );
+        let task = tokio::spawn(async move {
+            if let Some(previous) = previous {
+                previous.stop().await;
+            }
+            run.await
+        });
         Self {
             env,
             status,
             tx,
             task,
             repo,
+            cancel,
             _watcher: watcher,
         }
     }
 
     /// Stops the set's task without waiting. An operation already under way
-    /// finishes in the background.
+    /// stops soon after, in the background.
     pub fn abort(self) {
+        self.cancel.store(true, Ordering::Relaxed);
         self.task.abort();
     }
 
     /// Stops the set's task and closes its repository, waiting for an
-    /// operation already under way to finish (aborting doesn't stop it).
-    /// Afterwards nothing holds files in the set's directory open, so it can
-    /// be deleted (Windows refuses while a file in it is open).
+    /// operation already under way to stop (it is cancelled; aborting the
+    /// task alone doesn't stop it). Afterwards nothing holds files in the
+    /// set's directory open, so it can be deleted (Windows refuses while a
+    /// file in it is open).
     pub async fn stop(self) {
+        self.cancel.store(true, Ordering::Relaxed);
         self.task.abort();
         let _ = self.task.await;
         let repo = self.repo;
@@ -280,14 +325,43 @@ fn set_state(env: &SetEnv, status: &Mutex<RunStatus>, state: SetState) {
     }
 }
 
-/// Forwards backup progress to subscribers, at most four times a second.
+/// Forwards maintenance progress to subscribers, at most four times a
+/// second (and always when a step starts or ends).
+fn maintenance_reporter(
+    env: &SetEnv,
+) -> impl FnMut(&kinvault_core::MaintenanceProgress) + Send + use<> {
+    let events = env.events.clone();
+    let set = env.set.id.clone();
+    let mut last: Option<(kinvault_core::MaintenanceStep, std::time::Instant)> = None;
+    move |p| {
+        let edge = p.done == 0 || p.done == p.total;
+        let due = match last {
+            Some((step, at)) => {
+                step != p.step || edge || at.elapsed() >= Duration::from_millis(250)
+            }
+            None => true,
+        };
+        if due {
+            last = Some((p.step, std::time::Instant::now()));
+            let _ = events.send(Event::MaintenanceProgress {
+                set: set.clone(),
+                step: p.step.into(),
+                done: p.done,
+                total: p.total,
+            });
+        }
+    }
+}
+
+/// Forwards backup progress to subscribers, at most four times a second,
+/// and always the final totals once every file has been looked at.
 fn progress_reporter(env: &SetEnv) -> kinvault_core::ProgressFn {
     let events = env.events.clone();
     let set = env.set.id.clone();
     let last = Mutex::new(std::time::Instant::now() - Duration::from_secs(1));
     Arc::new(move |p: &kinvault_core::BackupProgress| {
         let mut last = last.lock().unwrap();
-        if last.elapsed() >= Duration::from_millis(250) {
+        if p.scanned || last.elapsed() >= Duration::from_millis(250) {
             *last = std::time::Instant::now();
             let _ = events.send(Event::Progress {
                 set: set.clone(),
@@ -310,6 +384,7 @@ struct Worker {
     env: SetEnv,
     status: Arc<Mutex<RunStatus>>,
     repo: RepoSlot,
+    cancel: Arc<AtomicBool>,
 }
 
 impl Worker {
@@ -320,12 +395,17 @@ impl Worker {
     ) -> Result<T> {
         let slot = self.repo.clone();
         let env = self.env.clone();
+        let cancel = self.cancel.clone();
         tokio::task::spawn_blocking(move || {
             // Held for the whole operation; see `SetHandle::stop`.
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
             let repo = match &mut *slot {
                 Some(r) => r,
-                empty => empty.insert(env.open_repository()?),
+                empty => {
+                    let mut repo = env.open_repository()?;
+                    repo.set_cancel(Some(cancel));
+                    empty.insert(repo)
+                }
             };
             f(repo)
         })
@@ -372,8 +452,12 @@ impl Worker {
     }
 
     async fn prune(&mut self) -> Result<PruneSummary> {
+        set_state(&self.env, &self.status, SetState::Pruning);
         let policy = self.env.set.retention;
-        let s = self.with_repo(move |repo| Ok(repo.prune(&policy)?)).await?;
+        let mut progress = maintenance_reporter(&self.env);
+        let s = self
+            .with_repo(move |repo| Ok(repo.prune_with_progress(&policy, &mut progress)?))
+            .await?;
         let summary = PruneSummary {
             time_unix: unix_now(),
             snapshots_kept: s.snapshots_kept,
@@ -390,8 +474,10 @@ impl Worker {
     }
 
     async fn verify(&mut self, max_bytes: u64) -> Result<VerifySummary> {
+        set_state(&self.env, &self.status, SetState::Verifying);
+        let mut progress = maintenance_reporter(&self.env);
         let r = self
-            .with_repo(move |repo| Ok(repo.verify(max_bytes)?))
+            .with_repo(move |repo| Ok(repo.verify_with_progress(max_bytes, &mut progress)?))
             .await?;
         let summary = VerifySummary {
             time_unix: unix_now(),
@@ -462,15 +548,19 @@ async fn run(
     env: SetEnv,
     status: Arc<Mutex<RunStatus>>,
     repo: RepoSlot,
+    cancel: Arc<AtomicBool>,
     mut rx: mpsc::Receiver<Trigger>,
 ) {
     let debounce = Duration::from_secs(env.set.debounce_secs);
     let rescan = Duration::from_secs(env.set.rescan_secs);
     let paused = env.set.paused;
+    let host = env.host();
+    let mut host_events = env.events.subscribe();
     let mut worker = Worker {
         env,
         status: status.clone(),
         repo,
+        cancel,
     };
     let mut waiters: Vec<Reply<BackupSummary>> = Vec::new();
     let mut failures = 0u32;
@@ -481,6 +571,7 @@ async fn run(
     let mut change_deadline: Option<Instant> = None;
     let mut first_change: Option<Instant> = None;
     let mut waiting_for_window = false;
+    let mut waiting_for_host = false;
 
     loop {
         set_state(
@@ -492,6 +583,8 @@ async fn run(
                 SetState::ChangesPending
             } else if waiting_for_window {
                 SetState::WaitingForWindow
+            } else if waiting_for_host {
+                SetState::WaitingForHost
             } else {
                 SetState::Idle
             },
@@ -511,12 +604,10 @@ async fn run(
                     true
                 }
                 Some(Trigger::Prune(reply)) => {
-                    set_state(&worker.env, &status, SetState::Running);
                     let _ = reply.send(worker.prune().await.map_err(|e| format!("{e:#}")));
                     false
                 }
                 Some(Trigger::Verify(max_bytes, reply)) => {
-                    set_state(&worker.env, &status, SetState::Running);
                     let result = worker.verify(max_bytes).await;
                     if matches!(&result, Ok(v) if !v.ok) && !paused {
                         scheduled = Instant::now();
@@ -525,6 +616,21 @@ async fn run(
                     false
                 }
             },
+            ev = host_events.recv(), if host.is_some() => {
+                let id = host.as_ref().map(|h| h.id.as_str()).unwrap_or_default();
+                let back = match ev {
+                    Ok(Event::PeerOnline { id: peer, online }) => online && peer == id,
+                    // Missed events; it may have come back meanwhile.
+                    Err(broadcast::error::RecvError::Lagged(_)) => !worker.env.hosts.is_offline(id),
+                    _ => false,
+                };
+                // Back up now rather than at the next retry.
+                if back && (waiting_for_host || failures > 0) && !paused {
+                    waiting_for_host = false;
+                    scheduled = Instant::now();
+                }
+                false
+            }
             _ = tokio::time::sleep_until(next) => true,
         };
         if !run_now {
@@ -544,12 +650,26 @@ async fn run(
             }
         }
         waiting_for_window = false;
+        // Don't keep dialling a host that is known to be away; it is checked
+        // regularly and we hear when it's back. Explicit requests still try.
+        if waiters.is_empty()
+            && let Some(h) = &host
+            && worker.env.hosts.is_offline(&h.id)
+        {
+            waiting_for_host = true;
+            scheduled = Instant::now() + MAX_RETRY_DELAY;
+            continue;
+        }
+        waiting_for_host = false;
         set_state(&worker.env, &status, SetState::Running);
 
         let result = worker.backup().await;
         match result {
             Ok(summary) => {
                 failures = 0;
+                if let Some(h) = &host {
+                    worker.env.hosts.record(&h.id, true);
+                }
                 scheduled = if paused { far } else { Instant::now() + rescan };
                 tracing::info!(
                     set = %worker.env.set.name,
@@ -578,18 +698,36 @@ async fn run(
                 }
             }
             Err(e) => {
-                let msg = format!("{e:#}");
-                if !paused {
+                let mut msg = format!("{e:#}");
+                // A host that went away isn't a problem to report: wait for it.
+                let offline = match &host {
+                    Some(h) => !worker.env.hosts.check(&worker.env.endpoint, h).await,
+                    None => false,
+                };
+                if offline {
+                    msg = format!(
+                        "the backup host can't be reached right now; \
+                         backing up resumes once it's online ({msg})"
+                    );
+                    if !paused {
+                        waiting_for_host = true;
+                        scheduled = Instant::now() + MAX_RETRY_DELAY;
+                        tracing::info!(set = %worker.env.set.name, "backup host is offline; waiting for it");
+                        status.lock().unwrap().last_error = None;
+                    }
+                } else if !paused {
                     failures += 1;
                     let delay = retry_delay(failures);
                     scheduled = Instant::now() + delay;
                     tracing::warn!(set = %worker.env.set.name, "backup failed (retrying in {}s): {msg}", delay.as_secs());
                     status.lock().unwrap().last_error = Some(msg.clone());
                 }
-                let _ = worker.env.events.send(Event::BackupFailed {
-                    set: worker.env.set.id.clone(),
-                    error: msg.clone(),
-                });
+                if !offline {
+                    let _ = worker.env.events.send(Event::BackupFailed {
+                        set: worker.env.set.id.clone(),
+                        error: msg.clone(),
+                    });
+                }
                 for w in waiters.drain(..) {
                     let _ = w.send(Err(msg.clone()));
                 }

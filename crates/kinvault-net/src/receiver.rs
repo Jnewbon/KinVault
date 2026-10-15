@@ -836,8 +836,9 @@ mod tests {
         old.delete_repo().await.unwrap();
         // Deleting a repository that was never used is fine.
         s.remote("unused").delete_repo().await.unwrap();
-        // Folders that can't be repositories are left alone.
-        #[cfg(unix)]
+        // Folders that can't be repositories are left alone. (macOS refuses
+        // names that aren't UTF-8.)
+        #[cfg(target_os = "linux")]
         {
             use std::os::unix::ffi::OsStrExt;
             let odd = std::ffi::OsStr::from_bytes(b"\xff");

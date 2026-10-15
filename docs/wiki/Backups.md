@@ -40,8 +40,21 @@ until things have been quiet for 30 seconds (change with `--debounce
 <seconds>`), then backs up only what changed. A steady stream of changes never
 holds a backup off for more than 10 minutes.
 
-If a backup fails (the destination is offline, for example) it's retried
-automatically, waiting longer each time, up to 30 minutes between attempts.
+If a backup fails it's retried automatically, waiting longer each time, up
+to 30 minutes between attempts.
+
+## Destinations that aren't always on
+
+A friend's computer or one of your own devices won't always be switched on.
+KinVault checks every couple of minutes whether each computer that keeps your
+backups can be reached, and shows it as **Online** or **Offline** next to the
+backup, and on the Friends and Mine pages (`kinvault peer list` and
+`kinvault status` show it too).
+
+While a destination is offline, its backups show **Waiting for destination**
+instead of failing over and over. Changes keep being noticed, and are backed up
+as soon as it's reachable again; there's nothing to do. **Back up now** still
+tries straight away.
 
 To back up right away: **Back up now** in the app, or
 
@@ -58,7 +71,10 @@ This runs even outside the backup's hours (below) and waits until it's done.
 | Up to date | Everything is backed up |
 | Changes waiting | Changes noticed, backing up shortly |
 | Backing up | A backup is running |
+| Cleaning up | Removing old versions it no longer keeps; shows how far it got and roughly how long is left |
+| Checking | Checking the stored backups are complete and intact; shows progress the same way |
 | Waiting for its hours | Changes are waiting for the backup's time window |
+| Waiting for destination | The computer it backs up to is offline; it backs up when it's back |
 | Not backed up yet | No backup has finished yet |
 | Paused | Automatic backups are off |
 | Needs attention | The last backup failed; see its message |

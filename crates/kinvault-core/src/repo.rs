@@ -3,6 +3,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fastcdc::v2020::StreamCDC;
@@ -17,7 +18,7 @@ use crate::pack::{self, BlobKind, PackBuilder};
 use crate::snapshot::{self, Node, NodeKind, Snapshot, Tree};
 
 mod maintenance;
-pub use maintenance::{PruneStats, VerifyReport};
+pub use maintenance::{MaintenanceProgress, MaintenanceStep, PruneStats, VerifyReport};
 
 const CHUNK_MIN: u32 = 256 * 1024;
 const CHUNK_AVG: u32 = 1024 * 1024;
@@ -32,6 +33,8 @@ pub struct BackupProgress {
     pub total_bytes: u64,
     pub bytes_read: u64,
     pub bytes_uploaded: u64,
+    /// Every file has been looked at: `files` and `total_bytes` are final.
+    pub scanned: bool,
 }
 
 pub type ProgressFn = Arc<dyn Fn(&BackupProgress) + Send + Sync>;
@@ -77,6 +80,7 @@ pub struct Repository<B: Backend> {
     excludes: Vec<PathBuf>,
     exclude_patterns: Excludes,
     progress: Option<ProgressFn>,
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl<B: Backend> Repository<B> {
@@ -89,6 +93,7 @@ impl<B: Backend> Repository<B> {
             excludes: Vec::new(),
             exclude_patterns: Excludes::default(),
             progress: None,
+            cancel: None,
         }
     }
 
@@ -99,6 +104,20 @@ impl<B: Backend> Repository<B> {
     /// Called after each file during backups; keep it cheap.
     pub fn set_progress(&mut self, progress: Option<ProgressFn>) {
         self.progress = progress;
+    }
+
+    /// Once `flag` is set, a running backup, prune or verify stops soon with
+    /// [`Error::Cancelled`], leaving the repository consistent: data already
+    /// stored is reused next time.
+    pub fn set_cancel(&mut self, flag: Option<Arc<AtomicBool>>) {
+        self.cancel = flag;
+    }
+
+    fn check_cancelled(&self) -> Result<()> {
+        match &self.cancel {
+            Some(flag) if flag.load(Ordering::Relaxed) => Err(Error::Cancelled),
+            _ => Ok(()),
+        }
     }
 
     /// Absolute paths (and everything below them) to leave out of backups.
@@ -225,6 +244,7 @@ impl<B: Backend> Repository<B> {
         nodes.sort_by(|a, b| a.name.cmp(&b.name));
         let root = run.store_tree(Tree { nodes })?;
         run.flush()?;
+        run.report_progress(true);
         Ok((root, paths, run.stats))
     }
 
@@ -547,13 +567,14 @@ impl<B: Backend> BackupRun<'_, B> {
         Ok(())
     }
 
-    fn report_progress(&self) {
+    fn report_progress(&self, scanned: bool) {
         if let Some(progress) = &self.repo.progress {
             progress(&BackupProgress {
                 files: self.stats.files,
                 total_bytes: self.stats.total_bytes,
                 bytes_read: self.stats.bytes_read,
                 bytes_uploaded: self.writer.bytes,
+                scanned,
             });
         }
     }
@@ -571,12 +592,16 @@ impl<B: Backend> BackupRun<'_, B> {
         name: String,
         entry: Option<&fs::DirEntry>,
     ) -> Result<Option<Node>> {
+        self.repo.check_cancelled()?;
         if self.repo.excludes.iter().any(|e| path.starts_with(e)) {
             return Ok(None);
         }
-        // A listing's entry doesn't follow symlinks either, and on Windows
-        // already holds the metadata, saving an open of every file.
-        let meta = match entry.map_or_else(|| fs::symlink_metadata(path), |e| e.metadata()) {
+        // A listing's entry doesn't follow symlinks either. On Windows it
+        // holds the metadata the listing saw, which can be out of date for a
+        // file written moments ago, and a stale size or time could hide a
+        // change, so ask the file itself there.
+        let listed = entry.filter(|_| cfg!(unix));
+        let meta = match listed.map_or_else(|| fs::symlink_metadata(path), |e| e.metadata()) {
             Ok(m) => m,
             Err(e) => {
                 self.warn(path, e);
@@ -657,7 +682,7 @@ impl<B: Backend> BackupRun<'_, B> {
         {
             self.stats.files += 1;
             self.stats.total_bytes += size;
-            self.report_progress();
+            self.report_progress(false);
             return Ok(Some(NodeKind::File {
                 size,
                 chunks: cached.chunks,
@@ -712,6 +737,7 @@ impl<B: Backend> BackupRun<'_, B> {
                         return Ok(None);
                     }
                 };
+                self.repo.check_cancelled()?;
                 read += chunk.length as u64;
                 chunks.push(self.store_blob(BlobKind::Data, &chunk.data)?);
             }
@@ -719,8 +745,8 @@ impl<B: Backend> BackupRun<'_, B> {
         self.stats.files += 1;
         self.stats.files_changed += 1;
         self.stats.bytes_read += read;
-        self.report_progress();
         self.stats.total_bytes += read;
+        self.report_progress(false);
         // Cache keyed on the metadata seen *before* reading, so a file modified
         // mid-read gets a new mtime and is re-read next time.
         self.repo.index.put_cached_file(

@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 
 use crate::api::{self, Event, GrantSpec, HostOffer, Reply, Request};
 use crate::config::{Config, PendingInvite, SetConfig, StoppedSet, StoredTarget};
+use crate::reachability::{HostTarget, Hosts, ReachabilityOptions};
 mod deletion;
 mod nearby;
 mod restores;
@@ -44,6 +45,8 @@ pub struct DaemonOptions {
     pub endpoint: Option<Endpoint>,
     /// Where to look for the user's other devices on the local network.
     pub nearby: kinvault_net::nearby::NearbyOptions,
+    /// How often backup hosts are checked for being online.
+    pub reachability: ReachabilityOptions,
 }
 
 #[derive(Clone)]
@@ -74,6 +77,10 @@ struct Inner {
     wake_deletions: Arc<tokio::sync::Notify>,
     /// Stopped sets whose worker is still closing its files, by set id.
     closing: std::sync::Mutex<HashMap<String, JoinHandle<()>>>,
+    /// Which backup hosts are online.
+    hosts: Arc<Hosts>,
+    /// Checks the hosts early (one was added or a set moved).
+    wake_hosts: Arc<tokio::sync::Notify>,
 }
 
 fn unix_now() -> i64 {
@@ -110,6 +117,12 @@ impl Daemon {
             }
         }
         let router = kinvault_net::serve(endpoint.clone(), receiver.clone());
+        let events = broadcast::channel(256).0;
+        let hosts = Arc::new(Hosts::new(
+            state_dir.join("hosts-seen.json"),
+            events.clone(),
+            opts.reachability,
+        ));
 
         let daemon = Self {
             inner: Arc::new(Inner {
@@ -123,13 +136,15 @@ impl Daemon {
                 sets: Mutex::new(HashMap::new()),
                 config: Mutex::new(config.clone()),
                 background: Default::default(),
-                events: broadcast::channel(256).0,
+                events,
                 nearby_opts: opts.nearby,
                 nearby: Default::default(),
                 restores: Default::default(),
                 wake_purge: Default::default(),
                 wake_deletions: Default::default(),
                 closing: Default::default(),
+                hosts,
+                wake_hosts: Default::default(),
             }),
         };
 
@@ -189,6 +204,22 @@ impl Daemon {
             }
         });
         daemon.inner.background.lock().unwrap().push(deletions);
+
+        // Keep checking which backup hosts are online.
+        let weak = Arc::downgrade(&daemon.inner);
+        let wake = daemon.inner.wake_hosts.clone();
+        let interval = opts.reachability.interval;
+        let reachability = tokio::spawn(async move {
+            loop {
+                let Some(inner) = weak.upgrade() else { return };
+                (Daemon { inner }).check_hosts().await;
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {}
+                    _ = wake.notified() => {}
+                }
+            }
+        });
+        daemon.inner.background.lock().unwrap().push(reachability);
 
         // Stopped sets used to keep their key in removed-sets/<id>.
         for stopped in &config.stopped_sets {
@@ -261,6 +292,7 @@ impl Daemon {
             runtime: self.inner.runtime.clone(),
             excludes,
             events: self.inner.events.clone(),
+            hosts: self.inner.hosts.clone(),
         }
     }
 
@@ -322,6 +354,10 @@ impl Daemon {
         if result.is_ok()
             && let Some(event) = event
         {
+            if matches!(event, Event::SetsChanged | Event::PeersChanged) {
+                // A host may have started or stopped keeping backups.
+                self.inner.wake_hosts.notify_one();
+            }
             self.notify(event);
         }
         result
@@ -539,6 +575,7 @@ impl Daemon {
             }
             Request::PeerList => {
                 let peers = self.inner.config.lock().await.peers.clone();
+                let hosts = &self.inner.hosts;
                 let mut out = Vec::with_capacity(peers.len());
                 for p in peers {
                     // Also for peers no longer allowed here: what they left is still stored.
@@ -551,7 +588,10 @@ impl Daemon {
                             .unwrap_or_default(),
                         _ => Default::default(),
                     };
+                    let reach = hosts.get(&p.id);
                     out.push(api::PeerInfo {
+                        online: reach.online,
+                        last_seen_unix: reach.last_seen_unix,
                         id: p.id,
                         name: p.name,
                         grant: p.grant,
@@ -725,10 +765,10 @@ impl Daemon {
         let updated = entry.clone();
         config.save(&self.config_path())?;
         let mut sets = self.inner.sets.lock().await;
-        if let Some(old) = sets.remove(&id) {
-            old.abort();
-        }
-        sets.insert(id, SetHandle::start(self.set_env(updated)));
+        // The old worker's operation is cancelled, and the new one starts
+        // once it has stopped.
+        let old = sets.remove(&id);
+        sets.insert(id, SetHandle::start_after(self.set_env(updated), old));
         Ok(Reply::Done)
     }
 
@@ -755,6 +795,10 @@ impl Daemon {
                     retention: h.env.set.retention,
                     excludes: h.env.set.excludes.clone(),
                     state: st.state,
+                    target_online: match &h.env.set.target {
+                        StoredTarget::Peer { id, .. } => self.inner.hosts.get(id).online,
+                        StoredTarget::Local { .. } => None,
+                    },
                     last_backup: st.last_backup,
                     last_error: st.last_error,
                     last_prune: st.maintenance.last_prune,
@@ -791,6 +835,58 @@ impl Daemon {
             keep_deleted_days,
             restores: self.restore_jobs(),
         }))
+    }
+
+    /// Hosts that keep, or have agreed to keep, this instance's backups.
+    async fn host_targets(&self) -> Vec<HostTarget> {
+        let config = self.inner.config.lock().await;
+        let mut targets: Vec<HostTarget> = Vec::new();
+        let sets = config
+            .sets
+            .iter()
+            .chain(config.stopped_sets.iter().map(|s| &s.set));
+        for set in sets {
+            let StoredTarget::Peer {
+                id, addrs, hosts, ..
+            } = &set.target
+            else {
+                continue;
+            };
+            match targets.iter_mut().find(|t| t.id == *id) {
+                Some(t) => t.add(addrs, hosts),
+                None => targets.push(HostTarget {
+                    id: id.clone(),
+                    addrs: addrs.clone(),
+                    hosts: hosts.clone(),
+                }),
+            }
+        }
+        for peer in &config.peers {
+            match targets.iter_mut().find(|t| t.id == peer.id) {
+                Some(t) => t.add(&peer.addrs, &peer.hosts),
+                None if peer.hosts_us.is_some() => targets.push(HostTarget {
+                    id: peer.id.clone(),
+                    addrs: peer.addrs.clone(),
+                    hosts: peer.hosts.clone(),
+                }),
+                None => {}
+            }
+        }
+        targets
+    }
+
+    /// Checks every backup host at once and records which are online.
+    async fn check_hosts(&self) {
+        let targets = self.host_targets().await;
+        let hosts = &self.inner.hosts;
+        hosts.retain(|id| targets.iter().any(|t| t.id == id));
+        let mut checks = tokio::task::JoinSet::new();
+        for target in targets {
+            let hosts = hosts.clone();
+            let endpoint = self.inner.endpoint.clone();
+            checks.spawn(async move { hosts.check(&endpoint, &target).await });
+        }
+        checks.join_all().await;
     }
 
     async fn network(&self) -> Result<Reply> {

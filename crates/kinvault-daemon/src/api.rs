@@ -329,6 +329,15 @@ pub enum Event {
         bytes_read: u64,
         bytes_uploaded: u64,
     },
+    /// How far cleaning up old versions or checking the backups got.
+    MaintenanceProgress {
+        set: String,
+        step: MaintenanceStep,
+        /// Done and total in this step: bytes for `Repacking` and
+        /// `Checking`, otherwise items.
+        done: u64,
+        total: u64,
+    },
     BackupFinished {
         set: String,
         summary: BackupSummary,
@@ -343,6 +352,11 @@ pub enum Event {
     PeersChanged,
     /// The listening port or public addresses changed.
     NetworkChanged,
+    /// A host that keeps backups went offline or came back online.
+    PeerOnline {
+        id: String,
+        online: bool,
+    },
     /// Finding nearby devices started or stopped, or found or paired one.
     NearbyChanged,
     /// A background restore started or made progress.
@@ -408,6 +422,10 @@ pub struct SetStatus {
     #[serde(default)]
     pub excludes: Vec<String>,
     pub state: SetState,
+    /// Whether the host it backs up to is reachable; `None` for a local
+    /// folder or a host not checked yet.
+    #[serde(default)]
+    pub target_online: Option<bool>,
     pub last_backup: Option<BackupSummary>,
     pub last_error: Option<String>,
     pub last_prune: Option<PruneSummary>,
@@ -436,7 +454,41 @@ pub enum SetState {
     WaitingForWindow,
     /// Not backing up automatically (e.g. restored from a recovery kit).
     Paused,
+    /// The host it backs up to can't be reached; will back up when it's back.
+    WaitingForHost,
     Running,
+    /// Removing old versions the retention policy doesn't keep.
+    Pruning,
+    /// Checking the backups are complete and intact.
+    Verifying,
+}
+
+/// A step of cleaning up (`Listings`, `Repacking`, `Deleting`) or checking
+/// (`Listings`, `Checking`).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceStep {
+    /// Reading the folder listings of every version. The total counts every
+    /// listing stored, so the step may end short of it.
+    Listings,
+    /// Rewriting partly-used data so the unused part can be freed.
+    Repacking,
+    /// Deleting data no version uses any more.
+    Deleting,
+    /// Downloading and decrypting data to check it.
+    Checking,
+}
+
+impl From<kinvault_core::MaintenanceStep> for MaintenanceStep {
+    fn from(step: kinvault_core::MaintenanceStep) -> Self {
+        use kinvault_core::MaintenanceStep as S;
+        match step {
+            S::Listings => Self::Listings,
+            S::Repacking => Self::Repacking,
+            S::Deleting => Self::Deleting,
+            S::Checking => Self::Checking,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -507,6 +559,13 @@ pub struct PeerInfo {
     pub hosts_us: Option<HostOffer>,
     /// One of this user's own devices rather than a friend's.
     pub mine: bool,
+    /// Whether it's reachable, for hosts that keep (or may keep) our
+    /// backups; `None` for other peers and before the first check.
+    #[serde(default)]
+    pub online: Option<bool>,
+    /// When it was last reachable (Unix seconds).
+    #[serde(default)]
+    pub last_seen_unix: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]

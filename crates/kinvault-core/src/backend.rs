@@ -371,8 +371,10 @@ mod tests {
         fs::create_dir_all(b.pack_path(&pack)).unwrap();
         assert!(matches!(b.get_pack(&pack), Err(Error::Io(_))));
         assert!(matches!(b.delete_pack(&pack), Err(Error::Io(_))));
-        // A file where the trash folder should be can't be listed.
-        fs::write(tmp.path().join("trash"), b"").unwrap();
+        // A file where a trash folder should be can't be listed. (One level
+        // down: on Windows a path below a file is just "not found".)
+        fs::create_dir_all(tmp.path().join("trash")).unwrap();
+        fs::write(tmp.path().join("trash/packs"), b"").unwrap();
         assert!(matches!(b.purge_trash(Duration::ZERO), Err(Error::Io(_))));
     }
 
