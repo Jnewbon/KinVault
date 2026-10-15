@@ -14,7 +14,7 @@ pub mod protocol;
 mod receiver;
 mod ticket;
 
-pub use client::{RemoteBackend, RemoteStatus, pair, redeem_invite};
+pub use client::{RemoteBackend, RemoteStatus, pair, ping, redeem_invite};
 pub use error::NetError;
 pub use hosts::{HostAddr, InvalidHostAddr, with_hosts};
 pub use identity::load_or_create_secret;

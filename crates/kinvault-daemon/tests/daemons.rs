@@ -7,17 +7,21 @@ use std::time::Duration;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, SecretKey};
 use kinvault_daemon::api::{
-    BackupSummary, CreateInvite, CreateSet, GrantSpec, HostOffer, NearbyState, NearbyStatus,
+    BackupSummary, CreateInvite, CreateSet, Event, GrantSpec, HostOffer, NearbyState, NearbyStatus,
     NetworkSettings, Reply, Request, SetState, SetStatus, Target, TimeWindow,
 };
-use kinvault_daemon::{Daemon, DaemonOptions, ipc};
+use kinvault_daemon::{Daemon, DaemonOptions, ReachabilityOptions, ipc};
 use kinvault_net::nearby::NearbyOptions;
 
 async fn local_endpoint(secret: SecretKey) -> Endpoint {
+    local_endpoint_on(secret, 0).await
+}
+
+async fn local_endpoint_on(secret: SecretKey, port: u16) -> Endpoint {
     Endpoint::builder(presets::Minimal)
         .secret_key(secret)
         .clear_ip_transports()
-        .bind_addr("127.0.0.1:0")
+        .bind_addr(("127.0.0.1", port))
         .unwrap()
         .bind()
         .await
@@ -29,10 +33,19 @@ async fn start(state: &Path, secret: SecretKey) -> Daemon {
 }
 
 async fn start_with_nearby(state: &Path, secret: SecretKey, nearby: NearbyOptions) -> Daemon {
+    start_with_endpoint(state, local_endpoint(secret).await, nearby).await
+}
+
+async fn start_with_endpoint(state: &Path, endpoint: Endpoint, nearby: NearbyOptions) -> Daemon {
     Daemon::start(DaemonOptions {
         state_dir: state.to_path_buf(),
-        endpoint: Some(local_endpoint(secret).await),
+        endpoint: Some(endpoint),
         nearby,
+        // Check hosts often, so tests see them come and go quickly.
+        reachability: ReachabilityOptions {
+            interval: Duration::from_millis(500),
+            timeout: Duration::from_secs(2),
+        },
     })
     .await
     .unwrap()
@@ -1632,4 +1645,87 @@ async fn excluded_files_are_left_out_and_dont_trigger_backups() {
     fs::write(repo.join("src/main.rs"), b"fn main() { println!(); }").unwrap();
     let second = wait_for_backup(&pc, Some(&first.snapshot)).await;
     assert_eq!(second.files, 2, "src/main.rs and notes.log: {second:?}");
+}
+
+/// Polls until the set's status satisfies `ok`.
+async fn wait_for_set(d: &Daemon, ok: impl Fn(&SetStatus) -> bool) -> SetStatus {
+    for _ in 0..300 {
+        let st = set_status(d).await;
+        if ok(&st) {
+            return st;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("set never got there; status: {:?}", set_status(d).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sets_wait_for_an_offline_host_and_back_up_when_it_returns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("documents");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("notes.md"), b"# notes").unwrap();
+    let host_state = tmp.path().join("host-state");
+    let host_secret = SecretKey::generate();
+    // A fixed port, so the host can come back where the PC expects it.
+    let port = free_udp_port();
+    let start_host = || async {
+        let endpoint = local_endpoint_on(host_secret.clone(), port).await;
+        start_with_endpoint(&host_state, endpoint, Default::default()).await
+    };
+    let host = start_host().await;
+    let pc = start(&tmp.path().join("pc-state"), SecretKey::generate()).await;
+    call(
+        &host,
+        Request::PeerAllow {
+            id: pc.id().to_string(),
+            name: Some("pc".into()),
+            grant: GrantSpec::default(),
+        },
+    )
+    .await;
+    let target = Target::Peer {
+        id: host.id().to_string(),
+        addrs: vec![([127, 0, 0, 1], port).into()],
+    };
+    call(&pc, create_set("docs", &src, target)).await;
+    let first = wait_for_backup(&pc, None).await;
+    wait_for_set(&pc, |s| s.target_online == Some(true)).await;
+
+    // The host is switched off: the PC notices, and a change waits for it
+    // rather than failing.
+    let mut events = pc.subscribe();
+    host.shutdown().await;
+    drop(host);
+    wait_for_set(&pc, |s| s.target_online == Some(false)).await;
+    fs::write(
+        src.join("notes.md"),
+        b"# notes\nwritten while the host was away",
+    )
+    .unwrap();
+    let waiting = wait_for_set(&pc, |s| s.state == SetState::WaitingForHost).await;
+    assert!(waiting.last_error.is_none(), "{waiting:?}");
+    assert_eq!(waiting.last_backup.unwrap().snapshot, first.snapshot);
+
+    // Back on: the change is backed up without waiting for a retry.
+    let host = start_host().await;
+    let second = wait_for_backup(&pc, Some(&first.snapshot)).await;
+    assert_eq!(second.files_changed, 1);
+    let st = wait_for_set(&pc, |s| s.state == SetState::Idle).await;
+    assert_eq!(st.target_online, Some(true));
+    assert!(st.last_error.is_none(), "{st:?}");
+
+    // Subscribers heard it go and come back, and no failure was reported.
+    let mut seen = Vec::new();
+    while let Ok(ev) = events.try_recv() {
+        match ev {
+            Event::PeerOnline { online, .. } => seen.push(online),
+            Event::BackupFailed { error, .. } => panic!("reported a failure: {error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(seen, [false, true]);
+
+    pc.shutdown().await;
+    host.shutdown().await;
 }

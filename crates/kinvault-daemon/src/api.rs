@@ -343,6 +343,11 @@ pub enum Event {
     PeersChanged,
     /// The listening port or public addresses changed.
     NetworkChanged,
+    /// A host that keeps backups went offline or came back online.
+    PeerOnline {
+        id: String,
+        online: bool,
+    },
     /// Finding nearby devices started or stopped, or found or paired one.
     NearbyChanged,
     /// A background restore started or made progress.
@@ -408,6 +413,10 @@ pub struct SetStatus {
     #[serde(default)]
     pub excludes: Vec<String>,
     pub state: SetState,
+    /// Whether the host it backs up to is reachable; `None` for a local
+    /// folder or a host not checked yet.
+    #[serde(default)]
+    pub target_online: Option<bool>,
     pub last_backup: Option<BackupSummary>,
     pub last_error: Option<String>,
     pub last_prune: Option<PruneSummary>,
@@ -436,6 +445,8 @@ pub enum SetState {
     WaitingForWindow,
     /// Not backing up automatically (e.g. restored from a recovery kit).
     Paused,
+    /// The host it backs up to can't be reached; will back up when it's back.
+    WaitingForHost,
     Running,
 }
 
@@ -507,6 +518,13 @@ pub struct PeerInfo {
     pub hosts_us: Option<HostOffer>,
     /// One of this user's own devices rather than a friend's.
     pub mine: bool,
+    /// Whether it's reachable, for hosts that keep (or may keep) our
+    /// backups; `None` for other peers and before the first check.
+    #[serde(default)]
+    pub online: Option<bool>,
+    /// When it was last reachable (Unix seconds).
+    #[serde(default)]
+    pub last_seen_unix: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]

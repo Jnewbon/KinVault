@@ -1,8 +1,10 @@
 //! One task per backup set: watches the sources, waits for changes to
 //! settle, then runs an incremental backup. Also rescans periodically (to
 //! catch anything the watcher missed), retries with backoff on failure, and
-//! runs maintenance (prune, verify) when due. Everything that touches the
-//! repository goes through this task, so operations never overlap.
+//! runs maintenance (prune, verify) when due. While the host it backs up to
+//! is offline it waits, and backs up as soon as the host is back. Everything
+//! that touches the repository goes through this task, so operations never
+//! overlap.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,6 +25,7 @@ use tokio::time::Instant;
 
 use crate::api::{BackupSummary, Event, PruneSummary, SetState, VerifySummary};
 use crate::config::{SetConfig, StoredTarget, write_private};
+use crate::reachability::{HostTarget, Hosts};
 
 /// A burst of changes never delays a backup by more than this.
 const MAX_CHANGE_DELAY: Duration = Duration::from_secs(10 * 60);
@@ -71,6 +74,7 @@ pub(crate) struct SetEnv {
     pub runtime: Handle,
     pub excludes: Vec<PathBuf>,
     pub events: broadcast::Sender<Event>,
+    pub hosts: Arc<Hosts>,
 }
 
 pub(crate) fn master_key_path(set_dir: &Path) -> PathBuf {
@@ -140,6 +144,20 @@ impl SetEnv {
         repo.set_excludes(self.excludes.clone());
         repo.set_exclude_patterns(self.exclude_patterns());
         Ok(repo)
+    }
+
+    /// The host the set backs up to, unless it's a local folder.
+    pub fn host(&self) -> Option<HostTarget> {
+        match &self.set.target {
+            StoredTarget::Peer {
+                id, addrs, hosts, ..
+            } => Some(HostTarget {
+                id: id.clone(),
+                addrs: addrs.clone(),
+                hosts: hosts.clone(),
+            }),
+            StoredTarget::Local { .. } => None,
+        }
     }
 
     fn last_backup_path(&self) -> PathBuf {
@@ -467,6 +485,8 @@ async fn run(
     let debounce = Duration::from_secs(env.set.debounce_secs);
     let rescan = Duration::from_secs(env.set.rescan_secs);
     let paused = env.set.paused;
+    let host = env.host();
+    let mut host_events = env.events.subscribe();
     let mut worker = Worker {
         env,
         status: status.clone(),
@@ -481,6 +501,7 @@ async fn run(
     let mut change_deadline: Option<Instant> = None;
     let mut first_change: Option<Instant> = None;
     let mut waiting_for_window = false;
+    let mut waiting_for_host = false;
 
     loop {
         set_state(
@@ -492,6 +513,8 @@ async fn run(
                 SetState::ChangesPending
             } else if waiting_for_window {
                 SetState::WaitingForWindow
+            } else if waiting_for_host {
+                SetState::WaitingForHost
             } else {
                 SetState::Idle
             },
@@ -525,6 +548,21 @@ async fn run(
                     false
                 }
             },
+            ev = host_events.recv(), if host.is_some() => {
+                let id = host.as_ref().map(|h| h.id.as_str()).unwrap_or_default();
+                let back = match ev {
+                    Ok(Event::PeerOnline { id: peer, online }) => online && peer == id,
+                    // Missed events; it may have come back meanwhile.
+                    Err(broadcast::error::RecvError::Lagged(_)) => !worker.env.hosts.is_offline(id),
+                    _ => false,
+                };
+                // Back up now rather than at the next retry.
+                if back && (waiting_for_host || failures > 0) && !paused {
+                    waiting_for_host = false;
+                    scheduled = Instant::now();
+                }
+                false
+            }
             _ = tokio::time::sleep_until(next) => true,
         };
         if !run_now {
@@ -544,12 +582,26 @@ async fn run(
             }
         }
         waiting_for_window = false;
+        // Don't keep dialling a host that is known to be away; it is checked
+        // regularly and we hear when it's back. Explicit requests still try.
+        if waiters.is_empty()
+            && let Some(h) = &host
+            && worker.env.hosts.is_offline(&h.id)
+        {
+            waiting_for_host = true;
+            scheduled = Instant::now() + MAX_RETRY_DELAY;
+            continue;
+        }
+        waiting_for_host = false;
         set_state(&worker.env, &status, SetState::Running);
 
         let result = worker.backup().await;
         match result {
             Ok(summary) => {
                 failures = 0;
+                if let Some(h) = &host {
+                    worker.env.hosts.record(&h.id, true);
+                }
                 scheduled = if paused { far } else { Instant::now() + rescan };
                 tracing::info!(
                     set = %worker.env.set.name,
@@ -578,18 +630,36 @@ async fn run(
                 }
             }
             Err(e) => {
-                let msg = format!("{e:#}");
-                if !paused {
+                let mut msg = format!("{e:#}");
+                // A host that went away isn't a problem to report: wait for it.
+                let offline = match &host {
+                    Some(h) => !worker.env.hosts.check(&worker.env.endpoint, h).await,
+                    None => false,
+                };
+                if offline {
+                    msg = format!(
+                        "the backup host can't be reached right now; \
+                         backing up resumes once it's online ({msg})"
+                    );
+                    if !paused {
+                        waiting_for_host = true;
+                        scheduled = Instant::now() + MAX_RETRY_DELAY;
+                        tracing::info!(set = %worker.env.set.name, "backup host is offline; waiting for it");
+                        status.lock().unwrap().last_error = None;
+                    }
+                } else if !paused {
                     failures += 1;
                     let delay = retry_delay(failures);
                     scheduled = Instant::now() + delay;
                     tracing::warn!(set = %worker.env.set.name, "backup failed (retrying in {}s): {msg}", delay.as_secs());
                     status.lock().unwrap().last_error = Some(msg.clone());
                 }
-                let _ = worker.env.events.send(Event::BackupFailed {
-                    set: worker.env.set.id.clone(),
-                    error: msg.clone(),
-                });
+                if !offline {
+                    let _ = worker.env.events.send(Event::BackupFailed {
+                        set: worker.env.set.id.clone(),
+                        error: msg.clone(),
+                    });
+                }
                 for w in waiters.drain(..) {
                     let _ = w.send(Err(msg.clone()));
                 }

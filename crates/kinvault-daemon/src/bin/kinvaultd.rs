@@ -72,6 +72,7 @@ async fn main() -> Result<()> {
         state_dir,
         endpoint: None,
         nearby: Default::default(),
+        reachability: Default::default(),
     })
     .await?;
     tracing::info!(

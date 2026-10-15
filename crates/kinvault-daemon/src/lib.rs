@@ -9,6 +9,7 @@ pub mod api;
 pub mod config;
 mod daemon;
 pub mod ipc;
+mod reachability;
 pub mod recovery;
 pub mod service;
 #[cfg(feature = "web")]
@@ -18,6 +19,7 @@ mod worker;
 use std::path::PathBuf;
 
 pub use daemon::{Daemon, DaemonOptions};
+pub use reachability::ReachabilityOptions;
 
 /// Per-user directory holding identity, configuration, keys and indexes.
 pub fn default_state_dir() -> Option<PathBuf> {

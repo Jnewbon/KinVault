@@ -109,6 +109,25 @@ function peerName(id) {
   return p?.name || shortId(id);
 }
 
+/** A green or grey "Online"/"Offline" marker, or null before the host has been checked. */
+function presence(online, lastSeen) {
+  if (online === null || online === undefined) return null;
+  const title = online ? "Reachable now"
+    : lastSeen ? `Last online ${dateTime(lastSeen)}` : "Not reachable since KinVault started";
+  return el("span", { class: "presence", title },
+    el("span", { class: `dot ${online ? "on" : "idle"}` }), online ? "Online" : "Offline");
+}
+
+function peerPresence(p) {
+  return presence(p.online, p.last_seen_unix);
+}
+
+/** " (last online 3 days ago)" for a host that's away, if it was ever seen. */
+function lastOnline(id) {
+  const seen = state.peers.find((p) => p.id === id)?.last_seen_unix;
+  return seen ? ` (last online ${ago(seen)})` : "";
+}
+
 function describeTarget(target) {
   return target.kind === "local" ? `Folder ${target.path}` : `${peerName(target.id)}`;
 }
@@ -457,6 +476,7 @@ function renderBanner() {
 function stateChip(set) {
   if (set.state === "running") return el("span", { class: "chip run" }, "Backing up");
   if (set.state === "paused") return el("span", { class: "chip warn" }, "Paused");
+  if (set.state === "waiting_for_host") return el("span", { class: "chip warn" }, "Waiting for destination");
   if (set.last_error) return el("span", { class: "chip bad" }, "Needs attention");
   if (set.last_verify && !set.last_verify.ok) return el("span", { class: "chip bad" }, "Problems found");
   if (set.state === "changes_pending") return el("span", { class: "chip" }, "Changes waiting");
@@ -549,12 +569,17 @@ function setCard(set) {
   }, prune));
   const more = el("button", { class: "btn small", onclick: () => setSettingsDialog(set) }, "Settings…");
 
+  const offline = set.target.kind === "peer" && set.target_online === false;
   return el("div", { class: "card" },
     el("div", { class: "card-head" }, el("span", { class: "card-title" }, set.name), stateChip(set),
-      el("span", { class: "spacer" }), el("span", { class: "card-sub" }, `→ ${describeTarget(set.target)}`)),
+      el("span", { class: "spacer" }), el("span", { class: "card-sub" }, `→ ${describeTarget(set.target)}`),
+      presence(set.target_online, null)),
     el("div", { class: "paths" }, set.paths.join(" · ")),
     lines,
     set.last_error ? el("div", { class: "notice bad" }, set.last_error) : null,
+    offline ? el("div", { class: "notice warn" },
+      `${peerName(set.target.id)} can't be reached right now${lastOnline(set.target.id)}. `
+      + "Changes are backed up automatically as soon as it's back online.") : null,
     set.state === "paused" ? el("div", { class: "notice warn" }, "Paused: changes aren't being backed up. Restores still work.") : null,
     el("div", { class: "actions" }, backup,
       el("button", { class: "btn small", onclick: () => { state.restoreSet = set.id; go("restore"); } }, "Restore…"),
@@ -662,7 +687,8 @@ async function newSetDialog() {
   const byHosting = (a, b) => !!b.hosts_us - !!a.hosts_us;
   const mine = state.peers.filter((p) => p.mine).sort(byHosting);
   const friends = state.peers.filter((p) => !p.mine).sort(byHosting);
-  const space = (p) => (p.hosts_us ? ` (${p.hosts_us.quota_bytes ? bytes(p.hosts_us.quota_bytes) : "unlimited"})` : "");
+  const space = (p) => (p.hosts_us ? ` (${p.hosts_us.quota_bytes ? bytes(p.hosts_us.quota_bytes) : "unlimited"})` : "")
+    + (p.online === false ? " · offline" : "");
   const options = [
     ...mine.map((p) => [`peer:${p.id}`, `${p.name || shortId(p.id)}${space(p)}`]),
     ["local", "A folder or external drive…"],
@@ -897,7 +923,8 @@ function renderFriends() {
     const revoke = p.grant ? el("button", { class: "btn small danger", onclick: () => revokeDialog(p) }, "Stop hosting…") : null;
     const toMine = el("button", { class: "btn small", onclick: () => moveToMineDialog(p) }, "Move to Mine…");
     page.append(el("div", { class: "card" },
-      el("div", { class: "card-head" }, el("span", { class: "card-title" }, p.name || "Unnamed friend"), el("span", { class: "spacer" }),
+      el("div", { class: "card-head" }, el("span", { class: "card-title" }, p.name || "Unnamed friend"), peerPresence(p),
+        el("span", { class: "spacer" }),
         el("span", { class: "mono muted", title: p.id }, shortId(p.id))),
       lines, el("div", { class: "actions" }, edit, toMine, revoke)));
   }
@@ -961,7 +988,8 @@ function renderMine() {
     const allow = p.grant ? null : el("button", { class: "btn small" }, "Allow to store here");
     allow?.addEventListener("click", () => attempt(() => call("peer_set_mine", { id: p.id, mine: true }), allow));
     page.append(el("div", { class: "card" },
-      el("div", { class: "card-head" }, el("span", { class: "card-title" }, p.name || "Unnamed device"), el("span", { class: "spacer" }),
+      el("div", { class: "card-head" }, el("span", { class: "card-title" }, p.name || "Unnamed device"), peerPresence(p),
+        el("span", { class: "spacer" }),
         el("span", { class: "mono muted", title: p.id }, shortId(p.id))),
       lines, el("div", { class: "actions" }, allow, toFriends, remove),
       using.length ? el("div", { class: "muted small", style: "margin-top:6px" },
@@ -1370,6 +1398,18 @@ listen("daemon-event", (e) => {
     case "peers_changed":
       refreshPeers();
       break;
+    case "peer_online": {
+      const peer = state.peers.find((p) => p.id === ev.id);
+      if (peer) {
+        peer.online = ev.online;
+        if (ev.online) peer.last_seen_unix = Math.floor(Date.now() / 1000);
+      }
+      for (const set of state.status?.sets || []) {
+        if (set.target.kind === "peer" && set.target.id === ev.id) set.target_online = ev.online;
+      }
+      render();
+      break;
+    }
     case "network_changed":
       refreshNetwork();
       break;

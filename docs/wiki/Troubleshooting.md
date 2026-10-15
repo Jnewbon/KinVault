@@ -19,10 +19,11 @@ On Linux, its log is also in `journalctl --user -u kinvaultd`.
 
 The last backup failed. The app shows the error under the backup;
 `kinvault status` shows it too. KinVault keeps retrying on its own (up to
-every 30 minutes), so a temporary problem, such as the host being offline,
-clears itself. Common causes:
+every 30 minutes), so a temporary problem clears itself. (A destination that's
+simply switched off shows **Waiting for destination** instead, and backs up
+when it's back; see [Backups](Backups#destinations-that-arent-always-on).)
+Common causes:
 
-- **The peer is offline.** Nothing to do; it'll back up when they're back.
 - **Over quota.** Ask your friend to raise it (`kinvault peer allow <you>
   --quota …` on their side), or leave more out ([Backups](Backups#leaving-files-out)).
 - **A folder was moved or unmounted.** Remount it, or `kinvault set resume
