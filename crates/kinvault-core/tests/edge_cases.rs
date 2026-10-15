@@ -2,8 +2,8 @@
 //! be read mid-scan, odd sources, cancelling, and missing data.
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Once};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 
 use kinvault_core::pack::{self, BlobKind};
@@ -110,8 +110,10 @@ fn sources_missing_repeated_or_excluded() {
 #[test]
 fn files_changing_during_the_scan_are_skipped_with_warnings() {
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::Once;
     let tmp = tempfile::tempdir().unwrap();
-    let src = tmp.path().join("src");
+    // Warnings name the resolved path (macOS's temporary folder is a symlink).
+    let src = fs::canonicalize(tmp.path()).unwrap().join("src");
     fs::create_dir_all(src.join("locked")).unwrap();
     for name in ["a", "b", "c", "d"] {
         fs::write(src.join(name), name).unwrap();
@@ -241,7 +243,7 @@ fn restoring_a_folder_with_symlinks_counts_only_files() {
     // Restoring again replaces the symlink.
     repo.restore(&snap, &out, Some(&include)).unwrap();
     let link = out.join(&include).join("link");
-    assert_eq!(fs::read_link(link).unwrap(), PathBuf::from("f"));
+    assert_eq!(fs::read_link(link).unwrap(), std::path::PathBuf::from("f"));
 }
 
 #[test]
