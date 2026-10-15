@@ -66,6 +66,33 @@ impl Index {
         Ok(Self { conn })
     }
 
+    /// Groups the writes that follow into one transaction, until
+    /// [`Self::end_batch`]. Committing each write on its own costs several
+    /// file locks and log writes, which dominates scanning many small files.
+    pub fn begin_batch(&self) -> Result<()> {
+        if self.conn.is_autocommit() {
+            self.conn.execute_batch("BEGIN")?;
+        }
+        Ok(())
+    }
+
+    /// Commits what a batch has written so far and keeps batching.
+    /// Does nothing outside a batch.
+    pub fn commit_batch(&self) -> Result<()> {
+        if !self.conn.is_autocommit() {
+            self.conn.execute_batch("COMMIT; BEGIN")?;
+        }
+        Ok(())
+    }
+
+    /// Commits and ends a batch. Does nothing outside one.
+    pub fn end_batch(&self) -> Result<()> {
+        if !self.conn.is_autocommit() {
+            self.conn.execute_batch("COMMIT")?;
+        }
+        Ok(())
+    }
+
     pub fn known_packs(&self) -> Result<HashSet<PackId>> {
         let mut stmt = self.conn.prepare("SELECT id FROM packs")?;
         let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
@@ -77,7 +104,7 @@ impl Index {
     }
 
     pub fn add_pack(&mut self, pack: &PackId, entries: &[BlobEntry]) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         tx.execute(
             "INSERT OR IGNORE INTO packs (id) VALUES (?1)",
             [&pack.0[..]],
@@ -105,7 +132,7 @@ impl Index {
     }
 
     pub fn remove_pack(&mut self, pack: &PackId) -> Result<()> {
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         tx.execute("DELETE FROM chunks WHERE pack = ?1", [&pack.0[..]])?;
         tx.execute("DELETE FROM packs WHERE id = ?1", [&pack.0[..]])?;
         tx.execute("DELETE FROM verified WHERE pack = ?1", [&pack.0[..]])?;
