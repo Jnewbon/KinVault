@@ -146,7 +146,7 @@ async fn daemon_backs_up_changes_to_peer() {
     assert!(second.bytes_uploaded < 4096, "{second:?}");
 
     // On-demand backup through the control socket.
-    let listener = ipc::Listener::bind(&ipc::endpoint_name(&pc_state))
+    let listener = ipc::Listener::bind(&ipc::listen_name(&pc_state).unwrap())
         .await
         .unwrap();
     let server = tokio::spawn(listener.serve(pc.clone()));
@@ -251,7 +251,7 @@ async fn daemon_backs_up_changes_to_peer() {
 #[tokio::test(flavor = "multi_thread")]
 async fn second_daemon_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
-    let path = ipc::endpoint_name(tmp.path());
+    let path = ipc::listen_name(tmp.path()).unwrap();
     assert!(!ipc::daemon_running(tmp.path()));
     let first = ipc::Listener::bind(&path).await.unwrap();
     let _serving = tokio::spawn(async move {
@@ -696,7 +696,7 @@ async fn subscribers_see_state_changes_and_results() {
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
     let daemon = start(&state, SecretKey::generate()).await;
-    let listener = ipc::Listener::bind(&ipc::endpoint_name(&state))
+    let listener = ipc::Listener::bind(&ipc::listen_name(&state).unwrap())
         .await
         .unwrap();
     let server = tokio::spawn(listener.serve(daemon.clone()));

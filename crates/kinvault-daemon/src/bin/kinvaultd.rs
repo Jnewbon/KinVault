@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&state_dir)
         .with_context(|| format!("creating the state directory {}", state_dir.display()))?;
 
-    let listener = ipc::Listener::bind(&ipc::endpoint_name(&state_dir))
+    let listener = ipc::Listener::bind(&ipc::listen_name(&state_dir)?)
         .await
         .with_context(|| {
             format!(
