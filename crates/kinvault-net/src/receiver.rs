@@ -15,8 +15,8 @@ use kinvault_core::{Backend, LocalDirBackend};
 use crate::error::NetError;
 use crate::limits::{RateLimiter, TimeWindow};
 use crate::protocol::{
-    ErrorCode, MAX_OBJECT_LEN, Offer, Op, Request, Response, read_msg, read_payload,
-    valid_repo_name, write_msg,
+    ErrorCode, MAX_OBJECT_LEN, MAX_REQUEST_LEN, Offer, Op, Request, Response, read_msg,
+    read_payload, valid_repo_name, write_msg,
 };
 
 /// How long a repository its owner deleted is kept before it is erased.
@@ -24,6 +24,10 @@ pub const REPO_DELETE_DELAY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Per-peer directory of deleted repositories, named `<erase unix>-<repo>`.
 /// Repository names can't start with a dot, so it never clashes with one.
 const DELETED_DIR: &str = ".deleted";
+/// Uploads one peer may have in progress; more wait their turn. Each is
+/// held in memory until stored, so this bounds what a peer can make the
+/// host buffer (at most this many times [`MAX_OBJECT_LEN`]).
+const UPLOADS_PER_PEER: usize = 4;
 
 /// Storage a peer uses on this host.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -111,7 +115,8 @@ struct Inner {
     root: PathBuf,
     peers: RwLock<HashMap<EndpointId, PeerAccess>>,
     /// Cached bytes stored per peer; dropped after writes and recomputed lazily.
-    usage: Mutex<HashMap<EndpointId, PeerUsage>>,
+    usage: Mutex<HashMap<EndpointId, CachedUsage>>,
+    uploads: Mutex<HashMap<EndpointId, Arc<PeerUploads>>>,
     invites: RwLock<Option<InviteHandler>>,
     pairing: RwLock<Option<PairHandler>>,
 }
@@ -126,6 +131,7 @@ impl Receiver {
                 root: root.into(),
                 peers: RwLock::default(),
                 usage: Mutex::default(),
+                uploads: Mutex::default(),
                 invites: RwLock::default(),
                 pairing: RwLock::default(),
             }),
@@ -179,9 +185,10 @@ impl Receiver {
 
     /// What the peer stores here, and how much of it is waiting to be erased.
     pub async fn usage_detail(&self, peer: &EndpointId) -> io::Result<PeerUsage> {
-        if let Some(usage) = self.inner.usage.lock().unwrap().get(peer) {
-            return Ok(*usage);
-        }
+        let version = match self.cached_usage(peer) {
+            Ok(usage) => return Ok(usage),
+            Err(version) => version,
+        };
         let dir = self.peer_dir(peer);
         let usage = tokio::task::spawn_blocking(move || -> io::Result<PeerUsage> {
             // Deleted repositories, plus objects in each repository's trash.
@@ -198,12 +205,41 @@ impl Receiver {
         })
         .await
         .map_err(io::Error::other)??;
-        self.inner.usage.lock().unwrap().insert(*peer, usage);
+        self.store_usage(peer, version, usage);
         Ok(usage)
     }
 
+    /// The cached usage, or the cache version to count it against.
+    fn cached_usage(&self, peer: &EndpointId) -> Result<PeerUsage, u64> {
+        let cache = self.inner.usage.lock().unwrap();
+        let cached = cache.get(peer);
+        cached
+            .and_then(|c| c.usage)
+            .ok_or(cached.map_or(0, |c| c.version))
+    }
+
+    /// Caches a count started at cache `version`, unless what the peer
+    /// stores changed since: the count may have missed that change.
+    fn store_usage(&self, peer: &EndpointId, version: u64, usage: PeerUsage) {
+        let mut cache = self.inner.usage.lock().unwrap();
+        let cached = cache.entry(*peer).or_default();
+        if cached.version == version {
+            cached.usage = Some(usage);
+        }
+    }
+
     fn invalidate_usage(&self, peer: &EndpointId) {
-        self.inner.usage.lock().unwrap().remove(peer);
+        let mut cache = self.inner.usage.lock().unwrap();
+        let cached = cache.entry(*peer).or_default();
+        cached.usage = None;
+        cached.version += 1;
+    }
+
+    fn invalidate_all_usage(&self) {
+        for cached in self.inner.usage.lock().unwrap().values_mut() {
+            cached.usage = None;
+            cached.version += 1;
+        }
     }
 
     /// Permanently deletes data peers deleted more than `grace` ago.
@@ -241,7 +277,7 @@ impl Receiver {
         .await
         .map_err(io::Error::other)??;
         if freed > 0 {
-            self.inner.usage.lock().unwrap().clear();
+            self.invalidate_all_usage();
         }
         Ok(freed)
     }
@@ -252,7 +288,7 @@ impl Receiver {
         mut send: SendStream,
         mut recv: RecvStream,
     ) -> Result<(), NetError> {
-        let req: Request = read_msg(&mut recv).await?;
+        let req: Request = read_msg(&mut recv, MAX_REQUEST_LEN).await?;
         let (resp, payload) = match self.dispatch(peer, req, &mut recv).await {
             Ok(reply) => reply,
             Err((code, message)) => {
@@ -409,7 +445,7 @@ impl Receiver {
                 ))
             }
             Op::PutPack { id, len } => {
-                let data = self
+                let (data, reservation) = self
                     .receive_object(&peer, &grant, limiter.as_deref(), len, recv)
                     .await?;
                 if blake3::hash(&data).as_bytes() != &id.0 {
@@ -420,11 +456,11 @@ impl Receiver {
                 }
                 let b = backend.clone();
                 blocking(move || b.put_pack(&id, &data)).await?;
-                self.invalidate_usage(&peer);
+                reservation.release().await;
                 Ok((Response::Ok, None))
             }
             Op::PutSnapshot { id, len } => {
-                let data = self
+                let (data, reservation) = self
                     .receive_object(&peer, &grant, limiter.as_deref(), len, recv)
                     .await?;
                 if blake3::hash(&data).as_bytes() != &id.0 {
@@ -435,7 +471,7 @@ impl Receiver {
                 }
                 let b = backend.clone();
                 blocking(move || b.put_snapshot(&id, &data)).await?;
-                self.invalidate_usage(&peer);
+                reservation.release().await;
                 Ok((Response::Ok, None))
             }
             Op::GetPack { id } => {
@@ -491,7 +527,24 @@ impl Receiver {
         }
     }
 
+    fn peer_uploads(&self, peer: &EndpointId) -> Arc<PeerUploads> {
+        self.inner
+            .uploads
+            .lock()
+            .unwrap()
+            .entry(*peer)
+            .or_insert_with(|| {
+                Arc::new(PeerUploads {
+                    slots: Arc::new(tokio::sync::Semaphore::new(UPLOADS_PER_PEER)),
+                    reserved: tokio::sync::Mutex::new(0),
+                })
+            })
+            .clone()
+    }
+
     /// Checks window, size limits and quota, then reads an uploaded object.
+    /// The returned reservation counts the object against the quota until it
+    /// is stored and released.
     async fn receive_object(
         &self,
         peer: &EndpointId,
@@ -499,7 +552,7 @@ impl Receiver {
         limiter: Option<&RateLimiter>,
         len: u64,
         recv: &mut RecvStream,
-    ) -> Result<Vec<u8>, Failure> {
+    ) -> Result<(Vec<u8>, Reservation), Failure> {
         if let Some(window) = grant.window
             && !window.is_open_now()
         {
@@ -514,18 +567,109 @@ impl Receiver {
                 format!("object of {len} bytes exceeds the size limit"),
             ));
         }
-        if let Some(quota) = grant.quota_bytes {
-            let used = self.usage(peer).await.map_err(internal)?;
-            if used.saturating_add(len) > quota {
-                return Err((
-                    ErrorCode::QuotaExceeded,
-                    format!("{used} of {quota} bytes used; upload needs {len} more"),
-                ));
-            }
-        }
-        read_payload(recv, len, limiter)
+        let uploads = self.peer_uploads(peer);
+        let slot = uploads
+            .slots
+            .clone()
+            .acquire_owned()
             .await
-            .map_err(|e| (ErrorCode::BadRequest, e.to_string()))
+            .map_err(internal)?;
+        {
+            // Checking and reserving under one lock means uploads running
+            // at the same time can't all pass against the same usage.
+            let mut reserved = uploads.reserved.lock().await;
+            if let Some(quota) = grant.quota_bytes {
+                let used = self
+                    .usage(peer)
+                    .await
+                    .map_err(internal)?
+                    .saturating_add(*reserved);
+                if used.saturating_add(len) > quota {
+                    return Err((
+                        ErrorCode::QuotaExceeded,
+                        format!("{used} of {quota} bytes used; upload needs {len} more"),
+                    ));
+                }
+            }
+            *reserved += len;
+        }
+        let reservation = Reservation {
+            receiver: self.clone(),
+            peer: *peer,
+            uploads,
+            len,
+            released: false,
+            _slot: slot,
+        };
+        let data = read_payload(recv, len, limiter)
+            .await
+            .map_err(|e| (ErrorCode::BadRequest, e.to_string()))?;
+        Ok((data, reservation))
+    }
+}
+
+/// A peer's usage as last counted. `version` goes up whenever what the peer
+/// stores changes, so a count taken across a change is never kept.
+#[derive(Default)]
+struct CachedUsage {
+    usage: Option<PeerUsage>,
+    version: u64,
+}
+
+/// A peer's uploads in progress.
+struct PeerUploads {
+    slots: Arc<tokio::sync::Semaphore>,
+    /// Bytes of uploads in progress, not yet in the usage figure.
+    reserved: tokio::sync::Mutex<u64>,
+}
+
+/// An upload in progress: holds one of the peer's upload slots and counts
+/// its bytes against the quota until released.
+struct Reservation {
+    receiver: Receiver,
+    peer: EndpointId,
+    uploads: Arc<PeerUploads>,
+    len: u64,
+    released: bool,
+    _slot: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Reservation {
+    /// The object is stored: usage now includes it, so stop reserving it.
+    /// Both happen under the reservation lock, so a quota check never sees
+    /// the stale usage without the reservation.
+    async fn release(mut self) {
+        let mut reserved = self.uploads.reserved.lock().await;
+        self.receiver.invalidate_usage(&self.peer);
+        *reserved -= self.len;
+        self.released = true;
+    }
+}
+
+impl Drop for Reservation {
+    /// The upload failed or was abandoned before being stored.
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        let (receiver, peer, uploads, len) = (
+            self.receiver.clone(),
+            self.peer,
+            self.uploads.clone(),
+            self.len,
+        );
+        // A failed write may still have left something on disk.
+        let unreserve = async move {
+            let mut reserved = uploads.reserved.lock().await;
+            receiver.invalidate_usage(&peer);
+            *reserved -= len;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(unreserve);
+            }
+            Err(_) => tracing::warn!(%peer, "upload reservation leaked"),
+        }
     }
 }
 
@@ -628,6 +772,7 @@ mod tests {
 
     use super::*;
     use crate::client::{RemoteBackend, pair, redeem_invite};
+    use crate::protocol::{ALPN, MAX_REQUEST_LEN, MAX_RESPONSE_LEN};
     use crate::testutil::{addr_of, encode, local_endpoint, raw_call};
     use crate::ticket::InviteTicket;
 
@@ -801,6 +946,106 @@ mod tests {
         // Not a request at all: the host gives up on the stream.
         let garbage = [3, 0, 0, 0, 0xff, 0xff, 0xff];
         assert!(raw_call(&s.ep, s.addr(), &garbage).await.is_err());
+    }
+
+    #[test]
+    fn counts_taken_across_a_change_are_not_cached() {
+        let receiver = Receiver::new("/nowhere");
+        let peer = iroh::SecretKey::generate().public();
+        let stale = PeerUsage {
+            used_bytes: 1,
+            deleting_bytes: 0,
+        };
+        // A count starts, an upload is stored, then the count finishes:
+        // it may have missed the upload, so it isn't kept.
+        let version = receiver.cached_usage(&peer).unwrap_err();
+        receiver.invalidate_usage(&peer);
+        receiver.store_usage(&peer, version, stale);
+        assert!(receiver.cached_usage(&peer).is_err());
+
+        // An undisturbed count is kept...
+        let version = receiver.cached_usage(&peer).unwrap_err();
+        receiver.store_usage(&peer, version, stale);
+        assert_eq!(receiver.cached_usage(&peer), Ok(stale));
+
+        // ...until trash is purged, which changes every peer's usage, also
+        // for counts already under way.
+        receiver.invalidate_usage(&peer);
+        let version = receiver.cached_usage(&peer).unwrap_err();
+        receiver.invalidate_all_usage();
+        receiver.store_usage(&peer, version, stale);
+        assert!(receiver.cached_usage(&peer).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn large_requests_are_refused_before_anything_else() {
+        let s = setup(Grant::default()).await;
+        // A whole request over the limit, from a peer the host doesn't
+        // know: the host gives up on the stream instead of reading it.
+        let stranger = local_endpoint().await;
+        let huge = encode(&Request {
+            repo: "x".repeat(MAX_REQUEST_LEN),
+            op: Op::ListPacks,
+        });
+        assert!(raw_call(&stranger, s.addr(), &huge).await.is_err());
+        // A normal-sized request from it is answered (and denied).
+        let list = encode(&Request {
+            repo: "repo".into(),
+            op: Op::ListPacks,
+        });
+        let resp = raw_call(&stranger, s.addr(), &list).await.unwrap();
+        assert!(is_error(&resp, ErrorCode::Denied), "{resp:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parallel_uploads_share_the_quota() {
+        let s = setup(Grant {
+            quota_bytes: Some(1000),
+            ..Default::default()
+        })
+        .await;
+        // Four 400-byte uploads, all announced before any sends its data,
+        // so all are checked against the same usage: only two fit.
+        let conn = s.ep.connect(s.addr(), ALPN).await.unwrap();
+        let mut streams = Vec::new();
+        for i in 0..UPLOADS_PER_PEER as u8 {
+            let data = vec![i; 400];
+            let (mut send, recv) = conn.open_bi().await.unwrap();
+            let header = encode(&Request {
+                repo: "repo".into(),
+                op: Op::PutPack {
+                    id: PackId(*blake3::hash(&data).as_bytes()),
+                    len: data.len() as u64,
+                },
+            });
+            send.write_all(&header).await.unwrap();
+            streams.push((send, recv, data));
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut stored = 0;
+        for (mut send, mut recv, data) in streams {
+            // Refused uploads are stopped by the host, so these may fail.
+            let _ = send.write_all(&data).await;
+            let _ = send.finish();
+            match read_msg::<Response>(&mut recv, MAX_RESPONSE_LEN)
+                .await
+                .unwrap()
+            {
+                Response::Ok => stored += 1,
+                resp => assert!(is_error(&resp, ErrorCode::QuotaExceeded), "{resp:?}"),
+            }
+        }
+        assert_eq!(stored, 2);
+        assert!(s.receiver.usage(&s.ep.id()).await.unwrap() <= 1000);
+        // Refused uploads gave back what they reserved.
+        let uploads = s.receiver.peer_uploads(&s.ep.id());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while *uploads.reserved.lock().await != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
