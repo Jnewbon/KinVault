@@ -12,8 +12,8 @@ use crate::error::{NetError, transport};
 use crate::hosts::with_hosts;
 use crate::limits::RateLimiter;
 use crate::protocol::{
-    ALPN, MAX_OBJECT_LEN, Offer, Op, Request, Response, read_msg, read_payload, valid_repo_name,
-    write_msg, write_payload,
+    ALPN, MAX_OBJECT_LEN, MAX_RESPONSE_LEN, Offer, Op, Request, Response, read_msg, read_payload,
+    valid_repo_name, write_msg, write_payload,
 };
 use crate::receiver::InviteAccepted;
 use crate::ticket::InviteTicket;
@@ -181,7 +181,7 @@ async fn call_once(
     .await;
     // The host may reject an upload before reading it and stop our stream;
     // its response explains why, so prefer it over the write error.
-    let resp: Response = match read_msg(&mut recv).await {
+    let resp: Response = match read_msg(&mut recv, MAX_RESPONSE_LEN).await {
         Ok(resp) => resp,
         Err(e) => return Err(sent.err().unwrap_or(e)),
     };

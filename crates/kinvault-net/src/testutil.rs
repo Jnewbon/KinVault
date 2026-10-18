@@ -8,7 +8,9 @@ use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, SecretKey};
 
 use crate::error::{NetError, transport};
-use crate::protocol::{ALPN, Request, Response, read_msg, write_msg};
+use crate::protocol::{
+    ALPN, MAX_REQUEST_LEN, MAX_RESPONSE_LEN, Request, Response, read_msg, write_msg,
+};
 
 /// An endpoint on 127.0.0.1 without relays or discovery.
 pub async fn local_endpoint() -> Endpoint {
@@ -46,7 +48,7 @@ pub async fn raw_call(
     // The host may stop reading early; its response says why.
     let _ = send.write_all(bytes).await;
     let _ = send.finish();
-    read_msg(&mut recv).await
+    read_msg(&mut recv, MAX_RESPONSE_LEN).await
 }
 
 #[derive(Debug)]
@@ -82,7 +84,7 @@ impl ProtocolHandler for FakeHost {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         let first = self.connections.fetch_add(1, Ordering::SeqCst) == 0;
         while let Ok((mut send, mut recv)) = conn.accept_bi().await {
-            let _: Request = read_msg(&mut recv).await.unwrap();
+            let _: Request = read_msg(&mut recv, MAX_REQUEST_LEN).await.unwrap();
             match &self.behaviour {
                 Misbehave::Reply(resp) => write_msg(&mut send, resp).await.unwrap(),
                 Misbehave::HugeMessage => send.write_all(&u32::MAX.to_le_bytes()).await.unwrap(),

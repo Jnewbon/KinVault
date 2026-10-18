@@ -1,5 +1,6 @@
 //! Local control socket: a Unix socket on Unix (inside the private state
-//! directory, mode 0600), a named pipe on Windows. Each line sent is a JSON
+//! directory, mode 0600), a named pipe on Windows (named with a secret kept
+//! in the state directory; see [`listen_name`]). Each line sent is a JSON
 //! [`Request`]; each line received is a JSON `Result<Reply, String>`.
 //! Requests on one connection are answered in order.
 
@@ -13,7 +14,7 @@ use crate::daemon::Daemon;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
-    #[error("kinvaultd is not running (could not connect to {0})")]
+    #[error("kinvaultd is not running for {0}")]
     NotRunning(String),
     #[error("lost connection to kinvaultd: {0}")]
     Io(#[from] io::Error),
@@ -25,30 +26,136 @@ pub enum ClientError {
 #[cfg(unix)]
 const MAX_SOCKET_PATH: usize = 100;
 
-#[cfg(unix)]
-pub fn endpoint_name(state_dir: &Path) -> PathBuf {
-    let path = state_dir.join("kinvaultd.sock");
-    if path.as_os_str().len() <= MAX_SOCKET_PATH {
-        return path;
+/// File in the state directory holding the random part of the control
+/// endpoint's name, when the endpoint lives outside the state directory.
+/// That name can't be guessed without reading the (private) state
+/// directory, so another local user can't create the endpoint first and
+/// pose as the daemon.
+const NAME_FILE: &str = "ipc-name";
+
+/// The control endpoint a client connects to, or `None` if no daemon has
+/// ever served `state_dir`.
+pub fn endpoint_name(state_dir: &Path) -> Option<PathBuf> {
+    #[cfg(unix)]
+    if let Some(path) = socket_in_state_dir(state_dir) {
+        return Some(path);
     }
-    // Too long for a socket: use a per-state-dir name in the user's runtime
-    // directory instead. The socket itself is still created with mode 0600.
+    let secret = std::fs::read_to_string(state_dir.join(NAME_FILE)).ok()?;
+    let secret = secret.trim();
+    valid_secret(secret).then(|| shared_endpoint(secret))
+}
+
+/// The control endpoint the daemon serving `state_dir` listens on, creating
+/// its name the first time.
+pub fn listen_name(state_dir: &Path) -> io::Result<PathBuf> {
+    #[cfg(unix)]
+    if let Some(path) = socket_in_state_dir(state_dir) {
+        return Ok(path);
+    }
+    if old_daemon_running(state_dir) {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "an older kinvaultd is still running for this state directory; \
+             stop it (or restart the computer) before starting this one",
+        ));
+    }
+    if let Some(path) = endpoint_name(state_dir) {
+        return Ok(path);
+    }
+    let secret =
+        hex::encode(kinvault_core::crypto::random_bytes::<16>().map_err(io::Error::other)?);
+    // Write it whole under a temporary name, then link it into place, which
+    // fails if another daemon got there first: then use its name instead.
+    let path = state_dir.join(NAME_FILE);
+    let tmp = state_dir.join(format!("{NAME_FILE}.{secret}.tmp"));
+    crate::config::write_private(&tmp, secret.as_bytes()).map_err(io::Error::other)?;
+    let linked = std::fs::hard_link(&tmp, &path);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(shared_endpoint(&secret)),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => endpoint_name(state_dir)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "damaged ipc-name file")),
+        Err(e) => Err(e),
+    }
+}
+
+/// The endpoint used outside the state directory before the secret name: a
+/// hash of its path, which anyone could work out.
+fn old_endpoint_name(state_dir: &Path) -> PathBuf {
+    // FNV-1a.
+    let hash = state_dir
+        .to_string_lossy()
+        .bytes()
+        .fold(0xcbf29ce484222325u64, |h, b| {
+            (h ^ b as u64).wrapping_mul(0x100000001b3)
+        });
+    #[cfg(unix)]
+    return std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(format!("kinvaultd-{hash:016x}.sock"));
+    #[cfg(windows)]
+    return PathBuf::from(format!(r"\\.\pipe\kinvaultd-{hash:016x}"));
+}
+
+/// Whether something answers on the old, guessable endpoint for
+/// `state_dir`. That is most likely a daemon from before the upgrade still
+/// running, which new clients can no longer find: starting a second daemon
+/// beside it could damage the state directory, so refuse instead. (Another
+/// user squatting the old name can only stop the daemon starting this way,
+/// not pose as it.)
+fn old_daemon_running(state_dir: &Path) -> bool {
+    let path = old_endpoint_name(state_dir);
+    #[cfg(unix)]
+    return std::os::unix::net::UnixStream::connect(path).is_ok();
+    #[cfg(windows)]
+    {
+        // ERROR_PIPE_BUSY: it exists, but every instance is in use.
+        const ERROR_PIPE_BUSY: i32 = 231;
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+        {
+            Ok(_) => true,
+            Err(e) => e.raw_os_error() == Some(ERROR_PIPE_BUSY),
+        }
+    }
+}
+
+fn valid_secret(secret: &str) -> bool {
+    secret.len() == 32 && secret.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The socket inside the private state directory, if its path is short
+/// enough for a socket.
+#[cfg(unix)]
+fn socket_in_state_dir(state_dir: &Path) -> Option<PathBuf> {
+    let path = state_dir.join("kinvaultd.sock");
+    (path.as_os_str().len() <= MAX_SOCKET_PATH).then_some(path)
+}
+
+/// A state directory's path is too long for a socket: use a secretly named
+/// one in the user's runtime directory instead. The socket itself is still
+/// created with mode 0600.
+#[cfg(unix)]
+fn shared_endpoint(secret: &str) -> PathBuf {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    let hash = fnv1a(state_dir.to_string_lossy().as_bytes());
-    dir.join(format!("kinvaultd-{hash:016x}.sock"))
+    dir.join(format!("kinvaultd-{secret}.sock"))
 }
 
 #[cfg(windows)]
-pub fn endpoint_name(state_dir: &Path) -> PathBuf {
-    let hash = fnv1a(state_dir.to_string_lossy().as_bytes());
-    PathBuf::from(format!(r"\\.\pipe\kinvaultd-{hash:016x}"))
+fn shared_endpoint(secret: &str) -> PathBuf {
+    PathBuf::from(format!(r"\\.\pipe\kinvaultd-{secret}"))
 }
 
 /// Whether a daemon is serving `state_dir` (blocking check).
 pub fn daemon_running(state_dir: &Path) -> bool {
-    let path = endpoint_name(state_dir);
+    let Some(path) = endpoint_name(state_dir) else {
+        return false;
+    };
     #[cfg(unix)]
     return std::os::unix::net::UnixStream::connect(path).is_ok();
     #[cfg(windows)]
@@ -57,13 +164,6 @@ pub fn daemon_running(state_dir: &Path) -> bool {
         .write(true)
         .open(path)
         .is_ok();
-}
-
-fn fnv1a(data: &[u8]) -> u64 {
-    // FNV-1a; only needs to separate state directories, not resist attackers.
-    data.iter().fold(0xcbf29ce484222325u64, |h, b| {
-        (h ^ *b as u64).wrapping_mul(0x100000001b3)
-    })
 }
 
 async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin>(
@@ -216,8 +316,12 @@ pub struct Client {
 
 impl Client {
     pub async fn connect(state_dir: &Path) -> Result<Self, ClientError> {
-        let path = endpoint_name(state_dir);
-        let not_running = |_| ClientError::NotRunning(path.display().to_string());
+        let Some(path) = endpoint_name(state_dir) else {
+            return Err(ClientError::NotRunning(state_dir.display().to_string()));
+        };
+        // Names the state directory rather than the endpoint, whose name is
+        // meant to stay private.
+        let not_running = |_| ClientError::NotRunning(state_dir.display().to_string());
         #[cfg(unix)]
         let stream = tokio::net::UnixStream::connect(&path)
             .await
@@ -260,13 +364,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn long_state_dirs_get_short_socket_paths() {
+    fn short_state_dirs_keep_their_socket_inside() {
         let short = Path::new("/home/me/.local/share/KinVault");
-        assert_eq!(endpoint_name(short), short.join("kinvaultd.sock"));
-        let long = PathBuf::from(format!("/tmp/{}", "x".repeat(150)));
-        let name = endpoint_name(&long);
+        assert_eq!(endpoint_name(short), Some(short.join("kinvaultd.sock")));
+        assert_eq!(listen_name(short).unwrap(), short.join("kinvaultd.sock"));
+    }
+
+    #[test]
+    fn long_state_dirs_get_secret_socket_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let long = tmp.path().join("x".repeat(150));
+        std::fs::create_dir_all(&long).unwrap();
+        // Nothing to connect to until a daemon has picked a name.
+        assert_eq!(endpoint_name(&long), None);
+        let name = listen_name(&long).unwrap();
         assert!(name.as_os_str().len() <= MAX_SOCKET_PATH + 40, "{name:?}");
-        assert_ne!(name, endpoint_name(&long.join("other")));
+        assert_eq!(listen_name(&long).unwrap(), name);
+        assert_eq!(endpoint_name(&long), Some(name.clone()));
+        // The name comes from the state directory, not from its path.
+        let other = tmp.path().join("y".repeat(150));
+        std::fs::create_dir_all(&other).unwrap();
+        assert_ne!(listen_name(&other).unwrap(), name);
+        // Only the name file is left behind.
+        let files: Vec<_> = std::fs::read_dir(&long)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(files, vec![std::ffi::OsString::from(NAME_FILE)]);
+        // A damaged name file doesn't point anywhere.
+        std::fs::write(long.join(NAME_FILE), "../../somewhere").unwrap();
+        assert_eq!(endpoint_name(&long), None);
+    }
+
+    #[test]
+    fn an_old_daemon_still_running_blocks_a_new_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let long = tmp.path().join("z".repeat(150));
+        std::fs::create_dir_all(&long).unwrap();
+        let old = old_endpoint_name(&long);
+        let _ = std::fs::remove_file(&old);
+        let listener = std::os::unix::net::UnixListener::bind(&old).unwrap();
+        let err = listen_name(&long).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        // A leftover socket nobody answers on doesn't count.
+        drop(listener);
+        assert!(listen_name(&long).is_ok());
+        let _ = std::fs::remove_file(&old);
     }
 }
 

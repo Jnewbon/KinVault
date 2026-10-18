@@ -15,7 +15,12 @@ use crate::limits::{PACE_CHUNK, RateLimiter};
 pub const ALPN: &[u8] = b"kinvault/1";
 /// Largest pack or snapshot either side will accept.
 pub const MAX_OBJECT_LEN: u64 = 512 * 1024 * 1024;
-const MAX_MESSAGE_LEN: usize = 32 * 1024 * 1024;
+/// Largest request a host reads. Requests are read before the host checks
+/// who is asking, so this stays small; the biggest (an invite or pairing
+/// request listing a few addresses) needs far less.
+pub(crate) const MAX_REQUEST_LEN: usize = 64 * 1024;
+/// Largest response a client reads (a long list of pack ids).
+pub(crate) const MAX_RESPONSE_LEN: usize = 32 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Request {
@@ -152,11 +157,15 @@ pub(crate) async fn write_msg<T: Serialize>(
     Ok(())
 }
 
-pub(crate) async fn read_msg<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T, NetError> {
+/// Reads one length-prefixed message of at most `max_len` bytes.
+pub(crate) async fn read_msg<T: DeserializeOwned>(
+    recv: &mut RecvStream,
+    max_len: usize,
+) -> Result<T, NetError> {
     let mut len = [0u8; 4];
     recv.read_exact(&mut len).await.map_err(transport)?;
     let len = u32::from_le_bytes(len) as usize;
-    if len > MAX_MESSAGE_LEN {
+    if len > max_len {
         return Err(NetError::Protocol(format!(
             "message of {len} bytes is too large"
         )));
