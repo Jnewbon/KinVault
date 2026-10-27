@@ -779,8 +779,6 @@ async function newSetDialog() {
         { name: "to", label: "until", type: "time" },
       ] },
       { name: "ownKey", label: "Use a separate encryption key for this backup", type: "checkbox", value: false, hint: "Normally your backups share one key. A separate key keeps this one apart even from hosts that also store your other backups." },
-      { name: "pass", label: "Recovery passphrase", type: "password", hint: "Protects this backup's recovery file. At least 8 characters." },
-      { name: "pass2", label: "Repeat passphrase", type: "password" },
     ],
     ok: "Start backing up",
     validate: (v) => {
@@ -788,8 +786,6 @@ async function newSetDialog() {
       if (!v.paths.length) return "Choose at least one folder to back up.";
       if (v.dest === "id" && !/^[0-9a-f]{64}$/i.test(v.peerId)) return "Paste the 64-character instance id.";
       if (v.dest === "local" && !v.localPath.length) return "Choose the backup folder.";
-      if (v.pass.length < 8) return "The passphrase needs at least 8 characters.";
-      if (v.pass !== v.pass2) return "The passphrases don't match.";
       return windowProblem(v);
     },
     onSubmit: async (v) => {
@@ -797,7 +793,7 @@ async function newSetDialog() {
         : { kind: "peer", id: v.dest === "id" ? v.peerId.toLowerCase() : v.dest.slice(5), addrs: [] };
       const retention = { recommended: null, all: {}, month: { last: 3, daily: 31, monthly: 12 } }[v.keep];
       await call("create_set", {
-        name: v.name, paths: v.paths, target, recovery_passphrase: v.pass,
+        name: v.name, paths: v.paths, target,
         debounce_secs: null, rescan_secs: null, upload_limit: toBytes(v.rate, MiB),
         window: windowFrom(v.from, v.to), retention, excludes: excludesFrom(v.excludes),
         own_key: v.ownKey,

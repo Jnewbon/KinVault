@@ -455,22 +455,6 @@ fn format_unix(secs: i64) -> String {
     format_time(secs * 1_000_000_000)
 }
 
-fn recovery_passphrase() -> Result<String> {
-    if let Ok(p) = std::env::var(PASSPHRASE_ENV) {
-        return Ok(p);
-    }
-    println!("Choose a recovery passphrase. With it and the set's recovery file you can");
-    println!("restore on a new machine; without both, the backups can't be decrypted.");
-    let p = rpassword::prompt_password("Recovery passphrase: ")?;
-    if p.chars().count() < 8 {
-        bail!("passphrase must be at least 8 characters");
-    }
-    if rpassword::prompt_password("Repeat passphrase: ")? != p {
-        bail!("passphrases do not match");
-    }
-    Ok(p)
-}
-
 fn parse_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
     let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
@@ -760,7 +744,6 @@ async fn main() -> Result<()> {
                 name: name.clone(),
                 paths,
                 target,
-                recovery_passphrase: recovery_passphrase()?,
                 debounce_secs: debounce,
                 rescan_secs: None,
                 upload_limit: limits.upload_limit,

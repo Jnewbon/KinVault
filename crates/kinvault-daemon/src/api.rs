@@ -168,8 +168,6 @@ pub struct CreateSet {
     pub name: String,
     pub paths: Vec<PathBuf>,
     pub target: Target,
-    /// Wraps the set's key in a recovery file; needed to restore on a new machine.
-    pub recovery_passphrase: String,
     /// Quiet period after a change before backing up (default 30 s).
     pub debounce_secs: Option<u64>,
     /// Interval between full rescans that catch missed changes (default 6 h).

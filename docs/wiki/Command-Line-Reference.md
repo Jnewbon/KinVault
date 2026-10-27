@@ -66,9 +66,6 @@ a LaunchAgent on macOS, and a `Run` registry entry on Windows.
 | `--exclude <pattern>` | Leave out matches; repeat for more |
 | `--own-key` | Encrypt with a key of its own instead of the shared one |
 
-You're asked for the backup's recovery passphrase (or set
-`KINVAULT_PASSPHRASE`).
-
 ## Restoring
 
 | Command | Does |
@@ -127,7 +124,7 @@ See [[Recovery Kit]].
 | Variable | Used by | Meaning |
 |---|---|---|
 | `KINVAULT_STATE` | all | State folder |
-| `KINVAULT_PASSPHRASE` | `set create`, `recovery` | Passphrase, instead of asking |
+| `KINVAULT_PASSPHRASE` | `recovery` | Passphrase, instead of asking |
 | `KINVAULT_LISTEN_PORT` | `kinvaultd` | UDP port, if none is configured yet |
 | `KINVAULT_WEB` | `kinvaultd` (web builds) | Serve the web interface on this address |
 | `KINVAULT_WEB_PASSWORD` | `kinvaultd` (web builds) | Web sign-in password |

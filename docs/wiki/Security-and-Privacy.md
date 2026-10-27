@@ -40,7 +40,7 @@ share): anyone with access to the folder sees only encrypted packs.
 | Data and metadata | XChaCha20-Poly1305, with separate keys for data and metadata |
 | Chunk ids (for deduplication) | Keyed BLAKE3, so ids reveal nothing without the key |
 | Keys | A random 256-bit key shared by your backup sets, or one of its own for a set that asks; sub-keys derived with BLAKE3 |
-| Passphrase-protected keys (recovery file, recovery kit) | Argon2id (64 MiB, 3 passes) |
+| Passphrase-protected keys (recovery kit) | Argon2id (64 MiB, 3 passes) |
 | Connections between instances | QUIC (TLS 1.3), authenticated by each instance's key |
 
 By default your backup sets share one key. A set can have a key of its own

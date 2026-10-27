@@ -166,10 +166,6 @@ pub fn import_offline(
         let set_dir = state_dir.join("sets").join(&id);
         fs::create_dir_all(&set_dir)?;
         write_master_key(&set_dir, key)?;
-        write_private(
-            &set_dir.join("keyfile.json"),
-            serde_json::to_string_pretty(&set.key)?.as_bytes(),
-        )?;
         config.sets.push(SetConfig {
             id,
             name: name.clone(),

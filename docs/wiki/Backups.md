@@ -11,14 +11,10 @@ In the app: **Backups → New backup**. On the command line:
 kinvault set create <name> <paths>… (--peer <peer> | --local <folder>) [options]
 ```
 
-Each backup asks for a **recovery passphrase** (at least 8 characters).
-KinVault keeps a second, passphrase-protected copy of the backup's key
-(`keyfile.json` in the state folder) alongside the key it uses day to day.
-Write the passphrase down. It's separate from the [[Recovery Kit]]
-passphrase.
-
-A new backup isn't in recovery kits you made before it, so export a new kit
-after creating one.
+A backup's key is kept in the state folder. To restore on another machine
+you need a [[Recovery Kit]], which holds every backup's key under one
+passphrase. A new backup isn't in recovery kits you made before it, so
+export a new kit after creating one.
 
 The first backup starts immediately.
 

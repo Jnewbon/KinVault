@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use kinvault_core::{KeyFile, LocalDirBackend, MasterKey};
+use kinvault_core::{LocalDirBackend, MasterKey};
 use kinvault_net::{
     Endpoint, EndpointId, HostAddr, InviteAccepted, InviteRedemption, InviteTicket, Offer,
     Receiver, RemoteBackend,
@@ -931,10 +931,6 @@ impl Daemon {
             !req.paths.is_empty(),
             "choose at least one file or folder to back up"
         );
-        ensure!(
-            req.recovery_passphrase.chars().count() >= 8,
-            "recovery passphrase must be at least 8 characters"
-        );
         let paths = canonical_paths(&req.paths)?;
 
         let mut config = self.inner.config.lock().await;
@@ -996,13 +992,6 @@ impl Daemon {
         let set_dir = self.set_dir(&set.id);
         create_private_dir(&set_dir)?;
         write_master_key(&set_dir, &master)?;
-        let passphrase = req.recovery_passphrase;
-        let keyfile =
-            tokio::task::spawn_blocking(move || KeyFile::create(&master, &passphrase)).await??;
-        crate::config::write_private(
-            &set_dir.join("keyfile.json"),
-            serde_json::to_string_pretty(&keyfile)?.as_bytes(),
-        )?;
 
         config.sets.push(set.clone());
         config.save(&self.config_path())?;
