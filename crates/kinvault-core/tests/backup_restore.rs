@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use kinvault_core::{
-    Backend, Index, LocalDirBackend, MasterKey, PackId, Repository, Result, SnapshotId,
+    Backend, BackupStep, Index, LocalDirBackend, MasterKey, PackId, Repository, Result, SnapshotId,
 };
 
 /// Wraps a backend and counts bytes sent to it, to check incremental traffic.
@@ -404,7 +404,7 @@ fn backup_progress_counts_files_and_their_size_together() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let sink = seen.clone();
     repo.set_progress(Some(Arc::new(move |p: &kinvault_core::BackupProgress| {
-        sink.lock().unwrap().push(*p)
+        sink.lock().unwrap().push(p.clone())
     })));
 
     // The first run reads every file; the second finds them all unchanged.
@@ -412,7 +412,10 @@ fn backup_progress_counts_files_and_their_size_together() {
         seen.lock().unwrap().clear();
         let (_, stats) = repo.backup(std::slice::from_ref(&src), "h").unwrap();
         let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 21, "run {run}: one per file, then the totals");
+        // Once per file (and per pack sent), then the totals.
+        let mut counts: Vec<u64> = seen.iter().map(|p| p.files).collect();
+        counts.dedup();
+        assert_eq!(counts, (1..=20).collect::<Vec<u64>>(), "run {run}");
         for p in seen.iter() {
             assert_eq!(p.total_bytes, p.files * size as u64, "run {run}: {p:?}");
         }
@@ -423,6 +426,62 @@ fn backup_progress_counts_files_and_their_size_together() {
             (stats.files, stats.total_bytes)
         );
     }
+}
+
+#[test]
+fn a_large_file_reports_progress_while_it_is_read() {
+    use std::sync::{Arc, Mutex};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    let mut data = vec![0u8; 12 << 20];
+    blake3::Hasher::new().finalize_xof().fill(&mut data);
+    fs::write(src.join("big"), &data).unwrap();
+    let mut repo = Repository::open(
+        LocalDirBackend::create(tmp.path().join("store")).unwrap(),
+        &MasterKey::generate().unwrap(),
+        Index::open_in_memory().unwrap(),
+    );
+    repo.set_pack_target(4 << 20);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    repo.set_progress(Some(Arc::new(move |p: &kinvault_core::BackupProgress| {
+        sink.lock().unwrap().push(p.clone())
+    })));
+    repo.backup(std::slice::from_ref(&src), "h").unwrap();
+
+    let seen = seen.lock().unwrap();
+    let big = src.join("big").to_string_lossy().into_owned();
+    let reading: Vec<_> = seen
+        .iter()
+        .filter(|p| p.step == BackupStep::Reading)
+        .collect();
+    // Named before any of it is read, then counted as it's read.
+    assert_eq!(reading[0].file.as_deref(), Some(big.as_str()));
+    assert_eq!(reading[0].bytes_read, 0);
+    assert!(
+        reading
+            .iter()
+            .all(|p| p.file_size == data.len() as u64 && p.file_read == p.bytes_read)
+    );
+    assert!(
+        reading
+            .windows(2)
+            .all(|w| w[0].bytes_read <= w[1].bytes_read)
+    );
+    // Partway through it, before it counts as looked at.
+    let partway = reading.iter().filter(|p| p.files == 0).count();
+    assert!(partway > 3, "{partway}");
+    // Full packs are sent while the file is still being read.
+    let sent_early = seen
+        .iter()
+        .filter(|p| matches!(p.step, BackupStep::Sending { .. }) && p.files == 0)
+        .count();
+    assert!(sent_early >= 2, "{sent_early}");
+    let last = seen.last().unwrap();
+    assert!(last.scanned);
+    assert_eq!((last.files, last.bytes_read), (1, data.len() as u64));
 }
 
 #[test]

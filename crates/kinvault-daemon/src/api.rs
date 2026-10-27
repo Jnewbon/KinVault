@@ -330,6 +330,20 @@ pub enum Event {
         total_bytes: u64,
         bytes_read: u64,
         bytes_uploaded: u64,
+        /// What the backup is doing right now.
+        #[serde(default)]
+        step: BackupStep,
+        /// The file being checked or read.
+        #[serde(default)]
+        file: Option<String>,
+        /// Size of the pack being sent, while `step` is `Sending`.
+        #[serde(default)]
+        sending_bytes: u64,
+        /// While reading a file: its size, and how much of it was read.
+        #[serde(default)]
+        file_size: u64,
+        #[serde(default)]
+        file_read: u64,
     },
     /// How far cleaning up old versions or checking the backups got.
     MaintenanceProgress {
@@ -447,6 +461,18 @@ pub struct StoppedSetStatus {
     pub stopped_unix: i64,
     /// When its backups are due to be erased (Unix seconds).
     pub erase_after_unix: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupStep {
+    /// Looking for changed files.
+    #[default]
+    Checking,
+    /// Reading, compressing and encrypting a changed file.
+    Reading,
+    /// Sending a pack to where the backup is kept.
+    Sending,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]

@@ -187,7 +187,9 @@ impl<B: Backend> Repository<B> {
             for entry in contents[pack].iter().filter(|e| live.contains(&e.id)) {
                 let plaintext =
                     pack::decode_blob(&self.keys, &entry.id, pack::blob_bytes(&data, entry)?)?;
-                writer.add(self, entry.id, entry.kind, &plaintext)?;
+                if writer.add(self, entry.id, entry.kind, &plaintext)? {
+                    writer.flush_kind(self, entry.kind)?;
+                }
             }
             repacked += size;
             report(

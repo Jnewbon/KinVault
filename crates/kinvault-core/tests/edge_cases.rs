@@ -8,7 +8,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use kinvault_core::pack::{self, BlobKind};
 use kinvault_core::{
-    Backend, BackupProgress, Error, Index, LocalDirBackend, MasterKey, Repository,
+    Backend, BackupProgress, BackupStep, Error, Index, LocalDirBackend, MasterKey, Repository,
     snapshot_root_name,
 };
 
@@ -53,7 +53,7 @@ fn progress_is_reported_while_backing_up() {
     let seen: Arc<Mutex<Vec<BackupProgress>>> = Arc::default();
     let sink = seen.clone();
     repo.set_progress(Some(Arc::new(move |p: &BackupProgress| {
-        sink.lock().unwrap().push(*p)
+        sink.lock().unwrap().push(p.clone())
     })));
     repo.backup(std::slice::from_ref(&src), "host").unwrap();
     // Unchanged files are reported too.
@@ -61,9 +61,21 @@ fn progress_is_reported_while_backing_up() {
     repo.set_progress(None);
     repo.backup(std::slice::from_ref(&src), "host").unwrap();
 
-    // One report per file, then the final totals once the scan is done.
-    let seen = seen.lock().unwrap();
+    // Each pack sent is reported as it goes: one for the files, one for the
+    // folder listing, on the first run only.
+    let mut seen = seen.lock().unwrap();
+    let sending = |p: &BackupProgress| matches!(p.step, BackupStep::Sending { .. });
+    let sends: Vec<_> = seen.iter().filter(|p| sending(p)).cloned().collect();
+    assert_eq!(sends.len(), 2);
+    assert!(sends.iter().all(|p| p.files == 2 && !p.scanned));
+    seen.retain(|p| !sending(p));
+
+    // Otherwise one report per file, then the final totals once the scan is done.
     assert_eq!(seen.len(), 6);
+    assert_eq!(
+        seen[0].file.as_deref(),
+        Some(&*src.join("a").to_string_lossy())
+    );
     assert_eq!((seen[1].files, seen[1].bytes_read), (2, 7));
     assert!(seen[2].scanned && !seen[1].scanned);
     assert_eq!(

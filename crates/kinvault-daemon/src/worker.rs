@@ -24,7 +24,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::api::{BackupSummary, Event, PruneSummary, SetState, VerifySummary};
+use crate::api::{self, BackupSummary, Event, PruneSummary, SetState, VerifySummary};
 use crate::config::{SetConfig, StoredTarget, write_private};
 use crate::reachability::{HostTarget, Hosts};
 
@@ -376,21 +376,37 @@ fn maintenance_reporter(
 }
 
 /// Forwards backup progress to subscribers, at most four times a second,
-/// and always the final totals once every file has been looked at.
+/// but always when the backup moves to another step (sending a pack can
+/// take a while on a slow link) and the final totals once every file has
+/// been looked at.
 fn progress_reporter(env: &SetEnv) -> kinvault_core::ProgressFn {
+    use kinvault_core::BackupStep as S;
     let events = env.events.clone();
     let set = env.set.id.clone();
-    let last = Mutex::new(std::time::Instant::now() - Duration::from_secs(1));
+    let last = Mutex::new((
+        std::time::Instant::now() - Duration::from_secs(1),
+        api::BackupStep::Checking,
+    ));
     Arc::new(move |p: &kinvault_core::BackupProgress| {
+        let (step, sending_bytes) = match p.step {
+            S::Checking => (api::BackupStep::Checking, 0),
+            S::Reading => (api::BackupStep::Reading, 0),
+            S::Sending { bytes } => (api::BackupStep::Sending, bytes),
+        };
         let mut last = last.lock().unwrap();
-        if p.scanned || last.elapsed() >= Duration::from_millis(250) {
-            *last = std::time::Instant::now();
+        if p.scanned || step != last.1 || last.0.elapsed() >= Duration::from_millis(250) {
+            *last = (std::time::Instant::now(), step);
             let _ = events.send(Event::Progress {
                 set: set.clone(),
                 files: p.files,
                 total_bytes: p.total_bytes,
                 bytes_read: p.bytes_read,
                 bytes_uploaded: p.bytes_uploaded,
+                step,
+                file: p.file.clone(),
+                sending_bytes,
+                file_size: p.file_size,
+                file_read: p.file_read,
             });
         }
     })

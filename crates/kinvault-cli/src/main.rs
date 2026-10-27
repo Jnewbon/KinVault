@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use kinvault_daemon::api::{
-    CreateInvite, CreateSet, GrantSpec, HostAddr, NetworkInfo, NetworkSettings, Reply, Request,
-    RetentionPolicy, SetState, Target, TimeWindow,
+    BackupStep, CreateInvite, CreateSet, GrantSpec, HostAddr, NetworkInfo, NetworkSettings, Reply,
+    Request, RetentionPolicy, SetState, Target, TimeWindow,
 };
 use kinvault_daemon::ipc::Client;
 
@@ -898,14 +898,34 @@ async fn main() -> Result<()> {
                         set,
                         files,
                         total_bytes,
+                        bytes_read,
                         bytes_uploaded,
-                        ..
-                    } => println!(
-                        "{}: {files} files scanned ({}), uploaded {}",
-                        name(&set),
-                        format_bytes(total_bytes),
-                        format_bytes(bytes_uploaded)
-                    ),
+                        step,
+                        file,
+                        sending_bytes,
+                        file_size,
+                        file_read,
+                    } => {
+                        let doing = match (step, file) {
+                            (BackupStep::Sending, _) => {
+                                format!("sending {}", format_bytes(sending_bytes))
+                            }
+                            (BackupStep::Reading, Some(f)) => format!(
+                                "reading {f} ({} of {})",
+                                format_bytes(file_read),
+                                format_bytes(file_size)
+                            ),
+                            (_, Some(f)) => format!("checking {f}"),
+                            (_, None) => "checking".to_string(),
+                        };
+                        println!(
+                            "{}: {doing}; {files} files ({}) looked at, {} read, {} uploaded",
+                            name(&set),
+                            format_bytes(total_bytes),
+                            format_bytes(bytes_read),
+                            format_bytes(bytes_uploaded)
+                        )
+                    }
                     Event::MaintenanceProgress {
                         set,
                         step,

@@ -83,6 +83,8 @@ h2 { font-size: 15px; margin: 26px 0 10px; font-weight: 650; }
 .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .spacer { flex: 1; }
 .lines { margin: 10px 0 0; display: grid; gap: 4px; font-size: 13px; }
+.lines.tight { margin: 0; gap: 2px; }
+.now { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .paths { margin: 6px 0 0; color: var(--muted); font-size: 12px; }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
 .chip { font-size: 12px; padding: 2px 9px; border-radius: 999px; background: var(--surface-2); color: var(--muted); font-weight: 600; }

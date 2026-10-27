@@ -18,7 +18,8 @@ const state = {
   invites: [],
   network: null, // NetworkInfo
   nearby: { until_unix: null, devices: [] }, // NearbyStatus
-  progress: {}, // set id -> latest Progress event
+  progress: {}, // set id -> latest Progress event, plus when sending its pack started
+  rates: {}, // set id -> recent { t, read, sent } samples, for the backup's speeds
   maintenance: {}, // set id -> latest MaintenanceProgress event, plus when its step started
   autostart: false,
   restoreSet: null,
@@ -577,17 +578,71 @@ function restorableSets() {
   return [...(state.status?.sets || []), ...(state.status?.stopped_sets || [])];
 }
 
-function backupProgressText(progress) {
-  return progress
-    ? `Scanned ${plural(progress.files, "file")} (${bytes(progress.total_bytes)}), read ${bytes(progress.bytes_read)}, sent ${bytes(progress.bytes_uploaded)}`
-    : "Starting…";
+/** Records a Progress event, keeping about five seconds of samples for the speeds. */
+function noteProgress(ev) {
+  const now = performance.now();
+  const prev = state.progress[ev.set];
+  if (ev.step === "sending") ev.sendingSince = prev?.step === "sending" ? prev.sendingSince : now;
+  state.progress[ev.set] = ev;
+  const samples = (state.rates[ev.set] ||= []);
+  samples.push({ t: now, read: ev.bytes_read, sent: ev.bytes_uploaded });
+  while (samples.length > 2 && now - samples[1].t > 5000) samples.shift();
+}
+
+function forgetProgress(set) {
+  delete state.progress[set];
+  delete state.rates[set];
+}
+
+/** Bytes per second of `key` over the recent samples, or null with too little to go on. */
+function rate(set, key) {
+  const s = state.rates[set];
+  if (!s || s.length < 2) return null;
+  const first = s[0], last = s[s.length - 1];
+  const secs = (last.t - first.t) / 1000;
+  return secs >= 1 ? (last[key] - first[key]) / secs : null;
+}
+
+/** "3.2 GiB" plus its speed when there is one, e.g. "3.2 GiB at 85 MiB/s". */
+function withRate(total, perSec) {
+  return perSec === null || perSec <= 0 ? bytes(total) : `${bytes(total)} at ${bytes(Math.round(perSec))}/s`;
+}
+
+/** What a running backup is doing now, and how far it got. */
+function backupProgressLines(set) {
+  const p = state.progress[set.id];
+  if (!p) return [el("div", {}, "Starting…")];
+  let now;
+  if (p.step === "sending") {
+    const secs = Math.floor((performance.now() - p.sendingSince) / 1000);
+    now = el("div", { class: "now" },
+      `Sending ${bytes(p.sending_bytes)} to ${describeTarget(set.target)}…`,
+      secs >= 2 ? el("span", { class: "muted" }, ` ${secs} s`) : null);
+  } else if (p.file) {
+    const cut = Math.max(p.file.lastIndexOf("/"), p.file.lastIndexOf("\\"));
+    const reading = p.step === "reading";
+    // Only worth saying for a file that takes a while.
+    const howFar = reading && p.file_size >= 64 * MiB
+      ? ` (${bytes(p.file_read)} of ${bytes(p.file_size)})` : "";
+    now = el("div", { class: "now", title: p.file },
+      reading ? "Reading " : "Looking for changes: ",
+      el("strong", {}, p.file.slice(cut + 1)), howFar,
+      el("span", { class: "muted" }, ` in ${p.file.slice(0, Math.max(cut, 1))}`));
+  } else {
+    now = el("div", { class: "now" }, "Looking for changes…");
+  }
+  const totals = [
+    p.files ? `${plural(p.files, "file")} (${bytes(p.total_bytes)}) looked at` : null,
+    `read ${withRate(p.bytes_read, rate(set.id, "read"))}`,
+    `sent ${withRate(p.bytes_uploaded, rate(set.id, "sent"))}`,
+  ];
+  return [now, el("div", { class: "muted" }, totals.filter(Boolean).join(" · "))];
 }
 
 function setCard(set) {
   const lines = el("div", { class: "lines" });
-  const progress = state.progress[set.id];
   if (set.state === "running") {
-    lines.append(el("div", { id: `backup-progress-${set.id}` }, backupProgressText(progress)));
+    lines.append(el("div", { id: `backup-progress-${set.id}`, class: "lines tight" }, ...backupProgressLines(set)));
     lines.append(el("div", { class: "progress indeterminate" }, el("div")));
   }
   if (set.state === "pruning" || set.state === "verifying") {
@@ -929,9 +984,10 @@ function restoreCard(job) {
  * Shows a backup's latest progress without redrawing the page, which would
  * restart the progress bar's animation on every update.
  */
-function updateBackupProgress(progress) {
-  const line = document.getElementById(`backup-progress-${progress.set}`);
-  if (line) line.textContent = backupProgressText(progress);
+function updateBackupProgress(setId) {
+  const box = document.getElementById(`backup-progress-${setId}`);
+  const set = state.status?.sets.find((s) => s.id === setId);
+  if (box && set) box.replaceChildren(...backupProgressLines(set));
   else if (state.page === "backups") renderBackups();
 }
 
@@ -1448,6 +1504,7 @@ async function setConnected(connected) {
     state.network = null;
     state.nearby = { until_unix: null, devices: [] };
     state.progress = {};
+    state.rates = {};
     state.maintenance = {};
   }
   render();
@@ -1458,21 +1515,21 @@ listen("daemon-event", (e) => {
   const ev = e.payload;
   switch (ev.event) {
     case "progress":
-      state.progress[ev.set] = ev;
-      updateBackupProgress(ev);
+      noteProgress(ev);
+      updateBackupProgress(ev.set);
       break;
     case "maintenance_progress":
       noteMaintenance(ev);
       updateMaintenance(ev.set);
       break;
     case "backup_finished":
-      delete state.progress[ev.set];
+      forgetProgress(ev.set);
       refreshSoon();
       break;
     case "set_state": {
       const set = state.status?.sets.find((s) => s.id === ev.set);
       if (set) set.state = ev.state;
-      if (ev.state !== "running") delete state.progress[ev.set];
+      if (ev.state !== "running") forgetProgress(ev.set);
       if (ev.state !== "pruning" && ev.state !== "verifying") delete state.maintenance[ev.set];
       render();
       refreshSoon();
@@ -1537,6 +1594,11 @@ for (const ev of ["scroll", "resize"]) {
     for (const tip of document.querySelectorAll(".info-tip")) if (tip.offsetParent || tip.offsetHeight) tip.place?.();
   }, true);
 }
+
+// A backup sending a pack says for how long, even with no new progress.
+setInterval(() => {
+  for (const [id, p] of Object.entries(state.progress)) if (p.step === "sending") updateBackupProgress(id);
+}, 1000);
 
 // Relative times ("5 min ago") stay fresh.
 setInterval(() => { if (state.page === "backups") renderBackups(); }, 30_000);
