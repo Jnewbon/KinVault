@@ -69,6 +69,7 @@ This runs even outside the backup's hours (below) and waits until it's done.
 | Backing up | A backup is running |
 | Cleaning up | Removing old versions it no longer keeps; shows how far it got and roughly how long is left |
 | Checking | Checking the stored backups are complete and intact; shows progress the same way |
+| Copying | Copying new versions to the backup's other places (see below) |
 | Waiting for its hours | Changes are waiting for the backup's time window |
 | Waiting for destination | The computer it backs up to is offline; it backs up when it's back |
 | Not backed up yet | No backup has finished yet |
@@ -138,6 +139,41 @@ kinvault set retention documents --keep-all
 
 New rules apply at the next clean-up. To clean up now: **Clean up old
 versions** in the app, or `kinvault prune <set>`.
+
+## Keeping copies in more places
+
+A backup can keep copies in more than one place, each with its own keep
+rules. For example, a home server can keep every version while a friend's
+computer keeps one a day, then one a week and one a month.
+
+In the app: **Also keep copies in…** on the backup, then pick the place and
+which versions to keep there. On the command line:
+
+```sh
+kinvault set place add documents --peer friend --keep-daily 14 --keep-weekly 8 --keep-monthly 12
+```
+
+How it works:
+
+- Backups go to the backup's main place, as before. After each one, every
+  other place gets the versions it keeps but doesn't have yet. The data is
+  copied exactly as it is: encrypted, with the same key.
+- A new place starts with the versions its rules keep. After that, it gets
+  the **first** new version of each hour, day, week, month or year it keeps,
+  as soon as that version exists. With a "latest N" rule (like
+  **Recommended**), it gets every new version.
+- Each place cleans up with its own rules, and is checked about once a week.
+- Each place has its own upload speed limit and hours. A place whose
+  computer is offline catches up when it's back.
+- You can restore from any of them: pick it under **Restore from** (or use
+  `--from <place>` on the command line).
+- Copies are made from the main place, so give the main place the most
+  history (for example your home server), and make it one that's quick to
+  reach.
+
+Removing a place (**Remove…**, or `kinvault set place remove`) erases what
+it holds a week later, like deleting a backup. The backup's other places
+aren't affected.
 
 ## Upload speed and hours
 

@@ -54,12 +54,13 @@ impl Daemon {
             set.name
         );
         let now = unix_now();
-        let pending = pending_deletion(set, now, now + REPO_DELETE_DELAY.as_secs() as i64);
-        let id = pending.set_id.clone();
+        let pending = pending_deletions(set, now, now + REPO_DELETE_DELAY.as_secs() as i64);
+        let id = pending[0].set_id.clone();
+        let name = pending[0].set_name.clone();
         let mut config = self.inner.config.lock().await;
         config.sets.retain(|s| s.id != id);
         config.stopped_sets.retain(|s| s.set.id != id);
-        config.pending_deletions.push(pending.clone());
+        config.pending_deletions.extend(pending.iter().cloned());
         config.save(&self.config_path())?;
         drop(config);
         let handle = self.inner.sets.lock().await.remove(&id);
@@ -70,16 +71,35 @@ impl Daemon {
         self.wait_closed(&id).await;
         // Without its key, nothing backed up can be read any more.
         remove_dir(&self.set_dir(&id))?;
-        tracing::info!(set = pending.set_name, "deleted backup set");
+        tracing::info!(set = name, "deleted backup set");
 
-        let progress = self.erase(&pending, ASK_NOW_TIMEOUT).await;
-        if progress.finished {
-            self.forget_deletion(&pending.set_id).await?;
+        // Tells every place at once; the reply is about the main one, plus
+        // whether any is still to be asked again.
+        let mut tasks = tokio::task::JoinSet::new();
+        for (i, p) in pending.iter().cloned().enumerate() {
+            let daemon = self.clone();
+            tasks.spawn(async move { (i, daemon.erase(&p, ASK_NOW_TIMEOUT).await) });
         }
+        let mut results: Vec<Option<Progress>> = pending.iter().map(|_| None).collect();
+        while let Some(done) = tasks.join_next().await {
+            let (i, progress) = done?;
+            results[i] = Some(progress);
+        }
+        let results: Vec<Progress> = results.into_iter().flatten().collect();
+        let mut retrying = false;
+        for (p, progress) in pending.iter().zip(&results) {
+            if progress.finished {
+                self.forget_deletion(&p.set_id, p.target_id.as_deref())
+                    .await?;
+            } else if progress.error.is_some() {
+                retrying = true;
+            }
+        }
+        let main = &results[0];
         Ok(Reply::SetDeleted(DeletedSet {
-            erase_after_unix: progress.erase_after_unix,
-            retrying: !progress.finished && progress.error.is_some(),
-            error: progress.error,
+            erase_after_unix: main.erase_after_unix,
+            retrying,
+            error: results.iter().find_map(|p| p.error.clone()),
         }))
     }
 
@@ -97,12 +117,12 @@ impl Daemon {
                     .erase(&p, ASK_TIMEOUT)
                     .await
                     .finished
-                    .then_some(p.set_id)
+                    .then_some((p.set_id, p.target_id))
             });
         }
         while let Some(done) = tasks.join_next().await {
-            if let Some(set_id) = done? {
-                self.forget_deletion(&set_id).await?;
+            if let Some((set_id, target_id)) = done? {
+                self.forget_deletion(&set_id, target_id.as_deref()).await?;
             }
         }
         Ok(())
@@ -126,22 +146,37 @@ impl Daemon {
             // The grace period is over, so a backup folder is erased now.
             config
                 .pending_deletions
-                .push(pending_deletion(s.set, now, now));
+                .extend(pending_deletions(s.set, now, now));
         }
         config.save(&self.config_path())
     }
 
-    /// The set's backups are erased (or given up on): erase the key a
-    /// stopped set kept until now, and forget it. If the key can't be erased
-    /// yet (a restore has it open), it's tried again next time.
-    async fn forget_deletion(&self, set_id: &str) -> Result<()> {
-        self.wait_closed(set_id).await;
-        if let Err(e) = remove_dir(&self.set_dir(set_id)) {
-            tracing::warn!(set = set_id, "couldn't erase a stopped set's key yet: {e}");
-            return Ok(());
+    /// The backups in one of a set's places are erased (or given up on):
+    /// forget about them. Once that was the set's last place and the set is
+    /// gone, erase the key a stopped set kept until now too. If the key
+    /// can't be erased yet (a restore has it open), it's tried again next time.
+    async fn forget_deletion(&self, set_id: &str, target_id: Option<&str>) -> Result<()> {
+        let last = {
+            let config = self.inner.config.lock().await;
+            let others = config
+                .pending_deletions
+                .iter()
+                .any(|p| p.set_id == set_id && p.target_id.as_deref() != target_id);
+            let alive = config.sets.iter().any(|s| s.id == set_id)
+                || config.stopped_sets.iter().any(|s| s.set.id == set_id);
+            !others && !alive
+        };
+        if last {
+            self.wait_closed(set_id).await;
+            if let Err(e) = remove_dir(&self.set_dir(set_id)) {
+                tracing::warn!(set = set_id, "couldn't erase a stopped set's key yet: {e}");
+                return Ok(());
+            }
         }
         let mut config = self.inner.config.lock().await;
-        config.pending_deletions.retain(|p| p.set_id != set_id);
+        config
+            .pending_deletions
+            .retain(|p| !(p.set_id == set_id && p.target_id.as_deref() == target_id));
         config.save(&self.config_path())
     }
 
@@ -235,15 +270,23 @@ impl Daemon {
     }
 }
 
-fn pending_deletion(set: SetConfig, now: i64, erase_local_after: i64) -> PendingDeletion {
-    PendingDeletion {
-        set_id: set.id,
-        set_name: set.name,
-        erase_after_unix: matches!(set.target, StoredTarget::Local { .. })
-            .then_some(erase_local_after),
-        target: set.target,
+/// One deletion per place the set keeps backups in, the main one first.
+fn pending_deletions(set: SetConfig, now: i64, erase_local_after: i64) -> Vec<PendingDeletion> {
+    let place = |target_id: Option<String>, target: StoredTarget| PendingDeletion {
+        set_id: set.id.clone(),
+        set_name: set.name.clone(),
+        target_id,
+        erase_after_unix: matches!(target, StoredTarget::Local { .. }).then_some(erase_local_after),
+        target,
         requested_unix: now,
-    }
+    };
+    std::iter::once(place(None, set.target.clone()))
+        .chain(
+            set.extra_targets
+                .iter()
+                .map(|t| place(Some(t.id.clone()), t.target.clone())),
+        )
+        .collect()
 }
 
 fn remove_dir(path: &Path) -> io::Result<()> {

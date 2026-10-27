@@ -16,7 +16,7 @@ use kinvault_core::{KeyFile, MasterKey, RetentionPolicy};
 use kinvault_net::{SecretKey, TimeWindow};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, PeerEntry, SetConfig, StoredTarget, write_private};
+use crate::config::{Config, ExtraTarget, PeerEntry, SetConfig, StoredTarget, write_private};
 use crate::worker::{shared_key_path, write_key, write_master_key};
 
 const KIT_VERSION: u32 = 1;
@@ -46,6 +46,10 @@ pub struct KitSet {
     /// shared have none).
     #[serde(default)]
     pub shared_key: bool,
+    /// More places that keep copies (kits made before there could be more
+    /// have none).
+    #[serde(default)]
+    pub extra_targets: Vec<ExtraTarget>,
     pub key: KeyFile,
 }
 
@@ -72,6 +76,7 @@ pub(crate) fn build(
             retention: set.retention,
             excludes: set.excludes.clone(),
             shared_key: set.shared_key,
+            extra_targets: set.extra_targets.clone(),
             key: KeyFile::create(key, passphrase)?,
         });
     }
@@ -179,6 +184,7 @@ pub fn import_offline(
             paused: true,
             excludes: set.excludes.clone(),
             shared_key: set.shared_key,
+            extra_targets: set.extra_targets.clone(),
         });
         imported.push(name);
     }

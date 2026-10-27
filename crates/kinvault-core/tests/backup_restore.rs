@@ -529,3 +529,98 @@ fn a_cancelled_backup_stops_and_the_next_one_finishes_it() {
     let out = tmp.path().join("out");
     repo.restore(&id, &out, None).unwrap();
 }
+
+#[test]
+fn snapshots_copy_to_a_second_store_with_only_what_it_lacks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    make_tree(&src);
+    let master = MasterKey::generate().unwrap();
+    let open = |dir: &str| {
+        Repository::open(
+            Counting {
+                inner: LocalDirBackend::create(tmp.path().join(dir)).unwrap(),
+                uploaded: AtomicU64::new(0),
+            },
+            &master,
+            Index::open_in_memory().unwrap(),
+        )
+    };
+    let mut main = open("main");
+    let mut copy = open("copy");
+
+    let (first, _) = main.backup(std::slice::from_ref(&src), "h").unwrap();
+    fs::write(src.join("new.txt"), pseudo_random(300_000, "new")).unwrap();
+    let (second, _) = main.backup(std::slice::from_ref(&src), "h").unwrap();
+
+    // Only the first: the copy gets what it needs, and restores the same.
+    let stats = main
+        .copy_snapshots_to(&mut copy, &[first], &mut |_, _| {})
+        .unwrap();
+    assert_eq!(stats.snapshots, 1);
+    assert!(stats.packs > 0);
+    assert_eq!(copy.snapshot_times().unwrap().len(), 1);
+    let out = tmp.path().join("out1");
+    copy.restore(&first, &out, None).unwrap();
+    let root = out.join(kinvault_core::snapshot_root_name(
+        &fs::canonicalize(&src).unwrap(),
+    ));
+    assert_eq!(
+        fs::read(root.join("big.bin")).unwrap(),
+        fs::read(src.join("big.bin")).unwrap()
+    );
+    assert!(!root.join("new.txt").exists());
+
+    // Then the second: only the new data travels.
+    let before = copy.backend().uploaded.load(Ordering::Relaxed);
+    let mut seen = Vec::new();
+    let stats = main
+        .copy_snapshots_to(&mut copy, &[second], &mut |done, total| {
+            seen.push((done, total))
+        })
+        .unwrap();
+    let sent = copy.backend().uploaded.load(Ordering::Relaxed) - before;
+    assert!(sent < 400_000, "{sent}");
+    assert_eq!(seen.last().map(|&(d, t)| d == t), Some(true));
+    // The total leaves out pack headers, so it's a little short of what was sent.
+    let total = seen.last().unwrap().1;
+    assert!(
+        stats.bytes >= total && stats.bytes < total + 4096,
+        "{stats:?} {total}"
+    );
+    let out = tmp.path().join("out2");
+    copy.restore(&second, &out, None).unwrap();
+    assert_same(
+        &src,
+        &out.join(kinvault_core::snapshot_root_name(
+            &fs::canonicalize(&src).unwrap(),
+        )),
+    );
+
+    // Copying again sends nothing; a store with another key is refused.
+    let again = main
+        .copy_snapshots_to(&mut copy, &[second], &mut |_, _| {})
+        .unwrap();
+    assert_eq!((again.packs, again.bytes), (0, 0));
+    let mut stranger = Repository::open(
+        LocalDirBackend::create(tmp.path().join("other")).unwrap(),
+        &MasterKey::generate().unwrap(),
+        Index::open_in_memory().unwrap(),
+    );
+    assert!(
+        main.copy_snapshots_to(&mut stranger, &[first], &mut |_, _| {})
+            .is_err()
+    );
+
+    // The copy keeps its own versions: pruning it to one leaves the main store alone.
+    copy.prune(&kinvault_core::RetentionPolicy {
+        last: Some(1),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(copy.snapshot_times().unwrap().len(), 1);
+    assert_eq!(main.snapshot_times().unwrap().len(), 2);
+    copy.verify(u64::MAX)
+        .map(|r| assert!(r.is_ok(), "{r:?}"))
+        .unwrap();
+}

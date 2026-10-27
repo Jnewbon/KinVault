@@ -69,11 +69,47 @@ pub enum Request {
     /// Removes snapshots the retention policy doesn't keep and frees their space.
     Prune {
         set: String,
+        /// Which of the set's places to use: an extra one's id or host
+        /// name; the main one if `None`.
+        #[serde(default)]
+        from: Option<String>,
     },
     /// Checks the set's backups; downloads up to `max_bytes` of data to decrypt and check.
     Verify {
         set: String,
         max_bytes: Option<u64>,
+        /// Which of the set's places to use: an extra one's id or host
+        /// name; the main one if `None`.
+        #[serde(default)]
+        from: Option<String>,
+    },
+    /// Keeps copies of a set's backups in another place too, with its own
+    /// retention and limits. It gets the versions it keeps after each backup.
+    AddSetTarget {
+        set: String,
+        target: Target,
+        /// Default: [`RetentionPolicy::recommended`].
+        #[serde(default)]
+        retention: Option<RetentionPolicy>,
+        #[serde(default)]
+        upload_limit: Option<u64>,
+        #[serde(default)]
+        window: Option<TimeWindow>,
+    },
+    /// Changes an extra place's retention and limits.
+    UpdateSetTarget {
+        set: String,
+        /// The place's id or host name.
+        target: String,
+        retention: RetentionPolicy,
+        upload_limit: Option<u64>,
+        window: Option<TimeWindow>,
+    },
+    /// Stops keeping copies in an extra place. What it holds is erased as
+    /// for [`Request::DeleteSet`].
+    RemoveSetTarget {
+        set: String,
+        target: String,
     },
     /// Everything needed to restore this instance's backups on a new machine,
     /// with all keys encrypted under `passphrase`.
@@ -85,12 +121,20 @@ pub enum Request {
     Subscribe,
     ListSnapshots {
         set: String,
+        /// Which of the set's places to use: an extra one's id or host
+        /// name; the main one if `None`.
+        #[serde(default)]
+        from: Option<String>,
     },
     Restore {
         set: String,
         snapshot: String,
         target: PathBuf,
         include: Option<String>,
+        /// Which of the set's places to use: an extra one's id or host
+        /// name; the main one if `None`.
+        #[serde(default)]
+        from: Option<String>,
     },
     /// Starts restoring in the background and answers at once with
     /// `RestoreStarted`; progress and the result arrive as events.
@@ -99,6 +143,10 @@ pub enum Request {
         snapshot: String,
         target: PathBuf,
         include: Option<String>,
+        /// Which of the set's places to use: an extra one's id or host
+        /// name; the main one if `None`.
+        #[serde(default)]
+        from: Option<String>,
     },
     /// Stops a background restore. Files restored so far are kept.
     CancelRestore {
@@ -107,6 +155,10 @@ pub enum Request {
     /// Storage used by a set's owner on the host it backs up to.
     RemoteUsage {
         set: String,
+        /// Which of the set's places to use: an extra one's id or host
+        /// name; the main one if `None`.
+        #[serde(default)]
+        from: Option<String>,
     },
     /// Lets a peer store backups here (or updates its limits).
     PeerAllow {
@@ -270,6 +322,9 @@ pub enum Reply {
     SetCreated {
         id: String,
     },
+    TargetAdded {
+        id: String,
+    },
     Done,
     Backup(BackupSummary),
     Snapshots(Vec<SnapshotInfo>),
@@ -357,6 +412,14 @@ pub enum Event {
     BackupFinished {
         set: String,
         summary: BackupSummary,
+    },
+    /// How far copying versions to an extra place got, in bytes.
+    CopyProgress {
+        set: String,
+        /// The extra place's id.
+        target: String,
+        done: u64,
+        total: u64,
     },
     BackupFailed {
         set: String,
@@ -449,6 +512,45 @@ pub struct SetStatus {
     pub last_error: Option<String>,
     pub last_prune: Option<PruneSummary>,
     pub last_verify: Option<VerifySummary>,
+    /// More places that keep copies of the set's versions.
+    #[serde(default)]
+    pub extra_targets: Vec<ExtraTargetStatus>,
+}
+
+/// Another place that keeps copies of a set's backups.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ExtraTargetStatus {
+    pub id: String,
+    pub target: Target,
+    pub retention: RetentionPolicy,
+    pub upload_limit: Option<u64>,
+    pub window: Option<TimeWindow>,
+    /// Whether its host is reachable; `None` for a local folder or a host
+    /// not checked yet.
+    pub online: Option<bool>,
+    /// The last time versions were copied there.
+    pub last_copy: Option<CopySummary>,
+    /// Why the last attempt to copy (or clean up) there failed.
+    pub last_error: Option<String>,
+    pub last_prune: Option<PruneSummary>,
+    pub last_verify: Option<VerifySummary>,
+}
+
+/// Versions copied to an extra place in one go.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CopySummary {
+    pub time_unix: i64,
+    /// The newest version copied.
+    pub snapshot: String,
+    pub snapshots: u64,
+    pub bytes: u64,
+}
+
+/// One of a set's places, by id.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TargetRef {
+    pub id: String,
+    pub target: Target,
 }
 
 /// A set that stopped backing up, kept for restoring until `erase_after_unix`.
@@ -458,6 +560,9 @@ pub struct StoppedSetStatus {
     pub name: String,
     pub paths: Vec<PathBuf>,
     pub target: Target,
+    /// Extra places that keep copies, to restore from.
+    #[serde(default)]
+    pub extra_targets: Vec<TargetRef>,
     pub stopped_unix: i64,
     /// When its backups are due to be erased (Unix seconds).
     pub erase_after_unix: i64,
@@ -492,6 +597,8 @@ pub enum SetState {
     Pruning,
     /// Checking the backups are complete and intact.
     Verifying,
+    /// Copying new versions to its extra places.
+    Copying,
 }
 
 /// A step of cleaning up (`Listings`, `Repacking`, `Deleting`) or checking

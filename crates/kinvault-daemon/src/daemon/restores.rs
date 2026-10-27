@@ -26,12 +26,14 @@ impl Daemon {
         snapshot: String,
         target: PathBuf,
         include: Option<String>,
+        from: Option<String>,
     ) -> Result<Reply> {
         ensure!(
             !target.as_os_str().is_empty(),
             "choose a folder to restore into"
         );
         let env = self.find_readable_set(set).await?;
+        let from = self.place_in(&env.set, from).await?;
         let id = hex::encode(kinvault_core::crypto::random_bytes::<4>()?);
         let job = RestoreJob {
             id: id.clone(),
@@ -57,7 +59,7 @@ impl Daemon {
             let progress = daemon.clone();
             let job_id = job.id.clone();
             let result = blocking(move || {
-                let mut repo = env.open_repository()?;
+                let mut repo = env.open_place(from.as_deref())?;
                 let snapshot = repo.find_snapshot(&snapshot)?;
                 let mut last_sent: Option<Instant> = None;
                 Ok(repo.restore_with_progress(

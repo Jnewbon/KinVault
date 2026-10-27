@@ -5,7 +5,9 @@ erased (see [[Deleting Backups]]).
 
 ## In the app
 
-1. Open **Restore** and pick the backup.
+1. Open **Restore** and pick the backup. If it keeps copies in more than
+   one place, pick one under **Restore from**; each lists the versions it
+   holds.
 2. Pick a version (**Version from** shows when it was made and on which
    computer).
 3. **Restore this version…**
@@ -29,6 +31,13 @@ Restore one, by the start of its id or `latest`:
 ```sh
 kinvault restore documents latest ~/restored
 kinvault restore documents 3fa9c1 ~/restored
+```
+
+From another place the backup keeps copies in:
+
+```sh
+kinvault snapshots documents --from friend
+kinvault restore documents latest ~/restored --from friend
 ```
 
 Restore only part of it:

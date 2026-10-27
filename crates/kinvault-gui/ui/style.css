@@ -85,6 +85,10 @@ h2 { font-size: 15px; margin: 26px 0 10px; font-weight: 650; }
 .lines { margin: 10px 0 0; display: grid; gap: 4px; font-size: 13px; }
 .lines.tight { margin: 0; gap: 2px; }
 .now { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.places { margin-top: 12px; border-top: 1px solid var(--border); padding-top: 10px; display: grid; gap: 8px; }
+.places-head { font-size: 12px; font-weight: 650; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.place { display: flex; align-items: flex-start; gap: 10px; justify-content: space-between; flex-wrap: wrap; }
+.place-main { display: grid; gap: 2px; min-width: 0; flex: 1; font-size: 13px; }
 .paths { margin: 6px 0 0; color: var(--muted); font-size: 12px; }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
 .chip { font-size: 12px; padding: 2px 9px; border-radius: 999px; background: var(--surface-2); color: var(--muted); font-weight: 600; }

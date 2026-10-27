@@ -6,6 +6,7 @@
 //! that touches the repository goes through this task, so operations never
 //! overlap.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -44,8 +45,9 @@ type RepoSlot = Arc<Mutex<Option<Repository<Box<dyn Backend>>>>>;
 pub(crate) enum Trigger {
     Changed,
     Now(Reply<BackupSummary>),
-    Prune(Reply<PruneSummary>),
-    Verify(u64, Reply<VerifySummary>),
+    /// Prune the main place (`None`) or an extra one, by id.
+    Prune(Option<String>, Reply<PruneSummary>),
+    Verify(u64, Option<String>, Reply<VerifySummary>),
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -58,12 +60,26 @@ pub(crate) struct Maintenance {
     pub last_verify: Option<VerifySummary>,
 }
 
+/// How copying to, and maintaining, one of a set's extra places went.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct ExtraState {
+    /// When this place was first seen; maintenance is due an interval later.
+    #[serde(default)]
+    pub since_unix: i64,
+    pub last_copy: Option<api::CopySummary>,
+    pub last_error: Option<String>,
+    pub last_prune: Option<PruneSummary>,
+    pub last_verify: Option<VerifySummary>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct RunStatus {
     pub state: SetState,
     pub last_backup: Option<BackupSummary>,
     pub last_error: Option<String>,
     pub maintenance: Maintenance,
+    /// By extra place id.
+    pub extras: BTreeMap<String, ExtraState>,
 }
 
 /// Everything needed to open a set's repository.
@@ -142,9 +158,26 @@ impl SetEnv {
         })
     }
 
+    /// Opens the repository in the set's main place.
     pub fn open_repository(&self) -> Result<Repository<Box<dyn Backend>>> {
+        self.open_place(None)
+    }
+
+    /// Opens the repository in the main place (`None`) or an extra one, by
+    /// id. Each place has an index of its own.
+    pub fn open_place(&self, extra: Option<&str>) -> Result<Repository<Box<dyn Backend>>> {
         let master = read_master_key(&self.set_dir)?;
-        let backend: Box<dyn Backend> = match &self.set.target {
+        let (target, upload_limit) = match extra {
+            None => (&self.set.target, self.set.upload_limit),
+            Some(id) => {
+                let t = self
+                    .set
+                    .extra_target(id)
+                    .with_context(|| format!("{} has no extra place {id:?}", self.set.name))?;
+                (&t.target, t.upload_limit)
+            }
+        };
+        let backend: Box<dyn Backend> = match target {
             StoredTarget::Local { path } => Box::new(LocalDirBackend::open(path)?),
             StoredTarget::Peer {
                 id,
@@ -158,11 +191,11 @@ impl SetEnv {
                     repo,
                     self.runtime.clone(),
                 )?
-                .with_upload_limit(self.set.upload_limit)
+                .with_upload_limit(upload_limit)
                 .with_hosts(hosts.clone()),
             ),
         };
-        let index = Index::open(&self.set_dir.join("index.db"))?;
+        let index = Index::open(&self.set_dir.join(index_file(extra)))?;
         let mut repo = Repository::open(backend, &master, index);
         repo.set_excludes(self.excludes.clone());
         repo.set_exclude_patterns(self.exclude_patterns());
@@ -171,16 +204,11 @@ impl SetEnv {
 
     /// The host the set backs up to, unless it's a local folder.
     pub fn host(&self) -> Option<HostTarget> {
-        match &self.set.target {
-            StoredTarget::Peer {
-                id, addrs, hosts, ..
-            } => Some(HostTarget {
-                id: id.clone(),
-                addrs: addrs.clone(),
-                hosts: hosts.clone(),
-            }),
-            StoredTarget::Local { .. } => None,
-        }
+        host_of(&self.set.target)
+    }
+
+    fn extras_path(&self) -> PathBuf {
+        self.set_dir.join("extras.json")
     }
 
     fn last_backup_path(&self) -> PathBuf {
@@ -189,6 +217,28 @@ impl SetEnv {
 
     fn maintenance_path(&self) -> PathBuf {
         self.set_dir.join("maintenance.json")
+    }
+}
+
+/// The index file of the set's main place (`None`) or an extra one.
+pub(crate) fn index_file(extra: Option<&str>) -> String {
+    match extra {
+        None => "index.db".into(),
+        Some(id) => format!("index-{id}.db"),
+    }
+}
+
+/// The host a place is on, unless it's a local folder.
+pub(crate) fn host_of(target: &StoredTarget) -> Option<HostTarget> {
+    match target {
+        StoredTarget::Peer {
+            id, addrs, hosts, ..
+        } => Some(HostTarget {
+            id: id.clone(),
+            addrs: addrs.clone(),
+            hosts: hosts.clone(),
+        }),
+        StoredTarget::Local { .. } => None,
     }
 }
 
@@ -234,6 +284,19 @@ impl SetHandle {
                 }
                 m
             }),
+            extras: {
+                let mut extras: BTreeMap<String, ExtraState> =
+                    read_json(&env.extras_path()).unwrap_or_default();
+                // Forget places that were removed; start the clock on new ones.
+                extras.retain(|id, _| env.set.extra_target(id).is_some());
+                for t in &env.set.extra_targets {
+                    extras.entry(t.id.clone()).or_insert_with(|| ExtraState {
+                        since_unix: unix_now(),
+                        ..Default::default()
+                    });
+                }
+                extras
+            },
         }));
         let (tx, rx) = mpsc::channel(64);
         let watcher = if env.set.paused {
@@ -412,6 +475,15 @@ fn progress_reporter(env: &SetEnv) -> kinvault_core::ProgressFn {
     })
 }
 
+/// What copying to the extra places left to do.
+#[derive(Default)]
+struct ExtrasOutcome {
+    /// Until the soonest skipped place's time window opens.
+    wait: Option<Duration>,
+    /// A place was skipped or failed; try again when its host is back.
+    pending: bool,
+}
+
 fn retry_delay(failures: u32) -> Duration {
     Duration::from_secs(60)
         .saturating_mul(1 << failures.saturating_sub(1).min(10))
@@ -492,13 +564,47 @@ impl Worker {
         })
     }
 
-    async fn prune(&mut self) -> Result<PruneSummary> {
+    /// Runs `f` on an extra place's repository in a blocking thread.
+    async fn with_extra<T: Send + 'static>(
+        &self,
+        id: String,
+        f: impl FnOnce(&mut Repository<Box<dyn Backend>>) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let env = self.env.clone();
+        let cancel = self.cancel.clone();
+        let span = tracing::debug_span!("set", name = %self.env.set.name, place = %id);
+        tokio::task::spawn_blocking(move || {
+            let _span = span.entered();
+            let mut repo = env.open_place(Some(&id))?;
+            repo.set_cancel(Some(cancel));
+            f(&mut repo)
+        })
+        .await?
+    }
+
+    fn extra(&self, id: &str) -> Result<crate::config::ExtraTarget> {
+        self.env
+            .set
+            .extra_target(id)
+            .cloned()
+            .with_context(|| format!("{} has no extra place {id:?}", self.env.set.name))
+    }
+
+    /// Prunes the main place (`None`) or an extra one with its own policy.
+    async fn prune(&mut self, from: Option<String>) -> Result<PruneSummary> {
+        let policy = match &from {
+            None => self.env.set.retention,
+            Some(id) => self.extra(id)?.retention,
+        };
         set_state(&self.env, &self.status, SetState::Pruning);
-        let policy = self.env.set.retention;
         let mut progress = maintenance_reporter(&self.env);
-        let s = self
-            .with_repo(move |repo| Ok(repo.prune_with_progress(&policy, &mut progress)?))
-            .await?;
+        let prune = move |repo: &mut Repository<Box<dyn Backend>>| {
+            Ok(repo.prune_with_progress(&policy, &mut progress)?)
+        };
+        let s = match from.clone() {
+            None => self.with_repo(prune).await?,
+            Some(id) => self.with_extra(id, prune).await?,
+        };
         let summary = PruneSummary {
             time_unix: unix_now(),
             snapshots_kept: s.snapshots_kept,
@@ -509,17 +615,27 @@ impl Worker {
             bytes_downloaded: s.bytes_downloaded,
             bytes_uploaded: s.bytes_uploaded,
         };
-        self.save_maintenance(|m| m.last_prune = Some(summary.clone()));
-        tracing::info!(set = %self.env.set.name, removed = s.snapshots_removed, freed = s.bytes_deleted, "prune complete");
+        match &from {
+            None => self.save_maintenance(|m| m.last_prune = Some(summary.clone())),
+            Some(id) => self.save_extra(id, |e| e.last_prune = Some(summary.clone())),
+        }
+        tracing::info!(set = %self.env.set.name, place = ?from, removed = s.snapshots_removed, freed = s.bytes_deleted, "prune complete");
         Ok(summary)
     }
 
-    async fn verify(&mut self, max_bytes: u64) -> Result<VerifySummary> {
+    async fn verify(&mut self, max_bytes: u64, from: Option<String>) -> Result<VerifySummary> {
+        if let Some(id) = &from {
+            self.extra(id)?;
+        }
         set_state(&self.env, &self.status, SetState::Verifying);
         let mut progress = maintenance_reporter(&self.env);
-        let r = self
-            .with_repo(move |repo| Ok(repo.verify_with_progress(max_bytes, &mut progress)?))
-            .await?;
+        let verify = move |repo: &mut Repository<Box<dyn Backend>>| {
+            Ok(repo.verify_with_progress(max_bytes, &mut progress)?)
+        };
+        let r = match from.clone() {
+            None => self.with_repo(verify).await?,
+            Some(id) => self.with_extra(id, verify).await?,
+        };
         let summary = VerifySummary {
             time_unix: unix_now(),
             ok: r.is_ok(),
@@ -530,13 +646,139 @@ impl Worker {
             damaged_packs: r.damaged_packs.len() as u64,
             errors: r.errors,
         };
-        self.save_maintenance(|m| m.last_verify = Some(summary.clone()));
+        match &from {
+            None => self.save_maintenance(|m| m.last_verify = Some(summary.clone())),
+            Some(id) => self.save_extra(id, |e| e.last_verify = Some(summary.clone())),
+        }
         if summary.ok {
-            tracing::info!(set = %self.env.set.name, checked = r.bytes_checked, "verification passed");
+            tracing::info!(set = %self.env.set.name, place = ?from, checked = r.bytes_checked, "verification passed");
         } else {
-            tracing::warn!(set = %self.env.set.name, "verification found problems: {:?}", summary.errors);
+            tracing::warn!(set = %self.env.set.name, place = ?from, "verification found problems: {:?}", summary.errors);
         }
         Ok(summary)
+    }
+
+    fn save_extra(&self, id: &str, update: impl FnOnce(&mut ExtraState)) {
+        let mut st = self.status.lock().unwrap();
+        update(st.extras.entry(id.to_string()).or_default());
+        if let Ok(json) = serde_json::to_string(&st.extras) {
+            let _ = fs::write(self.env.extras_path(), json);
+        }
+        let _ = self.env.events.send(Event::SetsChanged);
+    }
+
+    /// Copies to each extra place the versions it keeps but doesn't have
+    /// yet, then cleans up or checks there when due. Automatic runs skip
+    /// places outside their time window or whose host is offline;
+    /// `explicit` ones (asked for by the user) try them all.
+    async fn copy_to_extras(&mut self, explicit: bool) -> ExtrasOutcome {
+        let mut outcome = ExtrasOutcome::default();
+        for t in self.env.set.extra_targets.clone() {
+            if !explicit && let Some(window) = t.window {
+                let wait = window.until_open();
+                if !wait.is_zero() {
+                    tracing::debug!(set = %self.env.set.name, place = t.id, "outside its time window; copying in {}s", wait.as_secs());
+                    outcome.wait = Some(outcome.wait.map_or(wait, |w| w.min(wait)));
+                    continue;
+                }
+            }
+            if !explicit
+                && let Some(h) = host_of(&t.target)
+                && self.env.hosts.is_offline(&h.id)
+            {
+                tracing::debug!(set = %self.env.set.name, place = t.id, "its host is offline; copying once it's back");
+                outcome.pending = true;
+                continue;
+            }
+            set_state(&self.env, &self.status, SetState::Copying);
+            match self.copy_to(&t).await {
+                Ok(copied) => {
+                    if let Some(c) = &copied {
+                        tracing::info!(set = %self.env.set.name, place = t.id, versions = c.snapshots, bytes = c.bytes, "copied versions");
+                    }
+                    self.save_extra(&t.id, |e| {
+                        if copied.is_some() {
+                            e.last_copy = copied;
+                        }
+                        e.last_error = None;
+                    });
+                }
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    tracing::warn!(set = %self.env.set.name, place = t.id, "copying failed: {msg}");
+                    self.save_extra(&t.id, |e| e.last_error = Some(msg));
+                    outcome.pending = true;
+                    continue;
+                }
+            }
+            let (pruned, verified, since) = {
+                let st = self.status.lock().unwrap();
+                let e = st.extras.get(&t.id).cloned().unwrap_or_default();
+                (
+                    e.last_prune.map_or(0, |p| p.time_unix),
+                    e.last_verify.map_or(0, |v| v.time_unix),
+                    e.since_unix,
+                )
+            };
+            let now = unix_now();
+            if now - pruned.max(since) >= PRUNE_INTERVAL_SECS
+                && let Err(e) = self.prune(Some(t.id.clone())).await
+            {
+                tracing::warn!(set = %self.env.set.name, place = t.id, "prune failed: {e:#}");
+                self.save_extra(&t.id, |s| {
+                    s.last_error = Some(format!("cleaning up: {e:#}"))
+                });
+            }
+            if now - verified.max(since) >= VERIFY_INTERVAL_SECS
+                && let Err(e) = self.verify(VERIFY_BUDGET_BYTES, Some(t.id.clone())).await
+            {
+                tracing::warn!(set = %self.env.set.name, place = t.id, "verification failed to run: {e:#}");
+            }
+        }
+        outcome
+    }
+
+    /// Copies to one extra place what it should have; `None` if nothing.
+    async fn copy_to(
+        &mut self,
+        t: &crate::config::ExtraTarget,
+    ) -> Result<Option<api::CopySummary>> {
+        let env = self.env.clone();
+        let cancel = self.cancel.clone();
+        let id = t.id.clone();
+        let policy = t.retention;
+        let events = self.env.events.clone();
+        let set = self.env.set.id.clone();
+        self.with_repo(move |main| {
+            let _span = tracing::debug_span!("copy", place = %id).entered();
+            let mut dest = env.open_place(Some(&id))?;
+            dest.set_cancel(Some(cancel));
+            let held = dest.snapshot_times()?;
+            let wanted = policy.to_copy(&main.snapshot_times()?, &held);
+            let Some(newest) = wanted.last().copied() else {
+                return Ok(None);
+            };
+            tracing::debug!(versions = wanted.len(), "copying versions");
+            let mut last = std::time::Instant::now() - Duration::from_secs(1);
+            let stats = main.copy_snapshots_to(&mut dest, &wanted, &mut |done, total| {
+                if done == 0 || done == total || last.elapsed() >= Duration::from_millis(250) {
+                    last = std::time::Instant::now();
+                    let _ = events.send(Event::CopyProgress {
+                        set: set.clone(),
+                        target: id.clone(),
+                        done,
+                        total,
+                    });
+                }
+            })?;
+            Ok(Some(api::CopySummary {
+                time_unix: unix_now(),
+                snapshot: newest.to_hex(),
+                snapshots: stats.snapshots,
+                bytes: stats.bytes,
+            }))
+        })
+        .await
     }
 
     fn save_maintenance(&self, update: impl FnOnce(&mut Maintenance)) {
@@ -569,12 +811,12 @@ impl Worker {
         let now = unix_now();
         let mut heal = false;
         if now - last_prune >= PRUNE_INTERVAL_SECS
-            && let Err(e) = self.prune().await
+            && let Err(e) = self.prune(None).await
         {
             tracing::warn!(set = %self.env.set.name, "prune failed: {e:#}");
         }
         if now - last_verify >= VERIFY_INTERVAL_SECS {
-            match self.verify(VERIFY_BUDGET_BYTES).await {
+            match self.verify(VERIFY_BUDGET_BYTES, None).await {
                 Ok(v) => heal = !v.ok,
                 Err(e) => {
                     tracing::warn!(set = %self.env.set.name, "verification failed to run: {e:#}")
@@ -596,6 +838,14 @@ async fn run(
     let rescan = Duration::from_secs(env.set.rescan_secs);
     let paused = env.set.paused;
     let host = env.host();
+    // Hosts of extra places: one coming back may have copies waiting.
+    let extra_hosts: Vec<String> = env
+        .set
+        .extra_targets
+        .iter()
+        .filter_map(|t| host_of(&t.target).map(|h| h.id))
+        .collect();
+    let mut extras_pending = false;
     let mut host_events = env.events.subscribe();
     let mut worker = Worker {
         env,
@@ -651,12 +901,14 @@ async fn run(
                     waiters.push(reply);
                     true
                 }
-                Some(Trigger::Prune(reply)) => {
-                    let _ = reply.send(worker.prune().await.map_err(|e| format!("{e:#}")));
+                Some(Trigger::Prune(from, reply)) => {
+                    let _ = reply.send(worker.prune(from).await.map_err(|e| format!("{e:#}")));
                     false
                 }
-                Some(Trigger::Verify(max_bytes, reply)) => {
-                    let result = worker.verify(max_bytes).await;
+                Some(Trigger::Verify(max_bytes, from, reply)) => {
+                    let result = worker.verify(max_bytes, from).await;
+                    // Damaged data was removed; the next run puts it back
+                    // (backing up for the main place, copying for others).
                     if matches!(&result, Ok(v) if !v.ok) && !paused {
                         scheduled = Instant::now();
                     }
@@ -664,17 +916,25 @@ async fn run(
                     false
                 }
             },
-            ev = host_events.recv(), if host.is_some() => {
+            ev = host_events.recv(), if host.is_some() || !extra_hosts.is_empty() => {
                 let id = host.as_ref().map(|h| h.id.as_str()).unwrap_or_default();
-                let back = match ev {
-                    Ok(Event::PeerOnline { id: peer, online }) => online && peer == id,
-                    // Missed events; it may have come back meanwhile.
-                    Err(broadcast::error::RecvError::Lagged(_)) => !worker.env.hosts.is_offline(id),
-                    _ => false,
+                let (back, extra_back) = match ev {
+                    Ok(Event::PeerOnline { id: peer, online }) => {
+                        (online && peer == id, online && extra_hosts.contains(&peer))
+                    }
+                    // Missed events; one may have come back meanwhile.
+                    Err(broadcast::error::RecvError::Lagged(_)) => (
+                        host.is_some() && !worker.env.hosts.is_offline(id),
+                        extra_hosts.iter().any(|h| !worker.env.hosts.is_offline(h)),
+                    ),
+                    _ => (false, false),
                 };
-                // Back up now rather than at the next retry.
+                // Back up (and copy) now rather than at the next retry.
                 if back && (waiting_for_host || failures > 0) && !paused {
                     waiting_for_host = false;
+                    scheduled = Instant::now();
+                }
+                if extra_back && extras_pending && !paused && !waiting_for_host {
                     scheduled = Instant::now();
                 }
                 false
@@ -725,6 +985,8 @@ async fn run(
             "backup started"
         );
 
+        // Asked for by the user: copies go out even outside their windows.
+        let explicit = !waiters.is_empty();
         let result = worker.backup().await;
         match result {
             Ok(summary) => {
@@ -754,6 +1016,15 @@ async fn run(
                 });
                 for w in waiters.drain(..) {
                     let _ = w.send(Ok(summary.clone()));
+                }
+                if !worker.env.set.extra_targets.is_empty() {
+                    let outcome = worker.copy_to_extras(explicit).await;
+                    extras_pending = outcome.pending;
+                    if let Some(wait) = outcome.wait
+                        && !paused
+                    {
+                        scheduled = scheduled.min(Instant::now() + wait);
+                    }
                 }
                 if worker.maintenance_if_due().await {
                     scheduled = Instant::now();

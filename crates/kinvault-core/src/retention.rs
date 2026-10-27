@@ -59,18 +59,7 @@ impl RetentionPolicy {
         if let Some(n) = self.last {
             keep.extend(sorted.iter().take(n as usize).map(|(id, _)| *id));
         }
-        let rules: [(Option<u32>, Bucket); 5] = [
-            (self.hourly, |s| s.div_euclid(3600)),
-            (self.daily, |s| s.div_euclid(86_400)),
-            // 1970-01-01 was a Thursday; shifting by 3 days starts weeks on Monday.
-            (self.weekly, |s| (s.div_euclid(86_400) + 3).div_euclid(7)),
-            (self.monthly, |s| {
-                let (y, m) = year_month(s.div_euclid(86_400));
-                y * 12 + m
-            }),
-            (self.yearly, |s| year_month(s.div_euclid(86_400)).0),
-        ];
-        for (count, bucket) in rules {
+        for (count, bucket) in self.rules() {
             let Some(count) = count else { continue };
             let mut kept = 0;
             let mut last_bucket = None;
@@ -87,6 +76,64 @@ impl RetentionPolicy {
             }
         }
         keep
+    }
+
+    fn rules(&self) -> [(Option<u32>, Bucket); 5] {
+        [
+            (self.hourly, |s| s.div_euclid(3600)),
+            (self.daily, |s| s.div_euclid(86_400)),
+            // 1970-01-01 was a Thursday; shifting by 3 days starts weeks on Monday.
+            (self.weekly, |s| (s.div_euclid(86_400) + 3).div_euclid(7)),
+            (self.monthly, |s| {
+                let (y, m) = year_month(s.div_euclid(86_400));
+                y * 12 + m
+            }),
+            (self.yearly, |s| year_month(s.div_euclid(86_400)).0),
+        ]
+    }
+
+    /// Which of `source`'s snapshots a copy kept with this policy should
+    /// receive, oldest first, given the snapshots it already `held`
+    /// (`(id, time in ns)` pairs).
+    ///
+    /// An empty copy starts with the snapshots the policy would keep. After
+    /// that it gets each newer snapshot that starts a new hour, day, week,
+    /// month or year the policy keeps, as soon as it exists; or every newer
+    /// one if the policy keeps the latest few (or everything). Older
+    /// snapshots are never filled in.
+    pub fn to_copy(
+        &self,
+        source: &[(SnapshotId, i64)],
+        held: &[(SnapshotId, i64)],
+    ) -> Vec<SnapshotId> {
+        let mut source = source.to_vec();
+        source.sort_by_key(|&(_, time)| time);
+        let Some(newest_held) = held.iter().map(|&(_, time)| time).max() else {
+            let keep = self.select(&source);
+            return source
+                .into_iter()
+                .filter(|(id, _)| keep.contains(id))
+                .map(|(id, _)| id)
+                .collect();
+        };
+        let every = self.keeps_everything() || self.last.is_some_and(|n| n > 0);
+        let mut times: Vec<i64> = held.iter().map(|&(_, time)| time).collect();
+        let mut out = Vec::new();
+        for (id, time) in source {
+            if time <= newest_held || held.iter().any(|(h, _)| *h == id) {
+                continue;
+            }
+            let secs = |ns: i64| ns.div_euclid(1_000_000_000);
+            let new_bucket = self.rules().iter().any(|(count, bucket)| {
+                count.is_some_and(|c| c > 0)
+                    && !times.iter().any(|&t| bucket(secs(t)) == bucket(secs(time)))
+            });
+            if every || new_bucket {
+                times.push(time);
+                out.push(id);
+            }
+        }
+        out
     }
 }
 
@@ -134,6 +181,57 @@ mod tests {
             .enumerate()
             .map(|(i, h)| (SnapshotId([i as u8; 32]), h * HOUR))
             .collect()
+    }
+
+    fn copied_hours(
+        policy: RetentionPolicy,
+        source: &[(SnapshotId, i64)],
+        held: &[(SnapshotId, i64)],
+    ) -> Vec<i64> {
+        policy
+            .to_copy(source, held)
+            .iter()
+            .map(|id| source.iter().find(|(s, _)| s == id).unwrap().1 / HOUR)
+            .collect()
+    }
+
+    #[test]
+    fn copies_start_with_what_is_kept_then_take_the_first_of_each_period() {
+        let daily = RetentionPolicy {
+            daily: Some(7),
+            ..Default::default()
+        };
+        // Every 6 hours over three days.
+        let source = snaps(&[0, 6, 12, 18, 24, 30, 36, 42, 48, 54]);
+        // Empty: what the policy keeps, i.e. the newest of each day.
+        assert_eq!(copied_hours(daily, &source, &[]), vec![18, 42, 54]);
+        // Holding hour 30 (day 1): nothing more from day 1, the first of day 2.
+        let held = vec![(SnapshotId([99; 32]), 30 * HOUR)];
+        assert_eq!(copied_hours(daily, &source, &held), vec![48]);
+        // Already held, or older than what's held: not copied again.
+        let held = vec![(source[8].0, 48 * HOUR)];
+        assert_eq!(copied_hours(daily, &source, &held), Vec::<i64>::new());
+
+        // Keeping the latest few, or everything, takes every newer one.
+        for every in [
+            RetentionPolicy {
+                last: Some(3),
+                daily: Some(7),
+                ..Default::default()
+            },
+            RetentionPolicy::default(),
+        ] {
+            let held = vec![(source[6].0, 36 * HOUR)];
+            assert_eq!(copied_hours(every, &source, &held), vec![42, 48, 54]);
+        }
+        // Several rules: a new hour is enough when hours are kept.
+        let hourly = RetentionPolicy {
+            hourly: Some(24),
+            monthly: Some(12),
+            ..Default::default()
+        };
+        let held = vec![(source[6].0, 36 * HOUR)];
+        assert_eq!(copied_hours(hourly, &source, &held), vec![42, 48, 54]);
     }
 
     fn kept_hours(policy: RetentionPolicy, s: &[(SnapshotId, i64)]) -> Vec<i64> {

@@ -17,15 +17,15 @@ use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::api::{self, Event, GrantSpec, HostOffer, Reply, Request};
-use crate::config::{Config, PendingInvite, SetConfig, StoppedSet, StoredTarget};
+use crate::config::{Config, PendingDeletion, PendingInvite, SetConfig, StoppedSet, StoredTarget};
 use crate::reachability::{HostTarget, Hosts, ReachabilityOptions};
 mod deletion;
 mod nearby;
 mod restores;
 
 use crate::worker::{
-    SetEnv, SetHandle, Trigger, VERIFY_BUDGET_BYTES, peer_addr, read_master_key, shared_key,
-    write_master_key,
+    SetEnv, SetHandle, Trigger, VERIFY_BUDGET_BYTES, index_file, peer_addr, read_master_key,
+    shared_key, write_master_key,
 };
 
 pub(crate) const DEFAULT_DEBOUNCE_SECS: u64 = 30;
@@ -340,7 +340,10 @@ impl Daemon {
             | Request::SetExcludes { .. }
             | Request::SetRetention { .. }
             | Request::PauseSet { .. }
-            | Request::ResumeSet { .. } => Some(Event::SetsChanged),
+            | Request::ResumeSet { .. }
+            | Request::AddSetTarget { .. }
+            | Request::UpdateSetTarget { .. }
+            | Request::RemoveSetTarget { .. } => Some(Event::SetsChanged),
             Request::PeerAllow { .. }
             | Request::PeerRevoke { .. }
             | Request::PeerSetMine { .. }
@@ -398,7 +401,63 @@ impl Daemon {
                 snapshot,
                 target,
                 include,
-            } => self.start_restore(&set, snapshot, target, include).await,
+                from,
+            } => {
+                self.start_restore(&set, snapshot, target, include, from)
+                    .await
+            }
+            Request::AddSetTarget {
+                set,
+                target,
+                retention,
+                upload_limit,
+                window,
+            } => {
+                let id = hex::encode(kinvault_core::crypto::random_bytes::<4>()?);
+                let config = self.inner.config.lock().await.clone();
+                let target = self.store_target(&config, target)?;
+                let new = crate::config::ExtraTarget {
+                    id: id.clone(),
+                    target,
+                    retention: retention.unwrap_or_else(api::RetentionPolicy::recommended),
+                    upload_limit,
+                    window,
+                };
+                self.update_set(&set, |s| {
+                    ensure!(
+                        !s.all_targets().any(|(_, t)| same_place(t, &new.target)),
+                        "{} already keeps its backups there",
+                        s.name
+                    );
+                    s.extra_targets.push(new);
+                    Ok(())
+                })
+                .await?;
+                Ok(Reply::TargetAdded { id })
+            }
+            Request::UpdateSetTarget {
+                set,
+                target,
+                retention,
+                upload_limit,
+                window,
+            } => {
+                let config = self.inner.config.lock().await.clone();
+                self.update_set(&set, |s| {
+                    let id = place_id(&config, s, &target)?;
+                    let t = s
+                        .extra_targets
+                        .iter_mut()
+                        .find(|t| t.id == id)
+                        .expect("place_id found it");
+                    t.retention = retention;
+                    t.upload_limit = upload_limit;
+                    t.window = window;
+                    Ok(())
+                })
+                .await
+            }
+            Request::RemoveSetTarget { set, target } => self.remove_set_target(&set, &target).await,
             Request::CancelRestore { id } => self.cancel_restore(&id),
             Request::SetLimits {
                 set,
@@ -458,13 +517,22 @@ impl Daemon {
             Request::BackupNow { set } => {
                 Ok(Reply::Backup(self.ask_worker(&set, Trigger::Now).await?))
             }
-            Request::Prune { set } => {
-                Ok(Reply::Pruned(self.ask_worker(&set, Trigger::Prune).await?))
-            }
-            Request::Verify { set, max_bytes } => {
-                let budget = max_bytes.unwrap_or(VERIFY_BUDGET_BYTES);
+            Request::Prune { set, from } => {
+                let from = self.place_of(&set, from).await?;
                 let summary = self
-                    .ask_worker(&set, |reply| Trigger::Verify(budget, reply))
+                    .ask_worker(&set, |reply| Trigger::Prune(from, reply))
+                    .await?;
+                Ok(Reply::Pruned(summary))
+            }
+            Request::Verify {
+                set,
+                max_bytes,
+                from,
+            } => {
+                let budget = max_bytes.unwrap_or(VERIFY_BUDGET_BYTES);
+                let from = self.place_of(&set, from).await?;
+                let summary = self
+                    .ask_worker(&set, |reply| Trigger::Verify(budget, from, reply))
                     .await?;
                 Ok(Reply::Verified(summary))
             }
@@ -483,10 +551,12 @@ impl Daemon {
                     json: serde_json::to_string_pretty(&kit)?,
                 })
             }
-            Request::ListSnapshots { set } => {
+            Request::ListSnapshots { set, from } => {
                 let env = self.find_readable_set(&set).await?;
+                let from = self.place_in(&env.set, from).await?;
                 let snapshots =
-                    blocking(move || Ok(env.open_repository()?.list_snapshots()?)).await?;
+                    blocking(move || Ok(env.open_place(from.as_deref())?.list_snapshots()?))
+                        .await?;
                 Ok(Reply::Snapshots(
                     snapshots
                         .into_iter()
@@ -506,10 +576,12 @@ impl Daemon {
                 snapshot,
                 target,
                 include,
+                from,
             } => {
                 let env = self.find_readable_set(&set).await?;
+                let from = self.place_in(&env.set, from).await?;
                 let stats = blocking(move || {
-                    let mut repo = env.open_repository()?;
+                    let mut repo = env.open_place(from.as_deref())?;
                     let id = repo.find_snapshot(&snapshot)?;
                     Ok(repo.restore(&id, &target, include.as_deref())?)
                 })
@@ -521,16 +593,21 @@ impl Daemon {
                     bytes: stats.bytes,
                 }))
             }
-            Request::RemoteUsage { set } => {
+            Request::RemoteUsage { set, from } => {
                 let env = self.find_readable_set(&set).await?;
+                let from = self.place_in(&env.set, from).await?;
+                let place = match &from {
+                    None => &env.set.target,
+                    Some(id) => &env.set.extra_target(id).expect("place_in found it").target,
+                };
                 let StoredTarget::Peer {
                     id,
                     repo,
                     addrs,
                     hosts,
-                } = &env.set.target
+                } = place
                 else {
-                    bail!("set {:?} is stored locally, not on a peer", env.set.name);
+                    bail!("that place is a local folder, not a peer");
                 };
                 let remote = RemoteBackend::new(
                     env.endpoint.clone(),
@@ -617,7 +694,10 @@ impl Daemon {
                     .sets
                     .iter()
                     .chain(config.stopped_sets.iter().map(|s| &s.set))
-                    .filter(|s| matches!(&s.target, StoredTarget::Peer { id: p, .. } if *p == id))
+                    .filter(|s| {
+                        s.all_targets()
+                            .any(|(_, t)| matches!(t, StoredTarget::Peer { id: p, .. } if *p == id))
+                    })
                     .map(|s| s.name.as_str())
                     .collect();
                 ensure!(
@@ -805,6 +885,32 @@ impl Daemon {
                     last_error: st.last_error,
                     last_prune: st.maintenance.last_prune,
                     last_verify: st.maintenance.last_verify,
+                    extra_targets: h
+                        .env
+                        .set
+                        .extra_targets
+                        .iter()
+                        .map(|t| {
+                            let e = st.extras.get(&t.id).cloned().unwrap_or_default();
+                            api::ExtraTargetStatus {
+                                id: t.id.clone(),
+                                target: t.target.to_api(),
+                                retention: t.retention,
+                                upload_limit: t.upload_limit,
+                                window: t.window,
+                                online: match &t.target {
+                                    StoredTarget::Peer { id, .. } => {
+                                        self.inner.hosts.get(id).online
+                                    }
+                                    StoredTarget::Local { .. } => None,
+                                },
+                                last_copy: e.last_copy,
+                                last_error: e.last_error,
+                                last_prune: e.last_prune,
+                                last_verify: e.last_verify,
+                            }
+                        })
+                        .collect(),
                 }
             })
             .collect();
@@ -820,6 +926,15 @@ impl Daemon {
                 name: s.set.name.clone(),
                 paths: s.set.paths.clone(),
                 target: s.set.target.to_api(),
+                extra_targets: s
+                    .set
+                    .extra_targets
+                    .iter()
+                    .map(|t| api::TargetRef {
+                        id: t.id.clone(),
+                        target: t.target.to_api(),
+                    })
+                    .collect(),
                 stopped_unix: s.stopped_unix,
                 erase_after_unix: s.stopped_unix + grace,
             })
@@ -847,10 +962,10 @@ impl Daemon {
             .sets
             .iter()
             .chain(config.stopped_sets.iter().map(|s| &s.set));
-        for set in sets {
+        for (_, target) in sets.flat_map(|s| s.all_targets()) {
             let StoredTarget::Peer {
                 id, addrs, hosts, ..
-            } = &set.target
+            } = target
             else {
                 continue;
             };
@@ -924,6 +1039,95 @@ impl Daemon {
             .collect()
     }
 
+    /// Where a set's backups go, ready to store in the config: a local
+    /// folder (created if needed), or a peer with a fresh repository name.
+    fn store_target(&self, config: &Config, target: api::Target) -> Result<StoredTarget> {
+        Ok(match target {
+            api::Target::Local { path } => {
+                LocalDirBackend::create(&path)?;
+                StoredTarget::Local {
+                    path: fs::canonicalize(&path)?,
+                }
+            }
+            api::Target::Peer { id, addrs } => {
+                let (id, known) = resolve_peer(config, &id)?;
+                let hosts = config
+                    .peers
+                    .iter()
+                    .find(|p| p.id == id)
+                    .map(|p| p.hosts.clone())
+                    .unwrap_or_default();
+                self.parse_peer_id(&id)
+                    .context("backups can't be stored on this same instance")?;
+                let addrs = if addrs.is_empty() { known } else { addrs };
+                let repo = hex::encode(kinvault_core::crypto::random_bytes::<12>()?);
+                StoredTarget::Peer {
+                    id,
+                    repo,
+                    addrs,
+                    hosts,
+                }
+            }
+        })
+    }
+
+    /// Resolves which of a set's places a request means (see `from`).
+    async fn place_of(&self, set: &str, key: Option<String>) -> Result<Option<String>> {
+        let env = self.find_readable_set(set).await?;
+        self.place_in(&env.set, key).await
+    }
+
+    async fn place_in(&self, set: &SetConfig, key: Option<String>) -> Result<Option<String>> {
+        let Some(key) = key else { return Ok(None) };
+        let config = self.inner.config.lock().await;
+        // The main place by name, for symmetry with the extra ones.
+        if place_matches(&config, &set.target, &key) {
+            return Ok(None);
+        }
+        Ok(Some(place_id(&config, set, &key)?))
+    }
+
+    /// Stops copying a set's backups to one of its extra places, and has
+    /// what's there erased like a deleted set's backups.
+    async fn remove_set_target(&self, set: &str, key: &str) -> Result<Reply> {
+        let config = self.inner.config.lock().await.clone();
+        let env = self.find_set(set).await?;
+        let id = place_id(&config, &env.set, key)?;
+        let removed = env
+            .set
+            .extra_target(&id)
+            .cloned()
+            .expect("place_id found it");
+        ensure!(
+            !self.restoring(&env.set.id),
+            "{} is being restored from; wait for that to finish or cancel it first",
+            env.set.name
+        );
+        self.update_set(set, |s| {
+            s.extra_targets.retain(|t| t.id != id);
+            Ok(())
+        })
+        .await?;
+        // The restarted task no longer opens its index.
+        let _ = fs::remove_file(self.set_dir(&env.set.id).join(index_file(Some(&id))));
+        let now = unix_now();
+        let pending = PendingDeletion {
+            set_id: env.set.id.clone(),
+            set_name: env.set.name.clone(),
+            target_id: Some(id),
+            erase_after_unix: matches!(removed.target, StoredTarget::Local { .. })
+                .then_some(now + kinvault_net::REPO_DELETE_DELAY.as_secs() as i64),
+            target: removed.target,
+            requested_unix: now,
+        };
+        let mut config = self.inner.config.lock().await;
+        config.pending_deletions.push(pending);
+        config.save(&self.config_path())?;
+        drop(config);
+        self.inner.wake_deletions.notify_one();
+        Ok(Reply::Done)
+    }
+
     async fn create_set(&self, req: api::CreateSet) -> Result<Reply> {
         let name = req.name.trim().to_string();
         ensure!(!name.is_empty(), "set name must not be empty");
@@ -934,33 +1138,7 @@ impl Daemon {
         let paths = canonical_paths(&req.paths)?;
 
         let mut config = self.inner.config.lock().await;
-        let target = match req.target {
-            api::Target::Local { path } => {
-                LocalDirBackend::create(&path)?;
-                StoredTarget::Local {
-                    path: fs::canonicalize(&path)?,
-                }
-            }
-            api::Target::Peer { id, addrs } => {
-                let (id, known) = resolve_peer(&config, &id)?;
-                let hosts = config
-                    .peers
-                    .iter()
-                    .find(|p| p.id == id)
-                    .map(|p| p.hosts.clone())
-                    .unwrap_or_default();
-                self.parse_peer_id(&id)
-                    .context("a set can't be stored on this same instance")?;
-                let addrs = if addrs.is_empty() { known } else { addrs };
-                let repo = hex::encode(kinvault_core::crypto::random_bytes::<12>()?);
-                StoredTarget::Peer {
-                    id,
-                    repo,
-                    addrs,
-                    hosts,
-                }
-            }
-        };
+        let target = self.store_target(&config, req.target)?;
         ensure!(
             !config.sets.iter().any(|s| s.name == name),
             "a set named {name:?} already exists"
@@ -980,6 +1158,7 @@ impl Daemon {
             paused: false,
             excludes: clean_excludes(req.excludes)?,
             shared_key: !req.own_key,
+            extra_targets: Vec::new(),
         };
 
         // The config lock is held, so two new sets can't both create the
@@ -1163,6 +1342,47 @@ impl Daemon {
             quota_bytes: accepted.quota_bytes,
             ask_reciprocal: ticket.ask_reciprocal,
         })
+    }
+}
+
+/// Whether `key` names this place: a peer's id or name, or a folder's path.
+fn place_matches(config: &Config, target: &StoredTarget, key: &str) -> bool {
+    match target {
+        StoredTarget::Peer { id, .. } => {
+            id == key || entry_name(config, id).as_deref() == Some(key)
+        }
+        StoredTarget::Local { path } => {
+            path.as_os_str() == key || fs::canonicalize(key).is_ok_and(|k| k == *path)
+        }
+    }
+}
+
+/// The id of a set's extra place, given its id, host name or folder.
+fn place_id(config: &Config, set: &SetConfig, key: &str) -> Result<String> {
+    if let Some(t) = set.extra_target(key) {
+        return Ok(t.id.clone());
+    }
+    let found: Vec<&str> = set
+        .extra_targets
+        .iter()
+        .filter(|t| place_matches(config, &t.target, key))
+        .map(|t| t.id.as_str())
+        .collect();
+    match found.as_slice() {
+        [id] => Ok(id.to_string()),
+        [] => bail!("{} isn't kept in an extra place called {key:?}", set.name),
+        _ => bail!(
+            "{key:?} matches more than one of {}'s places; use its id",
+            set.name
+        ),
+    }
+}
+
+fn same_place(a: &StoredTarget, b: &StoredTarget) -> bool {
+    match (a, b) {
+        (StoredTarget::Peer { id: x, .. }, StoredTarget::Peer { id: y, .. }) => x == y,
+        (StoredTarget::Local { path: x }, StoredTarget::Local { path: y }) => x == y,
+        _ => false,
     }
 }
 

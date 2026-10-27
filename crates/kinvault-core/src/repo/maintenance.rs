@@ -89,7 +89,7 @@ impl<B: Backend> Repository<B> {
 
     /// Every tree and data chunk reachable from `roots`. Fails if any tree
     /// can't be read, so callers never act on an incomplete picture.
-    fn reachable(
+    pub(super) fn reachable(
         &self,
         roots: &[ChunkId],
         cache: &mut PackCache,

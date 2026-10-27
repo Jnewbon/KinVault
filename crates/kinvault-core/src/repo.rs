@@ -17,7 +17,9 @@ use crate::index::{CachedFile, Index};
 use crate::pack::{self, BlobKind, PackBuilder};
 use crate::snapshot::{self, Node, NodeKind, Snapshot, Tree};
 
+mod copy;
 mod maintenance;
+pub use copy::CopyStats;
 pub use maintenance::{MaintenanceProgress, MaintenanceStep, PruneStats, VerifyReport};
 
 const CHUNK_MIN: u32 = 256 * 1024;
