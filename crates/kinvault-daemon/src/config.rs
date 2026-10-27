@@ -126,6 +126,10 @@ pub struct SetConfig {
     /// Files and folders to leave out; see [`kinvault_core::Excludes`].
     #[serde(default)]
     pub excludes: Vec<String>,
+    /// Encrypted with the instance's shared key rather than one of its own.
+    /// Sets made before keys could be shared each have their own.
+    #[serde(default)]
+    pub shared_key: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

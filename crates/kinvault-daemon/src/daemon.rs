@@ -24,7 +24,8 @@ mod nearby;
 mod restores;
 
 use crate::worker::{
-    SetEnv, SetHandle, Trigger, VERIFY_BUDGET_BYTES, peer_addr, read_master_key, write_master_key,
+    SetEnv, SetHandle, Trigger, VERIFY_BUDGET_BYTES, peer_addr, read_master_key, shared_key,
+    write_master_key,
 };
 
 pub(crate) const DEFAULT_DEBOUNCE_SECS: u64 = 30;
@@ -794,6 +795,7 @@ impl Daemon {
                     window: h.env.set.window,
                     retention: h.env.set.retention,
                     excludes: h.env.set.excludes.clone(),
+                    own_key: !h.env.set.shared_key,
                     state: st.state,
                     target_online: match &h.env.set.target {
                         StoredTarget::Peer { id, .. } => self.inner.hosts.get(id).online,
@@ -981,11 +983,18 @@ impl Daemon {
                 .unwrap_or_else(api::RetentionPolicy::recommended),
             paused: false,
             excludes: clean_excludes(req.excludes)?,
+            shared_key: !req.own_key,
         };
 
+        // The config lock is held, so two new sets can't both create the
+        // shared key.
+        let master = if req.own_key {
+            MasterKey::generate()?
+        } else {
+            shared_key(&self.inner.state_dir)?
+        };
         let set_dir = self.set_dir(&set.id);
         create_private_dir(&set_dir)?;
-        let master = MasterKey::generate()?;
         write_master_key(&set_dir, &master)?;
         let passphrase = req.recovery_passphrase;
         let keyfile =

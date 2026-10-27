@@ -64,6 +64,7 @@ a LaunchAgent on macOS, and a `Run` registry entry on Windows.
 | `--keep-last`, `--keep-hourly`, `--keep-daily`, `--keep-weekly`, `--keep-monthly`, `--keep-yearly <N>` | Keep rules (default: the recommended set, see [Backups](Backups#keeping-old-versions)) |
 | `--keep-all` | Never remove versions |
 | `--exclude <pattern>` | Leave out matches; repeat for more |
+| `--own-key` | Encrypt with a key of its own instead of the shared one |
 
 You're asked for the backup's recovery passphrase (or set
 `KINVAULT_PASSPHRASE`).

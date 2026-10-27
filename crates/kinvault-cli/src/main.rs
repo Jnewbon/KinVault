@@ -132,6 +132,10 @@ enum SetCommand {
         /// patterns so the shell doesn't expand them. See `set exclude`.
         #[arg(long = "exclude", value_name = "PATTERN")]
         excludes: Vec<String>,
+        /// Encrypt with a key of its own instead of the key your other sets
+        /// share.
+        #[arg(long)]
+        own_key: bool,
     },
     /// Show or change the files and folders a set leaves out. Changes apply
     /// from the next backup; earlier versions keep what they hold until
@@ -668,6 +672,9 @@ async fn main() -> Result<()> {
                     println!("  last error: {e}");
                 }
                 println!("  keeps {}", set.retention);
+                if set.own_key {
+                    println!("  has its own encryption key");
+                }
                 if !set.excludes.is_empty() {
                     println!("  leaves out {}", set.excludes.join(", "));
                 }
@@ -739,6 +746,7 @@ async fn main() -> Result<()> {
             debounce,
             limits,
             excludes,
+            own_key,
         }) => {
             let target = match (local, peer) {
                 (Some(path), _) => Target::Local { path },
@@ -759,6 +767,7 @@ async fn main() -> Result<()> {
                 window: limits.window,
                 retention: retention.policy(),
                 excludes,
+                own_key,
             });
             let Reply::SetCreated { id } = client.call(&req).await? else {
                 bail!("unexpected reply")

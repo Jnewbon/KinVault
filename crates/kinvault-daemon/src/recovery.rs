@@ -17,7 +17,7 @@ use kinvault_net::{SecretKey, TimeWindow};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, PeerEntry, SetConfig, StoredTarget, write_private};
-use crate::worker::write_master_key;
+use crate::worker::{shared_key_path, write_key, write_master_key};
 
 const KIT_VERSION: u32 = 1;
 
@@ -42,6 +42,10 @@ pub struct KitSet {
     pub retention: RetentionPolicy,
     #[serde(default)]
     pub excludes: Vec<String>,
+    /// Its key is the instance's shared key (kits made before keys could be
+    /// shared have none).
+    #[serde(default)]
+    pub shared_key: bool,
     pub key: KeyFile,
 }
 
@@ -67,6 +71,7 @@ pub(crate) fn build(
             window: set.window,
             retention: set.retention,
             excludes: set.excludes.clone(),
+            shared_key: set.shared_key,
             key: KeyFile::create(key, passphrase)?,
         });
     }
@@ -146,6 +151,11 @@ pub fn import_offline(
         hex::encode(identity.to_bytes()).as_bytes(),
     )?;
 
+    // New sets made after the import share the key the kit's sets shared.
+    if let Some((_, key)) = kit.sets.iter().zip(&keys).find(|(s, _)| s.shared_key) {
+        write_key(&shared_key_path(state_dir), key)?;
+    }
+
     let mut imported = Vec::new();
     for (set, key) in kit.sets.iter().zip(&keys) {
         let mut name = set.name.clone();
@@ -172,6 +182,7 @@ pub fn import_offline(
             retention: set.retention,
             paused: true,
             excludes: set.excludes.clone(),
+            shared_key: set.shared_key,
         });
         imported.push(name);
     }

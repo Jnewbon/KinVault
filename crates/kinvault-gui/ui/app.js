@@ -778,6 +778,7 @@ async function newSetDialog() {
         { name: "from", label: "Back up automatically from", type: "time", hint: "Leave empty for any time" },
         { name: "to", label: "until", type: "time" },
       ] },
+      { name: "ownKey", label: "Use a separate encryption key for this backup", type: "checkbox", value: false, hint: "Normally your backups share one key. A separate key keeps this one apart even from hosts that also store your other backups." },
       { name: "pass", label: "Recovery passphrase", type: "password", hint: "Protects this backup's recovery file. At least 8 characters." },
       { name: "pass2", label: "Repeat passphrase", type: "password" },
     ],
@@ -799,6 +800,7 @@ async function newSetDialog() {
         name: v.name, paths: v.paths, target, recovery_passphrase: v.pass,
         debounce_secs: null, rescan_secs: null, upload_limit: toBytes(v.rate, MiB),
         window: windowFrom(v.from, v.to), retention, excludes: excludesFrom(v.excludes),
+        own_key: v.ownKey,
       });
     },
   });

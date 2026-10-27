@@ -82,17 +82,39 @@ pub(crate) fn master_key_path(set_dir: &Path) -> PathBuf {
     set_dir.join("master.key")
 }
 
+/// The key new sets use unless they ask for their own; see [`shared_key`].
+pub(crate) fn shared_key_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("shared.key")
+}
+
 pub(crate) fn write_master_key(set_dir: &Path, key: &MasterKey) -> Result<()> {
-    write_private(
-        &master_key_path(set_dir),
-        hex::encode(key.to_bytes()).as_bytes(),
-    )
+    write_key(&master_key_path(set_dir), key)
 }
 
 pub(crate) fn read_master_key(set_dir: &Path) -> Result<MasterKey> {
-    let text = fs::read_to_string(master_key_path(set_dir)).context("reading set key")?;
+    read_key(&master_key_path(set_dir)).context("reading set key")
+}
+
+/// The instance's shared set key, created the first time it's needed.
+/// Each set using it still keeps its own copy in `master.key`.
+pub(crate) fn shared_key(state_dir: &Path) -> Result<MasterKey> {
+    let path = shared_key_path(state_dir);
+    if path.exists() {
+        return read_key(&path).context("reading the shared key");
+    }
+    let key = MasterKey::generate()?;
+    write_key(&path, &key)?;
+    Ok(key)
+}
+
+pub(crate) fn write_key(path: &Path, key: &MasterKey) -> Result<()> {
+    write_private(path, hex::encode(key.to_bytes()).as_bytes())
+}
+
+fn read_key(path: &Path) -> Result<MasterKey> {
+    let text = fs::read_to_string(path)?;
     let mut bytes = [0u8; 32];
-    hex::decode_to_slice(text.trim(), &mut bytes).context("set key is corrupt")?;
+    hex::decode_to_slice(text.trim(), &mut bytes).context("key is corrupt")?;
     Ok(MasterKey::from_bytes(bytes))
 }
 

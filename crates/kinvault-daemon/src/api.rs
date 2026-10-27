@@ -187,6 +187,10 @@ pub struct CreateSet {
     /// [`kinvault_core::Excludes`].
     #[serde(default)]
     pub excludes: Vec<String>,
+    /// Encrypt with a key of the set's own instead of the key the
+    /// instance's other sets share.
+    #[serde(default)]
+    pub own_key: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -421,6 +425,9 @@ pub struct SetStatus {
     pub retention: RetentionPolicy,
     #[serde(default)]
     pub excludes: Vec<String>,
+    /// Whether it has a key of its own rather than the shared one.
+    #[serde(default)]
+    pub own_key: bool,
     pub state: SetState,
     /// Whether the host it backs up to is reachable; `None` for a local
     /// folder or a host not checked yet.

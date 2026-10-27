@@ -124,6 +124,7 @@ async fn daemon_backs_up_changes_to_peer() {
             window: None,
             retention: None,
             excludes: Vec::new(),
+            own_key: false,
         }),
     )
     .await;
@@ -405,6 +406,7 @@ async fn friends_pair_with_an_invite_and_back_up_to_each_other() {
             window: None,
             retention: None,
             excludes: Vec::new(),
+            own_key: false,
         }),
     )
     .await;
@@ -443,6 +445,7 @@ async fn friends_pair_with_an_invite_and_back_up_to_each_other() {
             window: Some(closed),
             retention: None,
             excludes: Vec::new(),
+            own_key: false,
         }),
     )
     .await;
@@ -563,6 +566,7 @@ async fn recovery_kit_restores_backups_on_a_new_machine() {
             window: None,
             retention: None,
             excludes: Vec::new(),
+            own_key: false,
         }),
     )
     .await;
@@ -628,6 +632,11 @@ async fn recovery_kit_restores_backups_on_a_new_machine() {
     assert_eq!(summary.sets, vec!["docs".to_string()]);
     assert_eq!(summary.instance_id, pc_id.to_string());
     assert!(recovery::import_offline(&new_state, &json, "kit passphrase!", false).is_err());
+    // New sets on the new machine keep sharing the key.
+    assert_eq!(
+        fs::read_to_string(new_state.join("shared.key")).unwrap(),
+        fs::read_to_string(old_state.join("shared.key")).unwrap()
+    );
 
     // It comes back with the old identity, so the host recognises it.
     let secret = kinvault_net::load_or_create_secret(&new_state.join("identity.key")).unwrap();
@@ -680,6 +689,70 @@ async fn recovery_kit_restores_backups_on_a_new_machine() {
     host.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn sets_share_a_key_unless_they_ask_for_their_own() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let daemon = start(&state, SecretKey::generate()).await;
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.txt"), b"a").unwrap();
+
+    let mut ids = Vec::new();
+    for (name, own_key) in [("one", false), ("two", false), ("apart", true)] {
+        let Reply::SetCreated { id } = call(
+            &daemon,
+            Request::CreateSet(CreateSet {
+                name: name.into(),
+                paths: vec![src.clone()],
+                target: Target::Local {
+                    path: tmp.path().join(format!("backup-{name}")),
+                },
+                recovery_passphrase: "a long recovery phrase".into(),
+                debounce_secs: Some(60),
+                rescan_secs: None,
+                upload_limit: None,
+                window: None,
+                retention: None,
+                excludes: Vec::new(),
+                own_key,
+            }),
+        )
+        .await
+        else {
+            panic!()
+        };
+        ids.push(id);
+    }
+    let key =
+        |id: &str| fs::read_to_string(state.join("sets").join(id).join("master.key")).unwrap();
+    let shared = fs::read_to_string(state.join("shared.key")).unwrap();
+    assert_eq!(key(&ids[0]), shared);
+    assert_eq!(key(&ids[1]), shared);
+    assert_ne!(key(&ids[2]), shared);
+
+    let Reply::Status(st) = call(&daemon, Request::Status).await else {
+        panic!()
+    };
+    let own: Vec<(String, bool)> = st.sets.into_iter().map(|s| (s.name, s.own_key)).collect();
+    assert_eq!(
+        own,
+        vec![
+            ("apart".to_string(), true),
+            ("one".to_string(), false),
+            ("two".to_string(), false)
+        ]
+    );
+
+    // Removing a set leaves the shared key for the others.
+    call(&daemon, Request::RemoveSet { set: "one".into() }).await;
+    assert_eq!(
+        fs::read_to_string(state.join("shared.key")).unwrap(),
+        shared
+    );
+    daemon.shutdown().await;
+}
+
 fn hex_master_key(state: &Path) -> String {
     let sets = state.join("sets");
     let dir = fs::read_dir(&sets).unwrap().next().unwrap().unwrap().path();
@@ -727,6 +800,7 @@ async fn subscribers_see_state_changes_and_results() {
             window: None,
             retention: None,
             excludes: Vec::new(),
+            own_key: false,
         }),
     )
     .await;
@@ -1155,6 +1229,7 @@ fn create_set(name: &str, src: &Path, target: Target) -> Request {
         window: None,
         retention: None,
         excludes: Vec::new(),
+        own_key: false,
     })
 }
 
