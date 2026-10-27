@@ -138,12 +138,20 @@ impl<B: Backend> Repository<B> {
     /// Reconciles the local index with the packs the backend actually holds.
     /// Only headers of packs we don't know yet are downloaded.
     pub fn sync_index(&mut self) -> Result<()> {
+        tracing::debug!("asking the backup for the packs it holds");
         let remote: HashSet<PackId> = self.backend.list_packs()?.into_iter().collect();
         let local = self.index.known_packs()?;
+        tracing::debug!(
+            held = remote.len(),
+            new = remote.difference(&local).count(),
+            gone = local.difference(&remote).count(),
+            "compared the backup's packs with the local index"
+        );
         for gone in local.difference(&remote) {
             self.index.remove_pack(gone)?;
         }
         for new in remote.difference(&local) {
+            tracing::debug!(pack = %short(new), "reading the contents list of a pack");
             let (len, mut tail) = self.backend.get_pack_tail(new, pack::HEADER_TAIL_GUESS)?;
             let needed = pack::header_tail_len(&tail)?;
             if needed > tail.len() as u64 {
@@ -195,6 +203,7 @@ impl<B: Backend> Repository<B> {
             && old.paths == paths
             && old.hostname == hostname
         {
+            tracing::debug!(snapshot = %short(prev), "nothing changed since the last backup");
             return Ok((*prev, stats));
         }
 
@@ -211,6 +220,7 @@ impl<B: Backend> Repository<B> {
         };
         // Written last: a snapshot only becomes visible once all its data is stored.
         let (id, data) = snapshot::encode_snapshot(&self.keys, &snapshot)?;
+        tracing::debug!(snapshot = %short(&id), bytes = data.len(), "saving the snapshot");
         self.backend.put_snapshot(&id, &data)?;
         Ok((id, stats))
     }
@@ -518,7 +528,20 @@ impl PackWriter {
             return Ok(());
         }
         let finished = builder.finish(&repo.keys)?;
+        tracing::debug!(
+            pack = %short(&finished.id),
+            kind = ?kind,
+            bytes = finished.data.len(),
+            chunks = finished.entries.len(),
+            "sending a pack"
+        );
+        let started = std::time::Instant::now();
         repo.backend.put_pack(&finished.id, &finished.data)?;
+        tracing::debug!(
+            pack = %short(&finished.id),
+            took = ?started.elapsed(),
+            "pack stored"
+        );
         repo.index.add_pack(&finished.id, &finished.entries)?;
         // The pack is uploaded; make the index say so before going on.
         repo.index.commit_batch()?;
@@ -541,6 +564,7 @@ struct BackupRun<'a, B: Backend> {
 
 impl<B: Backend> BackupRun<'_, B> {
     fn warn(&mut self, path: &Path, err: impl std::fmt::Display) {
+        tracing::debug!("skipping {}: {err}", path.display());
         self.stats
             .warnings
             .push(format!("{}: {err}", path.display()));
@@ -594,6 +618,7 @@ impl<B: Backend> BackupRun<'_, B> {
     ) -> Result<Option<Node>> {
         self.repo.check_cancelled()?;
         if self.repo.excludes.iter().any(|e| path.starts_with(e)) {
+            tracing::trace!("leaving out {}", path.display());
             return Ok(None);
         }
         // A listing's entry doesn't follow symlinks either. On Windows it
@@ -615,6 +640,10 @@ impl<B: Backend> BackupRun<'_, B> {
             self.repo.exclude_patterns.excludes_file(path)
         };
         if left_out {
+            tracing::trace!(
+                "leaving out {} (matches an exclude pattern)",
+                path.display()
+            );
             return Ok(None);
         }
         let kind = if ft.is_symlink() {
@@ -648,6 +677,7 @@ impl<B: Backend> BackupRun<'_, B> {
     }
 
     fn store_dir(&mut self, path: &Path) -> Result<ChunkId> {
+        tracing::trace!("scanning folder {}", path.display());
         self.stats.dirs += 1;
         let mut entries: Vec<fs::DirEntry> = match fs::read_dir(path) {
             Ok(rd) => rd.filter_map(|e| e.ok()).collect(),
@@ -680,6 +710,7 @@ impl<B: Backend> BackupRun<'_, B> {
                 .iter()
                 .try_fold(true, |ok, c| Ok::<_, Error>(ok && self.is_stored(c)?))?
         {
+            tracing::trace!("unchanged: {}", path.display());
             self.stats.files += 1;
             self.stats.total_bytes += size;
             self.report_progress(false);
@@ -689,6 +720,7 @@ impl<B: Backend> BackupRun<'_, B> {
             }));
         }
 
+        tracing::debug!(bytes = size, "reading {}", path.display());
         match fs::File::open(path) {
             Ok(file) => self.store_contents(path, file, size, mtime, inode),
             Err(e) => {
@@ -760,6 +792,13 @@ impl<B: Backend> BackupRun<'_, B> {
         )?;
         Ok(Some(NodeKind::File { size: read, chunks }))
     }
+}
+
+/// The start of an id, enough to tell ids apart in logs.
+fn short(id: &impl std::fmt::Display) -> String {
+    let mut s = id.to_string();
+    s.truncate(12);
+    s
 }
 
 /// Name of a source in the snapshot root: its absolute path without the

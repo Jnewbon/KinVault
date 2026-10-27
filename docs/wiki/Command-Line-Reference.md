@@ -128,4 +128,4 @@ See [[Recovery Kit]].
 | `KINVAULT_LISTEN_PORT` | `kinvaultd` | UDP port, if none is configured yet |
 | `KINVAULT_WEB` | `kinvaultd` (web builds) | Serve the web interface on this address |
 | `KINVAULT_WEB_PASSWORD` | `kinvaultd` (web builds) | Web sign-in password |
-| `RUST_LOG` | `kinvaultd` | Log detail, e.g. `debug` |
+| `RUST_LOG` | `kinvaultd` | Log detail, e.g. `debug` (`kinvaultd -v` or `-vv` overrides it) |

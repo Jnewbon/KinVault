@@ -108,13 +108,18 @@ impl RemoteBackend {
         {
             return Ok(conn.clone());
         }
+        let host = self.addr.id.fmt_short();
+        tracing::debug!(%host, "connecting to the backup host");
+        let started = std::time::Instant::now();
         let conn = connect(
             &self.endpoint,
             self.addr.clone(),
             &self.hosts,
             CONNECT_TIMEOUT,
         )
-        .await?;
+        .await
+        .inspect_err(|e| tracing::debug!(%host, "couldn't connect to the backup host: {e}"))?;
+        tracing::debug!(%host, took = ?started.elapsed(), "connected to the backup host");
         *guard = Some(conn.clone());
         Ok(conn)
     }
@@ -134,6 +139,7 @@ impl RemoteBackend {
             match call_once(&conn, &req, payload, self.upload_limit.as_deref()).await {
                 // The cached connection went away (idle timeout, network change): reconnect once.
                 Err(NetError::Transport(_)) if attempt == 0 && conn.close_reason().is_some() => {
+                    tracing::debug!("the connection to the backup host closed; reconnecting");
                     attempt += 1;
                     *self.conn.lock().await = None;
                 }
@@ -170,6 +176,16 @@ async fn call_once(
     payload: Option<&[u8]>,
     limiter: Option<&RateLimiter>,
 ) -> Result<(Response, Option<Vec<u8>>), NetError> {
+    let what = describe(&req.op);
+    match (payload, limiter) {
+        (Some(_), Some(l)) => tracing::debug!(
+            limit = l.bytes_per_sec(),
+            "sending {what}, paced to the upload limit"
+        ),
+        (Some(_), None) => tracing::debug!("sending {what}"),
+        (None, _) => tracing::debug!("asking the host: {what}"),
+    }
+    let started = std::time::Instant::now();
     let (mut send, mut recv) = conn.open_bi().await.map_err(transport)?;
     let sent = async {
         write_msg(&mut send, req).await?;
@@ -179,12 +195,28 @@ async fn call_once(
         send.finish().map_err(transport)
     }
     .await;
+    match &sent {
+        Ok(()) => tracing::debug!(
+            took = ?started.elapsed(),
+            "sent {what}; waiting for the host's reply"
+        ),
+        Err(e) => tracing::debug!("sending {what} failed: {e}; reading the host's reply"),
+    }
+    let waiting = std::time::Instant::now();
     // The host may reject an upload before reading it and stop our stream;
     // its response explains why, so prefer it over the write error.
     let resp: Response = match read_msg(&mut recv, MAX_RESPONSE_LEN).await {
         Ok(resp) => resp,
-        Err(e) => return Err(sent.err().unwrap_or(e)),
+        Err(e) => {
+            tracing::debug!("no reply from the host to {what}: {e}");
+            return Err(sent.err().unwrap_or(e));
+        }
     };
+    tracing::debug!(
+        waited = ?waiting.elapsed(),
+        "host replied to {what}: {}",
+        describe_response(&resp)
+    );
     let data = match resp {
         Response::Data { len } | Response::Tail { len, .. } => {
             Some(read_payload(&mut recv, len, None).await?)
@@ -287,6 +319,56 @@ pub async fn pair(
         Response::Paired { host_name } => Ok(host_name),
         Response::Error { code, message } => Err(NetError::from_code(code, message)),
         other => Err(unexpected(&other)),
+    }
+}
+
+/// A request, for logs. Leaves out secrets such as invite tokens.
+fn describe(op: &Op) -> String {
+    let short = |id: &dyn std::fmt::Display| {
+        let mut s = id.to_string();
+        s.truncate(12);
+        s
+    };
+    match op {
+        Op::Status => "status".into(),
+        Op::ListPacks => "list packs".into(),
+        Op::PutPack { id, len } => format!("pack {} ({len} bytes)", short(id)),
+        Op::GetPack { id } => format!("get pack {}", short(id)),
+        Op::GetPackTail { id, max_len } => {
+            format!("get the last {max_len} bytes of pack {}", short(id))
+        }
+        Op::DeletePack { id } => format!("delete pack {}", short(id)),
+        Op::ListSnapshots => "list snapshots".into(),
+        Op::PutSnapshot { id, len } => format!("snapshot {} ({len} bytes)", short(id)),
+        Op::GetSnapshot { id } => format!("get snapshot {}", short(id)),
+        Op::DeleteSnapshot { id } => format!("delete snapshot {}", short(id)),
+        Op::RedeemInvite { .. } => "redeem invite".into(),
+        Op::Pair { .. } => "pair".into(),
+        Op::DeleteRepo => "delete repository".into(),
+    }
+}
+
+/// A reply, for logs. Lists are summarised by their length.
+fn describe_response(resp: &Response) -> String {
+    match resp {
+        Response::Ok => "ok".into(),
+        Response::Status {
+            used_bytes,
+            quota_bytes,
+        } => match quota_bytes {
+            Some(q) => format!("{used_bytes} of {q} bytes used"),
+            None => format!("{used_bytes} bytes used"),
+        },
+        Response::PackIds(ids) => format!("{} packs", ids.len()),
+        Response::SnapshotIds(ids) => format!("{} snapshots", ids.len()),
+        Response::Data { len } => format!("{len} bytes follow"),
+        Response::Tail { total_len, len } => format!("last {len} of {total_len} bytes follow"),
+        Response::Error { code, message } => format!("error {code:?}: {message}"),
+        Response::Redeemed { .. } => "invite accepted".into(),
+        Response::Paired { .. } => "paired".into(),
+        Response::DeleteScheduled { erase_after_unix } => {
+            format!("erasing at {erase_after_unix}")
+        }
     }
 }
 

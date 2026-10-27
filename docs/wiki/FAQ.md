@@ -120,5 +120,5 @@ folder, backups and friends.
 
 - Linux desktop: `journalctl --user -u kinvaultd`
 - Docker: `docker logs kinvault`
-- Anywhere: run `kinvaultd` in a terminal to see its output. Set
-  `RUST_LOG=debug` for more.
+- Anywhere: run `kinvaultd` in a terminal to see its output. Add `-v` for
+  more detail, `-vv` for everything (or set `RUST_LOG`, e.g. `debug`).

@@ -418,7 +418,10 @@ impl Worker {
         let slot = self.repo.clone();
         let env = self.env.clone();
         let cancel = self.cancel.clone();
+        // Tags what the repository and the network log with the set's name.
+        let span = tracing::debug_span!("set", name = %self.env.set.name);
         tokio::task::spawn_blocking(move || {
+            let _span = span.entered();
             // Held for the whole operation; see `SetHandle::stop`.
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
             let repo = match &mut *slot {
@@ -616,6 +619,13 @@ async fn run(
             msg = rx.recv() => match msg {
                 None => return,
                 Some(Trigger::Changed) => {
+                    if change_deadline.is_none() {
+                        tracing::debug!(
+                            set = %worker.env.set.name,
+                            "files changed; backing up after {}s without further changes",
+                            debounce.as_secs()
+                        );
+                    }
                     let now = Instant::now();
                     let first = *first_change.get_or_insert(now);
                     change_deadline = Some((now + debounce).min(first + MAX_CHANGE_DELAY));
@@ -666,6 +676,11 @@ async fn run(
         {
             let wait = window.until_open();
             if !wait.is_zero() {
+                tracing::debug!(
+                    set = %worker.env.set.name,
+                    "outside the backup window {window}; waiting {}s for it to open",
+                    wait.as_secs()
+                );
                 waiting_for_window = true;
                 scheduled = Instant::now() + wait;
                 continue;
@@ -678,12 +693,21 @@ async fn run(
             && let Some(h) = &host
             && worker.env.hosts.is_offline(&h.id)
         {
+            tracing::debug!(
+                set = %worker.env.set.name,
+                "the backup host is offline; waiting for it to come back"
+            );
             waiting_for_host = true;
             scheduled = Instant::now() + MAX_RETRY_DELAY;
             continue;
         }
         waiting_for_host = false;
         set_state(&worker.env, &status, SetState::Running);
+        tracing::debug!(
+            set = %worker.env.set.name,
+            paths = ?worker.env.set.paths,
+            "backup started"
+        );
 
         let result = worker.backup().await;
         match result {
