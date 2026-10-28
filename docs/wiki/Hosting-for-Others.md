@@ -30,6 +30,14 @@ or `kinvault peer allow <friend> --quota 1T --upload-limit 5M --window
 
 The **Friends** page shows how much each friend uses of their quota.
 
+### Forwarding
+
+Someone who backs up to you can ask you to forward copies of their backup to
+another computer they use (see [Backups](Backups#sending-copies-through-the-main-place)).
+You send what they already stored with you, still encrypted, so it costs you
+upload bandwidth but no extra space. Their **Upload speed** and **Hours**
+limits apply to forwarding too.
+
 ### Deleted data still counts for a while
 
 When a friend's KinVault removes old versions, you don't erase that data

@@ -15,7 +15,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use kinvault_core::{Backend, Excludes, Index, LocalDirBackend, MasterKey, Repository, SnapshotId};
+use kinvault_core::{
+    Backend, Excludes, Index, LocalDirBackend, MasterKey, PackId, Repository, SnapshotId,
+};
+use kinvault_net::protocol::{Delegation, ForwardOrder, ForwardState};
 use kinvault_net::{Endpoint, EndpointAddr, EndpointId, RemoteBackend};
 use notify::event::{AccessKind, AccessMode};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -70,7 +73,30 @@ pub(crate) struct ExtraState {
     pub last_error: Option<String>,
     pub last_prune: Option<PruneSummary>,
     pub last_verify: Option<VerifySummary>,
+    /// For a place copies are forwarded to: orders the relay hasn't
+    /// finished, and versions it has delivered (`(id, time in ns)`).
+    #[serde(default)]
+    pub orders: Vec<OrderRecord>,
+    #[serde(default)]
+    pub delivered: Vec<(String, i64)>,
+    #[serde(default)]
+    pub forwarding: Option<api::ForwardProgress>,
 }
+
+/// A forwarding order sent to the relay.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct OrderRecord {
+    pub id: String,
+    /// `(id, time in ns)`, oldest first.
+    pub snapshots: Vec<(String, i64)>,
+    pub packs: Vec<String>,
+}
+
+/// How long a relay may deliver with a permission given in one order.
+const DELEGATION_SECS: i64 = 60 * 24 * 60 * 60;
+/// Delivered versions remembered for choosing new ones; older ones can't
+/// share an hour, day, week, month or year with new ones anyway.
+const DELIVERED_MEMORY_NS: i64 = 400 * 24 * 60 * 60 * 1_000_000_000;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RunStatus {
@@ -205,6 +231,26 @@ impl SetEnv {
     /// The host the set backs up to, unless it's a local folder.
     pub fn host(&self) -> Option<HostTarget> {
         host_of(&self.set.target)
+    }
+
+    /// The main place's host, for asking it to forward copies.
+    pub fn main_remote(&self) -> Result<RemoteBackend> {
+        let StoredTarget::Peer {
+            id,
+            repo,
+            addrs,
+            hosts,
+        } = &self.set.target
+        else {
+            bail!("copies can only be forwarded when the main place is another computer");
+        };
+        Ok(RemoteBackend::new(
+            self.endpoint.clone(),
+            peer_addr(id, addrs)?,
+            repo,
+            self.runtime.clone(),
+        )?
+        .with_hosts(hosts.clone()))
     }
 
     fn extras_path(&self) -> PathBuf {
@@ -674,7 +720,12 @@ impl Worker {
     async fn copy_to_extras(&mut self, explicit: bool) -> ExtrasOutcome {
         let mut outcome = ExtrasOutcome::default();
         for t in self.env.set.extra_targets.clone() {
-            if !explicit && let Some(window) = t.window {
+            // Orders for the relay can be sent any time; it keeps the
+            // place's hours, and waits for it to be online.
+            if !explicit
+                && !t.relay
+                && let Some(window) = t.window
+            {
                 let wait = window.until_open();
                 if !wait.is_zero() {
                     tracing::debug!(set = %self.env.set.name, place = t.id, "outside its time window; copying in {}s", wait.as_secs());
@@ -683,6 +734,7 @@ impl Worker {
                 }
             }
             if !explicit
+                && !t.relay
                 && let Some(h) = host_of(&t.target)
                 && self.env.hosts.is_offline(&h.id)
             {
@@ -691,7 +743,12 @@ impl Worker {
                 continue;
             }
             set_state(&self.env, &self.status, SetState::Copying);
-            match self.copy_to(&t).await {
+            let copied = if t.relay {
+                self.forward_to(&t).await
+            } else {
+                self.copy_to(&t).await
+            };
+            match copied {
                 Ok(copied) => {
                     if let Some(c) = &copied {
                         tracing::info!(set = %self.env.set.name, place = t.id, versions = c.snapshots, bytes = c.bytes, "copied versions");
@@ -720,6 +777,12 @@ impl Worker {
                     e.since_unix,
                 )
             };
+            // Cleaning up and checking need to reach the place from here.
+            if t.relay
+                && host_of(&t.target).is_none_or(|h| self.env.hosts.get(&h.id).online != Some(true))
+            {
+                continue;
+            }
             let now = unix_now();
             if now - pruned.max(since) >= PRUNE_INTERVAL_SECS
                 && let Err(e) = self.prune(Some(t.id.clone())).await
@@ -736,6 +799,181 @@ impl Worker {
             }
         }
         outcome
+    }
+
+    /// For a place copies are forwarded to: learns which orders the relay
+    /// finished, then orders the versions the place should get next.
+    /// Returns what was delivered since last time, if anything.
+    async fn forward_to(
+        &mut self,
+        t: &crate::config::ExtraTarget,
+    ) -> Result<Option<api::CopySummary>> {
+        let relay = self.env.main_remote()?;
+        let infos = relay.forward_status(&t.id).await?;
+        let mut state = self
+            .status
+            .lock()
+            .unwrap()
+            .extras
+            .get(&t.id)
+            .cloned()
+            .unwrap_or_default();
+
+        let mut delivered: Option<api::CopySummary> = None;
+        let mut failed: Vec<String> = Vec::new();
+        let mut failure: Option<String> = None;
+        let mut progress = api::ForwardProgress::default();
+        let mut pending = Vec::new();
+        for order in std::mem::take(&mut state.orders) {
+            match infos.iter().find(|i| i.id == order.id) {
+                Some(i) if i.state == ForwardState::Done => {
+                    let d = delivered.get_or_insert(api::CopySummary {
+                        time_unix: i.updated_unix,
+                        snapshot: String::new(),
+                        snapshots: 0,
+                        bytes: 0,
+                    });
+                    d.time_unix = d.time_unix.max(i.updated_unix);
+                    d.snapshots += order.snapshots.len() as u64;
+                    d.bytes += i.bytes_sent;
+                    if let Some((newest, _)) = order.snapshots.last() {
+                        d.snapshot = newest.clone();
+                    }
+                    state.delivered.extend(order.snapshots);
+                }
+                Some(i) if i.state == ForwardState::Pending => {
+                    progress.orders += 1;
+                    progress.packs_sent += i.packs_sent;
+                    progress.packs_total += i.packs_total;
+                    progress.bytes_sent += i.bytes_sent;
+                    if i.error.is_some() {
+                        progress.note = i.error.clone();
+                    }
+                    pending.push(order);
+                }
+                found => {
+                    failure = Some(match found.and_then(|i| i.error.clone()) {
+                        Some(e) => format!("the relay couldn't deliver: {e}"),
+                        None => "the relay lost track of copies it was sending".into(),
+                    });
+                    failed.extend(order.packs);
+                }
+            }
+        }
+        state.orders = pending;
+        state.forwarding = (progress.orders > 0).then_some(progress);
+        if let Some(newest) = state.delivered.iter().map(|&(_, t)| t).max() {
+            state
+                .delivered
+                .retain(|&(_, t)| t == newest || newest - t < DELIVERED_MEMORY_NS);
+        }
+        // What failed is forgotten, so it's ordered again next time.
+        let index_path = self.env.set_dir.join(index_file(Some(&t.id)));
+        if !failed.is_empty() {
+            let path = index_path.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut sent = Index::open(&path)?;
+                for p in failed {
+                    sent.remove_pack(&PackId::from_hex(&p)?)?;
+                }
+                Ok(())
+            })
+            .await??;
+        }
+        if let Some(failure) = failure {
+            self.save_extra(&t.id, |e| *e = state);
+            bail!(failure);
+        }
+
+        // Order what the place should get next.
+        let held: Vec<(SnapshotId, i64)> = state
+            .delivered
+            .iter()
+            .chain(state.orders.iter().flat_map(|o| &o.snapshots))
+            .filter_map(|(id, time)| Some((SnapshotId::from_hex(id).ok()?, *time)))
+            .collect();
+        let policy = t.retention;
+        let path = index_path.clone();
+        let planned = self
+            .with_repo(move |main| {
+                let source = main.snapshot_times()?;
+                let wanted = policy.to_copy(&source, &held);
+                if wanted.is_empty() {
+                    return Ok(None);
+                }
+                let mut sent = Index::open(&path)?;
+                let packs = main.plan_copy(&mut sent, &wanted)?;
+                let snapshots: Vec<(SnapshotId, i64)> = wanted
+                    .iter()
+                    .filter_map(|id| source.iter().find(|(s, _)| s == id).copied())
+                    .collect();
+                Ok(Some((snapshots, packs)))
+            })
+            .await?;
+        if let Some((snapshots, packs)) = planned {
+            let StoredTarget::Peer {
+                id: host,
+                repo,
+                addrs,
+                hosts,
+            } = &t.target
+            else {
+                bail!("copies can only be forwarded to another computer");
+            };
+            let StoredTarget::Peer { id: relay_id, .. } = &self.env.set.target else {
+                bail!("copies can only be forwarded when the main place is another computer");
+            };
+            let order = ForwardOrder {
+                id: hex::encode(kinvault_core::crypto::random_bytes::<8>()?),
+                place: t.id.clone(),
+                delegation: Delegation::sign(
+                    self.env.endpoint.secret_key(),
+                    EndpointId::from_str(relay_id)?,
+                    EndpointId::from_str(host)?,
+                    repo,
+                    unix_now() + DELEGATION_SECS,
+                ),
+                addrs: addrs.clone(),
+                hosts: hosts.clone(),
+                packs: packs.clone(),
+                snapshots: snapshots.iter().map(|(id, _)| *id).collect(),
+                upload_limit: t.upload_limit,
+                window: t.window,
+            };
+            tracing::debug!(
+                set = %self.env.set.name,
+                place = t.id,
+                versions = snapshots.len(),
+                packs = packs.len(),
+                "asking the relay to forward copies"
+            );
+            if let Err(e) = relay.forward(&order).await {
+                // Not ordered after all: forget the packs, so they're planned again.
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    let mut sent = Index::open(&index_path)?;
+                    for p in &packs {
+                        sent.remove_pack(p)?;
+                    }
+                    Ok(())
+                })
+                .await??;
+                self.save_extra(&t.id, |e| *e = state);
+                return Err(e.into());
+            }
+            let progress = state.forwarding.get_or_insert_with(Default::default);
+            progress.orders += 1;
+            progress.packs_total += packs.len() as u64;
+            state.orders.push(OrderRecord {
+                id: order.id,
+                snapshots: snapshots
+                    .iter()
+                    .map(|(id, time)| (id.to_hex(), *time))
+                    .collect(),
+                packs: packs.iter().map(|p| p.to_hex()).collect(),
+            });
+        }
+        self.save_extra(&t.id, |e| *e = state);
+        Ok(delivered)
     }
 
     /// Copies to one extra place what it should have; `None` if nothing.

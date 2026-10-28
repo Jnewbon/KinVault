@@ -12,8 +12,8 @@ use crate::error::{NetError, transport};
 use crate::hosts::with_hosts;
 use crate::limits::RateLimiter;
 use crate::protocol::{
-    ALPN, MAX_OBJECT_LEN, MAX_RESPONSE_LEN, Offer, Op, Request, Response, read_msg, read_payload,
-    valid_repo_name, write_msg, write_payload,
+    ALPN, Delegation, Delivery, ForwardInfo, ForwardOrder, MAX_OBJECT_LEN, MAX_RESPONSE_LEN, Offer,
+    Op, Request, Response, read_msg, read_payload, valid_repo_name, write_msg, write_payload,
 };
 use crate::receiver::InviteAccepted;
 use crate::ticket::InviteTicket;
@@ -99,6 +99,35 @@ impl RemoteBackend {
             Response::DeleteScheduled { erase_after_unix } => Ok(erase_after_unix),
             other => Err(unexpected(&other)),
         }
+    }
+
+    /// Asks this host to forward objects of this repository to another
+    /// host (see [`ForwardOrder`]). It works through them in the background.
+    pub async fn forward(&self, order: &ForwardOrder) -> Result<(), NetError> {
+        let data = postcard::to_allocvec(order)?;
+        let op = Op::Forward {
+            len: data.len() as u64,
+        };
+        self.expect_ok(op, Some(&data)).await
+    }
+
+    /// How this repository's forwarding orders for `place` are going.
+    pub async fn forward_status(&self, place: &str) -> Result<Vec<ForwardInfo>, NetError> {
+        let op = Op::ForwardStatus {
+            place: place.to_string(),
+        };
+        match self.call(op, None).await?.0 {
+            Response::Forwarding(info) => Ok(info),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Drops unfinished forwarding orders for `place`.
+    pub async fn forward_cancel(&self, place: &str) -> Result<(), NetError> {
+        let op = Op::ForwardCancel {
+            place: place.to_string(),
+        };
+        self.expect_ok(op, None).await
     }
 
     async fn connection(&self) -> Result<Connection, NetError> {
@@ -227,7 +256,7 @@ async fn call_once(
 }
 
 /// Dials a host, giving up after `timeout`.
-async fn connect(
+pub(crate) async fn connect(
     endpoint: &Endpoint,
     addr: EndpointAddr,
     hosts: &[String],
@@ -345,6 +374,16 @@ fn describe(op: &Op) -> String {
         Op::RedeemInvite { .. } => "redeem invite".into(),
         Op::Pair { .. } => "pair".into(),
         Op::DeleteRepo => "delete repository".into(),
+        Op::Forward { len } => format!("forwarding order ({len} bytes)"),
+        Op::ForwardStatus { place } => format!("forwarding status for {place}"),
+        Op::ForwardCancel { place } => format!("cancel forwarding to {place}"),
+        Op::Deliver { item, .. } => match item {
+            Delivery::Have { packs } => format!("which of {} packs are here", packs.len()),
+            Delivery::Pack { id, len } => format!("deliver pack {} ({len} bytes)", short(id)),
+            Delivery::Snapshot { id, len } => {
+                format!("deliver snapshot {} ({len} bytes)", short(id))
+            }
+        },
     }
 }
 
@@ -369,11 +408,87 @@ fn describe_response(resp: &Response) -> String {
         Response::DeleteScheduled { erase_after_unix } => {
             format!("erasing at {erase_after_unix}")
         }
+        Response::Present(found) => {
+            let here = found.iter().filter(|&&f| f).count();
+            format!("{here} of {} here", found.len())
+        }
+        Response::Forwarding(orders) => format!("{} forwarding orders", orders.len()),
+    }
+}
+
+/// Delivers objects to an owner's repository on a host, as a relay with
+/// the owner's [`Delegation`].
+pub(crate) struct Deliverer {
+    pub conn: Connection,
+    pub delegation: Delegation,
+    pub limiter: Option<RateLimiter>,
+}
+
+impl Deliverer {
+    async fn send(&self, item: Delivery, payload: Option<&[u8]>) -> Result<Response, NetError> {
+        let req = Request {
+            repo: self.delegation.repo.clone(),
+            op: Op::Deliver {
+                delegation: self.delegation.clone(),
+                item,
+            },
+        };
+        match call_once(&self.conn, &req, payload, self.limiter.as_ref()).await? {
+            (Response::Error { code, message }, _) => Err(NetError::from_code(code, message)),
+            (resp, _) => Ok(resp),
+        }
+    }
+
+    /// Which of `packs` the host holds already.
+    pub async fn have(&self, packs: &[PackId]) -> Result<Vec<bool>, NetError> {
+        let mut out = Vec::with_capacity(packs.len());
+        for batch in packs.chunks(crate::protocol::MAX_HAVE) {
+            let item = Delivery::Have {
+                packs: batch.to_vec(),
+            };
+            match self.send(item, None).await? {
+                Response::Present(found) if found.len() == batch.len() => out.extend(found),
+                other => return Err(unexpected(&other)),
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn put_pack(&self, id: &PackId, data: &[u8]) -> Result<(), NetError> {
+        let item = Delivery::Pack {
+            id: *id,
+            len: delivery_len(data)?,
+        };
+        match self.send(item, Some(data)).await? {
+            Response::Ok => Ok(()),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    pub async fn put_snapshot(&self, id: &SnapshotId, data: &[u8]) -> Result<(), NetError> {
+        let item = Delivery::Snapshot {
+            id: *id,
+            len: delivery_len(data)?,
+        };
+        match self.send(item, Some(data)).await? {
+            Response::Ok => Ok(()),
+            other => Err(unexpected(&other)),
+        }
     }
 }
 
 fn unexpected(resp: &Response) -> NetError {
     NetError::Protocol(format!("unexpected response {resp:?}"))
+}
+
+fn delivery_len(data: &[u8]) -> Result<u64, NetError> {
+    let len = data.len() as u64;
+    if len > MAX_OBJECT_LEN {
+        return Err(NetError::Protocol(format!(
+            "object of {len} bytes is too large to send"
+        )));
+    }
+    Ok(len)
 }
 
 fn object_len(data: &[u8]) -> kinvault_core::Result<u64> {

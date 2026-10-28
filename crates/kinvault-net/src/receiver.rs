@@ -10,14 +10,18 @@ use std::time::Duration;
 use iroh::EndpointId;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::protocol::{AcceptError, ProtocolHandler};
-use kinvault_core::{Backend, LocalDirBackend};
+use kinvault_core::{Backend, LocalDirBackend, PackId, SnapshotId};
 
 use crate::error::NetError;
 use crate::limits::{RateLimiter, TimeWindow};
 use crate::protocol::{
-    ErrorCode, MAX_OBJECT_LEN, MAX_REQUEST_LEN, Offer, Op, Request, Response, read_msg,
-    read_payload, valid_repo_name, write_msg,
+    Delegation, Delivery, ErrorCode, ForwardOrder, MAX_HAVE, MAX_OBJECT_LEN, MAX_ORDER_LEN,
+    MAX_REQUEST_LEN, Offer, Op, Request, Response, read_msg, read_payload, valid_repo_name,
+    write_msg,
 };
+
+mod forward;
+pub use forward::ForwardQueue;
 
 /// How long a repository its owner deleted is kept before it is erased.
 pub const REPO_DELETE_DELAY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -119,6 +123,9 @@ struct Inner {
     uploads: Mutex<HashMap<EndpointId, Arc<PeerUploads>>>,
     invites: RwLock<Option<InviteHandler>>,
     pairing: RwLock<Option<PairHandler>>,
+    /// This host's own id, which deliveries must be addressed to.
+    identity: RwLock<Option<EndpointId>>,
+    forwarding: RwLock<Option<Arc<ForwardQueue>>>,
 }
 
 type Reply = (Response, Option<Vec<u8>>);
@@ -134,8 +141,21 @@ impl Receiver {
                 uploads: Mutex::default(),
                 invites: RwLock::default(),
                 pairing: RwLock::default(),
+                identity: RwLock::default(),
+                forwarding: RwLock::default(),
             }),
         }
+    }
+
+    /// Sets this host's id. Relays can only deliver for an owner once it's set.
+    pub fn set_identity(&self, id: EndpointId) {
+        *self.inner.identity.write().unwrap() = Some(id);
+    }
+
+    /// Lets peers have this host forward their objects to other hosts,
+    /// queueing orders in `queue`; see [`Self::run_forwarding`].
+    pub fn enable_forwarding(&self, queue: Arc<ForwardQueue>) {
+        *self.inner.forwarding.write().unwrap() = Some(queue);
     }
 
     /// Grants (or updates) a peer's access.
@@ -401,6 +421,11 @@ impl Receiver {
         if let Op::Pair { name, hosts } = req.op {
             return self.pair(PairRequest { peer, name, hosts }).await;
         }
+        // From a relay, which may not be a peer itself: allowed if the owner
+        // it delivers for signed a permission for it.
+        if let Op::Deliver { delegation, item } = req.op {
+            return self.deliver(peer, &req.repo, delegation, item, recv).await;
+        }
         let Some((grant, limiter)) = self.access(&peer) else {
             return Err((
                 ErrorCode::Denied,
@@ -415,6 +440,20 @@ impl Receiver {
         }
         if let Op::DeleteRepo = req.op {
             return self.delete_repo(&peer, &req.repo).await;
+        }
+        match req.op {
+            Op::Forward { len } => return self.take_order(peer, req.repo, len, recv).await,
+            Op::ForwardStatus { place } => {
+                let queue = self.forward_queue()?;
+                let info = queue.status(&peer, &place).await.map_err(internal)?;
+                return Ok((Response::Forwarding(info), None));
+            }
+            Op::ForwardCancel { place } => {
+                let queue = self.forward_queue()?;
+                queue.cancel(&peer, &place).await.map_err(internal)?;
+                return Ok((Response::Ok, None));
+            }
+            _ => {}
         }
         let repo_dir = self.peer_dir(&peer).join(&req.repo);
         let backend = Arc::new(blocking(move || LocalDirBackend::create(repo_dir)).await?);
@@ -445,34 +484,28 @@ impl Receiver {
                 ))
             }
             Op::PutPack { id, len } => {
-                let (data, reservation) = self
-                    .receive_object(&peer, &grant, limiter.as_deref(), len, recv)
-                    .await?;
-                if blake3::hash(&data).as_bytes() != &id.0 {
-                    return Err((
-                        ErrorCode::BadRequest,
-                        format!("pack {id} content does not match its id"),
-                    ));
-                }
-                let b = backend.clone();
-                blocking(move || b.put_pack(&id, &data)).await?;
-                reservation.release().await;
-                Ok((Response::Ok, None))
+                self.put_object(
+                    &peer,
+                    &grant,
+                    limiter.as_deref(),
+                    &backend,
+                    Object::Pack(id),
+                    len,
+                    recv,
+                )
+                .await
             }
             Op::PutSnapshot { id, len } => {
-                let (data, reservation) = self
-                    .receive_object(&peer, &grant, limiter.as_deref(), len, recv)
-                    .await?;
-                if blake3::hash(&data).as_bytes() != &id.0 {
-                    return Err((
-                        ErrorCode::BadRequest,
-                        format!("snapshot {id} content does not match its id"),
-                    ));
-                }
-                let b = backend.clone();
-                blocking(move || b.put_snapshot(&id, &data)).await?;
-                reservation.release().await;
-                Ok((Response::Ok, None))
+                self.put_object(
+                    &peer,
+                    &grant,
+                    limiter.as_deref(),
+                    &backend,
+                    Object::Snapshot(id),
+                    len,
+                    recv,
+                )
+                .await
             }
             Op::GetPack { id } => {
                 let b = backend.clone();
@@ -521,8 +554,178 @@ impl Receiver {
                 self.invalidate_usage(&peer);
                 Ok((Response::Ok, None))
             }
-            Op::RedeemInvite { .. } | Op::Pair { .. } | Op::DeleteRepo => {
+            Op::RedeemInvite { .. }
+            | Op::Pair { .. }
+            | Op::DeleteRepo
+            | Op::Deliver { .. }
+            | Op::Forward { .. }
+            | Op::ForwardStatus { .. }
+            | Op::ForwardCancel { .. } => {
                 unreachable!("handled above")
+            }
+        }
+    }
+
+    /// Reads an uploaded object, checks it matches its id, and stores it in
+    /// `owner`'s repository, counted against `owner`'s quota.
+    #[allow(clippy::too_many_arguments)]
+    async fn put_object(
+        &self,
+        owner: &EndpointId,
+        grant: &Grant,
+        limiter: Option<&RateLimiter>,
+        backend: &Arc<LocalDirBackend>,
+        object: Object,
+        len: u64,
+        recv: &mut RecvStream,
+    ) -> Result<Reply, Failure> {
+        let (data, reservation) = self
+            .receive_object(owner, grant, limiter, len, recv)
+            .await?;
+        let (what, id) = match object {
+            Object::Pack(id) => ("pack", id.0),
+            Object::Snapshot(id) => ("snapshot", id.0),
+        };
+        if blake3::hash(&data).as_bytes() != &id {
+            return Err((
+                ErrorCode::BadRequest,
+                format!("{what} {} content does not match its id", hex::encode(id)),
+            ));
+        }
+        let b = backend.clone();
+        match object {
+            Object::Pack(id) => blocking(move || b.put_pack(&id, &data)).await?,
+            Object::Snapshot(id) => blocking(move || b.put_snapshot(&id, &data)).await?,
+        }
+        reservation.release().await;
+        Ok((Response::Ok, None))
+    }
+
+    fn forward_queue(&self) -> Result<Arc<ForwardQueue>, Failure> {
+        self.inner
+            .forwarding
+            .read()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| (ErrorCode::Denied, "this host doesn't forward".to_string()))
+    }
+
+    /// Queues an order from `peer` to forward objects of its `repo` here.
+    async fn take_order(
+        &self,
+        peer: EndpointId,
+        repo: String,
+        len: u64,
+        recv: &mut RecvStream,
+    ) -> Result<Reply, Failure> {
+        let queue = self.forward_queue()?;
+        let me = self.identity()?;
+        if len > MAX_ORDER_LEN {
+            return Err((
+                ErrorCode::BadRequest,
+                format!("order of {len} bytes is too large"),
+            ));
+        }
+        let data = read_payload(recv, len, None)
+            .await
+            .map_err(|e| (ErrorCode::BadRequest, e.to_string()))?;
+        let order: ForwardOrder = postcard::from_bytes(&data)
+            .map_err(|e| (ErrorCode::BadRequest, format!("malformed order: {e}")))?;
+        let d = &order.delegation;
+        if d.owner != peer {
+            return Err((
+                ErrorCode::Denied,
+                "the permission isn't the sender's".into(),
+            ));
+        }
+        if d.host == me {
+            return Err((
+                ErrorCode::BadRequest,
+                "can't forward to this same host".into(),
+            ));
+        }
+        d.check(&me, &d.host, &d.repo, unix_now())
+            .map_err(|e| (ErrorCode::Denied, e))?;
+        if !valid_repo_name(&d.repo) {
+            return Err((ErrorCode::BadRequest, "invalid repository name".into()));
+        }
+        queue
+            .add(peer, repo, order)
+            .await
+            .map_err(|e| (ErrorCode::BadRequest, e))?;
+        Ok((Response::Ok, None))
+    }
+
+    fn identity(&self) -> Result<EndpointId, Failure> {
+        self.inner.identity.read().unwrap().ok_or_else(|| {
+            (
+                ErrorCode::Internal,
+                "this host doesn't know its own id".into(),
+            )
+        })
+    }
+
+    /// Handles a delivery from relay `peer` into the owner's `repo` here.
+    async fn deliver(
+        &self,
+        peer: EndpointId,
+        repo: &str,
+        delegation: Delegation,
+        item: Delivery,
+        recv: &mut RecvStream,
+    ) -> Result<Reply, Failure> {
+        let me = self.identity()?;
+        delegation
+            .check(&peer, &me, repo, unix_now())
+            .map_err(|e| (ErrorCode::Denied, e))?;
+        let owner = delegation.owner;
+        let Some((grant, limiter)) = self.access(&owner) else {
+            return Err((
+                ErrorCode::Denied,
+                format!("{owner} is not allowed to store data here"),
+            ));
+        };
+        if !valid_repo_name(repo) {
+            return Err((
+                ErrorCode::BadRequest,
+                format!("invalid repository name {repo:?}"),
+            ));
+        }
+        let repo_dir = self.peer_dir(&owner).join(repo);
+        let backend = Arc::new(blocking(move || LocalDirBackend::create(repo_dir)).await?);
+        match item {
+            Delivery::Have { packs } => {
+                if packs.len() > MAX_HAVE {
+                    return Err((ErrorCode::BadRequest, "asked about too many packs".into()));
+                }
+                let b = backend.clone();
+                let found =
+                    blocking(move || Ok(packs.iter().map(|p| b.has_pack(p)).collect())).await?;
+                Ok((Response::Present(found), None))
+            }
+            Delivery::Pack { id, len } => {
+                self.put_object(
+                    &owner,
+                    &grant,
+                    limiter.as_deref(),
+                    &backend,
+                    Object::Pack(id),
+                    len,
+                    recv,
+                )
+                .await
+            }
+            Delivery::Snapshot { id, len } => {
+                self.put_object(
+                    &owner,
+                    &grant,
+                    limiter.as_deref(),
+                    &backend,
+                    Object::Snapshot(id),
+                    len,
+                    recv,
+                )
+                .await
             }
         }
     }
@@ -736,6 +939,20 @@ fn dir_size(dir: &Path) -> io::Result<u64> {
     Ok(total)
 }
 
+async fn blocking_io<T: Send + 'static>(
+    f: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(io::Error::other)?
+}
+
+#[derive(Clone, Copy)]
+enum Object {
+    Pack(PackId),
+    Snapshot(SnapshotId),
+}
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -837,6 +1054,128 @@ mod tests {
 
     fn is_error(resp: &Response, want: ErrorCode) -> bool {
         matches!(resp, Response::Error { code, .. } if *code == want)
+    }
+
+    #[tokio::test]
+    async fn relays_deliver_only_with_the_owners_permission() {
+        use crate::protocol::Delegation;
+
+        let s = setup(Grant::default()).await;
+        let host_id = s.host.endpoint().id();
+        s.receiver.set_identity(host_id);
+        let owner = s.ep.secret_key().clone();
+        // The relay isn't a peer of this host.
+        let relay = local_endpoint().await;
+        let later = unix_now() + 3600;
+        let deliver = |d: &Delegation, repo: &str, item: Delivery, payload: &[u8]| {
+            let mut bytes = encode(&Request {
+                repo: repo.into(),
+                op: Op::Deliver {
+                    delegation: d.clone(),
+                    item,
+                },
+            });
+            bytes.extend_from_slice(payload);
+            bytes
+        };
+        let data = b"an encrypted pack".to_vec();
+        let id = PackId(*blake3::hash(&data).as_bytes());
+        let put = Delivery::Pack {
+            id,
+            len: data.len() as u64,
+        };
+        let have = Delivery::Have { packs: vec![id] };
+
+        let ok = Delegation::sign(&owner, relay.id(), host_id, "photos", later);
+        let resp = raw_call(&relay, s.addr(), &deliver(&ok, "photos", have.clone(), &[]))
+            .await
+            .unwrap();
+        assert!(
+            matches!(&resp, Response::Present(p) if p == &[false]),
+            "{resp:?}"
+        );
+        let resp = raw_call(
+            &relay,
+            s.addr(),
+            &deliver(&ok, "photos", put.clone(), &data),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(resp, Response::Ok), "{resp:?}");
+        // Stored as the owner's, where the owner's own requests see it.
+        assert!(s.peer_dir().join("photos/packs").exists());
+        let listed = blocking_call(&s.remote("photos"), |r| r.list_packs())
+            .await
+            .unwrap();
+        assert_eq!(listed, vec![id]);
+        let resp = raw_call(&relay, s.addr(), &deliver(&ok, "photos", have, &[]))
+            .await
+            .unwrap();
+        assert!(
+            matches!(&resp, Response::Present(p) if p == &[true]),
+            "{resp:?}"
+        );
+
+        // It can't do anything else there.
+        let resp = raw_call(
+            &relay,
+            s.addr(),
+            &encode(&Request {
+                repo: "photos".into(),
+                op: Op::ListPacks,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(is_error(&resp, ErrorCode::Denied), "{resp:?}");
+
+        // Nor deliver with a permission for someone or something else.
+        let other = local_endpoint().await.id();
+        let mut tampered = ok.clone();
+        tampered.repo = "other".into();
+        let refused = [
+            (
+                Delegation::sign(&owner, other, host_id, "photos", later),
+                "photos",
+            ),
+            (
+                Delegation::sign(&owner, relay.id(), other, "photos", later),
+                "photos",
+            ),
+            (
+                Delegation::sign(&owner, relay.id(), host_id, "photos", unix_now() - 1),
+                "photos",
+            ),
+            (ok.clone(), "other"),
+            (tampered, "other"),
+            // Signed by someone who isn't the owner it names.
+            (
+                Delegation {
+                    signature: Delegation::sign(
+                        relay.secret_key(),
+                        relay.id(),
+                        host_id,
+                        "photos",
+                        later,
+                    )
+                    .signature,
+                    ..ok.clone()
+                },
+                "photos",
+            ),
+        ];
+        for (d, repo) in refused {
+            let resp = raw_call(&relay, s.addr(), &deliver(&d, repo, put.clone(), &data))
+                .await
+                .unwrap();
+            assert!(is_error(&resp, ErrorCode::Denied), "{d:?} {repo}: {resp:?}");
+        }
+        // And not once the owner may no longer store data here.
+        s.receiver.revoke(&s.ep.id());
+        let resp = raw_call(&relay, s.addr(), &deliver(&ok, "photos", put, &data))
+            .await
+            .unwrap();
+        assert!(is_error(&resp, ErrorCode::Denied), "{resp:?}");
     }
 
     #[tokio::test]

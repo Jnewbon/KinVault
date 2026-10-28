@@ -110,6 +110,11 @@ impl Daemon {
             .unwrap_or_else(|| state_dir.join("hosted"));
         fs::create_dir_all(&hosting_store)?;
         let receiver = Receiver::new(&hosting_store);
+        receiver.set_identity(endpoint.id());
+        // Peers storing backups here may have them forwarded to other hosts.
+        receiver.enable_forwarding(kinvault_net::ForwardQueue::new(
+            state_dir.join("forwarding"),
+        ));
         for peer in &config.peers {
             let Some(grant) = peer.grant else { continue };
             match EndpointId::from_str(&peer.id) {
@@ -221,6 +226,12 @@ impl Daemon {
             }
         });
         daemon.inner.background.lock().unwrap().push(reachability);
+
+        // Forward peers' backups to other hosts, as they asked.
+        let receiver = daemon.inner.receiver.clone();
+        let endpoint = daemon.inner.endpoint.clone();
+        let forwarding = tokio::spawn(async move { receiver.run_forwarding(endpoint).await });
+        daemon.inner.background.lock().unwrap().push(forwarding);
 
         // Stopped sets used to keep their key in removed-sets/<id>.
         for stopped in &config.stopped_sets {
@@ -412,6 +423,7 @@ impl Daemon {
                 retention,
                 upload_limit,
                 window,
+                relay,
             } => {
                 let id = hex::encode(kinvault_core::crypto::random_bytes::<4>()?);
                 let config = self.inner.config.lock().await.clone();
@@ -422,6 +434,7 @@ impl Daemon {
                     retention: retention.unwrap_or_else(api::RetentionPolicy::recommended),
                     upload_limit,
                     window,
+                    relay,
                 };
                 self.update_set(&set, |s| {
                     ensure!(
@@ -429,6 +442,7 @@ impl Daemon {
                         "{} already keeps its backups there",
                         s.name
                     );
+                    check_relay(s, &new)?;
                     s.extra_targets.push(new);
                     Ok(())
                 })
@@ -441,6 +455,7 @@ impl Daemon {
                 retention,
                 upload_limit,
                 window,
+                relay,
             } => {
                 let config = self.inner.config.lock().await.clone();
                 self.update_set(&set, |s| {
@@ -453,7 +468,11 @@ impl Daemon {
                     t.retention = retention;
                     t.upload_limit = upload_limit;
                     t.window = window;
-                    Ok(())
+                    if let Some(relay) = relay {
+                        t.relay = relay;
+                    }
+                    let t = t.clone();
+                    check_relay(s, &t)
                 })
                 .await
             }
@@ -908,6 +927,8 @@ impl Daemon {
                                 last_error: e.last_error,
                                 last_prune: e.last_prune,
                                 last_verify: e.last_verify,
+                                relay: t.relay,
+                                forwarding: e.forwarding,
                             }
                         })
                         .collect(),
@@ -1110,6 +1131,14 @@ impl Daemon {
         .await?;
         // The restarted task no longer opens its index.
         let _ = fs::remove_file(self.set_dir(&env.set.id).join(index_file(Some(&id))));
+        // Stop the relay sending more (its permission runs out anyway).
+        if removed.relay
+            && let Ok(relay) = env.main_remote()
+            && let Err(e) =
+                tokio::time::timeout(Duration::from_secs(10), relay.forward_cancel(&id)).await
+        {
+            tracing::debug!(set = env.set.name, "couldn't cancel forwarding: {e}");
+        }
         let now = unix_now();
         let pending = PendingDeletion {
             set_id: env.set.id.clone(),
@@ -1376,6 +1405,23 @@ fn place_id(config: &Config, set: &SetConfig, key: &str) -> Result<String> {
             set.name
         ),
     }
+}
+
+/// Copies can only go through the main place's host when both places are
+/// other instances.
+fn check_relay(set: &SetConfig, t: &crate::config::ExtraTarget) -> Result<()> {
+    if !t.relay {
+        return Ok(());
+    }
+    ensure!(
+        matches!(set.target, StoredTarget::Peer { .. }),
+        "copies can only go through the main place when it's another computer"
+    );
+    ensure!(
+        matches!(t.target, StoredTarget::Peer { .. }),
+        "copies can only be forwarded to another computer, not a folder"
+    );
+    Ok(())
 }
 
 fn same_place(a: &StoredTarget, b: &StoredTarget) -> bool {

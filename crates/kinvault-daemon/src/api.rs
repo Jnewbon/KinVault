@@ -95,6 +95,10 @@ pub enum Request {
         upload_limit: Option<u64>,
         #[serde(default)]
         window: Option<TimeWindow>,
+        /// Send copies through the main place's host, which forwards them
+        /// on its own. Both places must be other instances.
+        #[serde(default)]
+        relay: bool,
     },
     /// Changes an extra place's retention and limits.
     UpdateSetTarget {
@@ -104,6 +108,9 @@ pub enum Request {
         retention: RetentionPolicy,
         upload_limit: Option<u64>,
         window: Option<TimeWindow>,
+        /// Whether copies go through the main place's host; unchanged if `None`.
+        #[serde(default)]
+        relay: Option<bool>,
     },
     /// Stops keeping copies in an extra place. What it holds is erased as
     /// for [`Request::DeleteSet`].
@@ -534,6 +541,24 @@ pub struct ExtraTargetStatus {
     pub last_error: Option<String>,
     pub last_prune: Option<PruneSummary>,
     pub last_verify: Option<VerifySummary>,
+    /// Copies go through the main place's host.
+    #[serde(default)]
+    pub relay: bool,
+    /// Copies the main place's host is still forwarding.
+    #[serde(default)]
+    pub forwarding: Option<ForwardProgress>,
+}
+
+/// Copies waiting to be forwarded to an extra place.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ForwardProgress {
+    /// Orders not finished yet.
+    pub orders: u64,
+    pub packs_sent: u64,
+    pub packs_total: u64,
+    pub bytes_sent: u64,
+    /// Why they're held up, e.g. the place can't be reached from the relay.
+    pub note: Option<String>,
 }
 
 /// Versions copied to an extra place in one go.

@@ -46,8 +46,8 @@ a LaunchAgent on macOS, and a `Run` registry entry on Windows.
 | `kinvault set resume <set> [paths…]` | Start them again, optionally from different paths |
 | `kinvault set remove <set>` | Stop backing up; it stays restorable for the grace period, then it's erased |
 | `kinvault set delete <set> [--yes]` | Delete a running or stopped backup for good (see [[Deleting Backups]]) |
-| `kinvault set place add <set> (--peer <peer> \| --local <dir>) [--keep-…] [--upload-limit] [--window]` | Also keep copies in another place, with its own keep rules (see [Backups](Backups#keeping-copies-in-more-places)) |
-| `kinvault set place change <set> <place> [--keep-…] [--upload-limit] [--window]` | Change a place's keep rules (kept if none are given), speed limit and hours |
+| `kinvault set place add <set> (--peer <peer> \| --local <dir>) [--keep-…] [--upload-limit] [--window] [--relay]` | Also keep copies in another place, with its own keep rules (see [Backups](Backups#keeping-copies-in-more-places)); `--relay` sends them through the main place's host |
+| `kinvault set place change <set> <place> [--keep-…] [--upload-limit] [--window] [--relay \| --direct]` | Change a place's keep rules (kept if none are given), speed limit and hours, and whether copies go through the main place's host |
 | `kinvault set place remove <set> <place>` | Stop keeping copies there; what it holds is erased a week later |
 | `kinvault backup <set>` | Back up now, even outside its hours, and wait |
 | `kinvault usage <set>` | Space used where it's stored |

@@ -8,6 +8,7 @@ use super::Repository;
 use crate::backend::Backend;
 use crate::error::{Error, Result};
 use crate::ids::{PackId, SnapshotId};
+use crate::index::Index;
 use crate::pack;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -39,30 +40,7 @@ impl<B: Backend> Repository<B> {
             return Ok(stats);
         }
         dest.sync_index()?;
-
-        // Everything the snapshots need, then the packs holding what `dest` lacks.
-        let mut roots = Vec::with_capacity(snapshots.len());
-        for id in snapshots {
-            roots.push(self.load_snapshot(id)?.root);
-        }
-        let mut cache = VecDeque::new();
-        let mut quiet: &mut dyn FnMut(&super::MaintenanceProgress) = &mut |_| {};
-        let needed = self.reachable(&roots, &mut cache, &mut quiet)?;
-        drop(cache);
-        let mut packs: Vec<PackId> = Vec::new();
-        let mut seen = HashSet::new();
-        for chunk in &needed {
-            if dest.index.has_chunk(chunk)? {
-                continue;
-            }
-            let location = self
-                .index
-                .locate(chunk)?
-                .ok_or_else(|| Error::Corrupt(format!("chunk {chunk} isn't in any pack")))?;
-            if seen.insert(location.pack) {
-                packs.push(location.pack);
-            }
-        }
+        let packs = self.missing_packs(snapshots, &dest.index)?;
         let sizes = self.index.pack_sizes()?;
         let total: u64 = packs.iter().filter_map(|p| sizes.get(p)).sum();
         progress(0, total);
@@ -88,6 +66,48 @@ impl<B: Backend> Repository<B> {
             stats.snapshots += 1;
         }
         Ok(stats)
+    }
+
+    /// The packs holding what `snapshots` need that `has` (an index of what
+    /// another place holds) doesn't list.
+    fn missing_packs(&self, snapshots: &[SnapshotId], has: &Index) -> Result<Vec<PackId>> {
+        let mut roots = Vec::with_capacity(snapshots.len());
+        for id in snapshots {
+            roots.push(self.load_snapshot(id)?.root);
+        }
+        let mut cache = VecDeque::new();
+        let mut quiet: &mut dyn FnMut(&super::MaintenanceProgress) = &mut |_| {};
+        let needed = self.reachable(&roots, &mut cache, &mut quiet)?;
+        let mut packs: Vec<PackId> = Vec::new();
+        let mut seen = HashSet::new();
+        for chunk in &needed {
+            if has.has_chunk(chunk)? {
+                continue;
+            }
+            let location = self
+                .index
+                .locate(chunk)?
+                .ok_or_else(|| Error::Corrupt(format!("chunk {chunk} isn't in any pack")))?;
+            if seen.insert(location.pack) {
+                packs.push(location.pack);
+            }
+        }
+        Ok(packs)
+    }
+
+    /// Plans copying `snapshots` to a place this repository can't write to
+    /// itself (another host forwards them): returns the packs it needs
+    /// besides those `sent` (an index of what was sent there before) lists,
+    /// and adds them to `sent`.
+    pub fn plan_copy(&self, sent: &mut Index, snapshots: &[SnapshotId]) -> Result<Vec<PackId>> {
+        let packs = self.missing_packs(snapshots, sent)?;
+        let contents = self.index.pack_contents()?;
+        for pack in &packs {
+            if let Some(entries) = contents.get(pack) {
+                sent.add_pack(pack, entries)?;
+            }
+        }
+        Ok(packs)
     }
 
     /// The snapshots this repository holds, as `(id, time in ns)` pairs.

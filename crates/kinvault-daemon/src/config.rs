@@ -170,6 +170,10 @@ pub struct ExtraTarget {
     /// Only copy automatically inside this daily window (local time).
     #[serde(default)]
     pub window: Option<api::TimeWindow>,
+    /// Copies go through the main place's host, which forwards them on its
+    /// own (even while this computer is off), instead of from here.
+    #[serde(default)]
+    pub relay: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

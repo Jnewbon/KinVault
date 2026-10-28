@@ -728,10 +728,16 @@ function placesList(set) {
       const limits = [`keeps ${describePolicy(p.retention)}`];
       if (p.upload_limit) limits.push(`max ${bytes(p.upload_limit)}/s`);
       if (p.window) limits.push(`copies automatically ${p.window}`);
+      const relay = set.target.kind === "peer" ? peerName(set.target.id) : "the main place";
+      const f = p.forwarding;
       return el("div", { class: "place" },
         el("div", { class: "place-main" },
-          el("div", { class: "row" }, el("strong", {}, describeTarget(p.target)), presence(p.online, null)),
+          el("div", { class: "row" }, el("strong", {}, describeTarget(p.target)), presence(p.online, null),
+            p.relay ? el("span", { class: "muted small" }, `via ${relay}`) : null),
           el("div", { class: "muted small" }, `${copy} · ${limits.join(" · ")}`),
+          f ? el("div", { class: "small" },
+            `${relay} is sending ${plural(f.packs_total, "pack")}: ${f.packs_sent} sent (${bytes(f.bytes_sent)})`,
+            f.note ? el("span", { class: "muted" }, ` · ${f.note}`) : null) : null,
           p.last_error ? el("div", { class: "notice bad" }, p.last_error) : null),
         el("div", { class: "row" },
           el("button", { class: "btn small", onclick: () => placeDialog(set, p) }, "Change…"),
@@ -788,6 +794,8 @@ async function placeDialog(set, place) {
   const preset = PLACE_PRESETS.find(([, , p]) => samePolicy(p, r))?.[0] || "custom";
   const [ws, we] = (place?.window || "-").split("-");
   const custom = preset === "custom";
+  // Copies can go through the main place's host only when both are other computers.
+  const relayHost = set.target.kind === "peer" ? peerName(set.target.id) : null;
   const v = await form({
     title: place ? `Copies of ${set.name} in ${describeTarget(place.target)}` : `Also keep copies of ${set.name}`,
     intro: place ? null : "After each backup, this place gets the versions it keeps, encrypted the same way. "
@@ -814,6 +822,12 @@ async function placeDialog(set, place) {
         { name: "from", label: "Copy automatically from", type: "time", value: ws || "", hint: "Leave empty for any time" },
         { name: "to", label: "until", type: "time", value: we || "" },
       ] },
+      ...(relayHost && place?.target.kind !== "local" ? [{
+        name: "relay", type: "checkbox", value: place ? place.relay : true,
+        label: `Send copies through ${relayHost}`,
+        hint: `${relayHost} forwards them on its own, even while this computer is off, and your upload is only used once. `
+          + "It can't read them, and can only add to this place: it can't see or delete what's there. (Not for folders.)",
+      }] : []),
     ],
     ok: place ? "Save" : "Add",
     validate: (v) => {
@@ -827,12 +841,13 @@ async function placeDialog(set, place) {
         ? { last: num(v.pLast), hourly: r.hourly ?? null, daily: num(v.pDaily), weekly: num(v.pWeekly), monthly: num(v.pMonthly), yearly: r.yearly ?? null }
         : PLACE_PRESETS.find(([k]) => k === v.keep)[2];
       const limits = { upload_limit: toBytes(v.rate, MiB), window: windowFrom(v.from, v.to) };
+      const relay = !!v.relay;
       if (place) {
-        await call("update_set_target", { set: set.id, target: place.id, retention, ...limits });
+        await call("update_set_target", { set: set.id, target: place.id, retention, ...limits, relay });
       } else {
         const target = v.dest === "local" ? { kind: "local", path: v.localPath[0] }
           : { kind: "peer", id: v.dest === "id" ? v.peerId.toLowerCase() : v.dest.slice(5), addrs: [] };
-        await call("add_set_target", { set: set.id, target, retention, ...limits });
+        await call("add_set_target", { set: set.id, target, retention, ...limits, relay: relay && v.dest !== "local" });
       }
     },
   });

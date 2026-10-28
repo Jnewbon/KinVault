@@ -175,6 +175,31 @@ Removing a place (**Remove…**, or `kinvault set place remove`) erases what
 it holds a week later, like deleting a backup. The backup's other places
 aren't affected.
 
+### Sending copies through the main place
+
+When the main place is another computer (say your home server) and so is
+the extra place (say a friend's), the copies can go through the home server
+instead of from your computer: tick **Send copies through …** (or add
+`--relay` to `set place add`). Then:
+
+- After each backup, your computer tells the home server which versions to
+  send and which packs they need. The home server sends them on its own, in
+  the place's hours and at its speed limit, even while your computer is off,
+  and retries while the other place is offline. Your own upload is only
+  used once, for the home server.
+- The other place stores them as your backup, counted against what it lets
+  *you* store. It doesn't need to know the home server.
+- The home server can't read anything it forwards, and you give it
+  permission only to *add* to that place, for 60 days at a time (renewed
+  with each new order): it can't list, read or delete what's there.
+- Your computer learns what was delivered the next time it backs up.
+  The place's line on the backup shows what's still on its way, and why
+  it's waiting if it is.
+- Cleaning up and checking that place still need your computer to reach it,
+  so they happen when it can.
+
+Both the home server and the other place need this version of KinVault.
+
 ## Upload speed and hours
 
 To stop a backup using all your bandwidth, or to only back up overnight:

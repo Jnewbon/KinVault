@@ -93,6 +93,12 @@ confirming.
   you stop are also only erased after a grace period. A whole backup set
   deleted with **Delete permanently** is erased after a week.
 
+- **A host that forwards your copies goes bad.** It can only do what your
+  signed permission allows: add data to that one backup on that one other
+  computer, until the permission runs out (60 days, renewed with each new
+  order). It can't read, list or delete anything there. At worst it adds
+  junk, which uses your storage there and is ignored when you restore.
+
 ## What you need to protect
 
 **Your state folder.** It holds each backup's key (readable only by your user

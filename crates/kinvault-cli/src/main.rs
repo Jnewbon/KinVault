@@ -238,6 +238,10 @@ enum PlaceCommand {
         /// Upload limit and time window for copying there.
         #[command(flatten)]
         limits: SetLimits,
+        /// Send copies through the main place's host, which forwards them
+        /// on its own, even while this computer is off. Both must be peers.
+        #[arg(long, requires = "peer")]
+        relay: bool,
     },
     /// Change an extra place's retention (kept if no --keep-* option is
     /// given), upload limit and time window (omitted ones are cleared).
@@ -249,6 +253,12 @@ enum PlaceCommand {
         retention: RetentionArgs,
         #[command(flatten)]
         limits: SetLimits,
+        /// Send copies through the main place's host from now on.
+        #[arg(long, conflicts_with = "direct")]
+        relay: bool,
+        /// Send copies from this computer from now on.
+        #[arg(long)]
+        direct: bool,
     },
     /// Stop copying to a place. What it holds is erased a week later.
     Remove { set: String, place: String },
@@ -780,6 +790,18 @@ async fn main() -> Result<()> {
                         ),
                         None => println!("    nothing copied yet"),
                     }
+                    if t.relay {
+                        println!("    copies go through the main place's host");
+                    }
+                    if let Some(f) = t.forwarding {
+                        println!(
+                            "    being forwarded: {} of {} pack(s) sent ({}){}",
+                            f.packs_sent,
+                            f.packs_total,
+                            format_bytes(f.bytes_sent),
+                            f.note.map(|n| format!("; {n}")).unwrap_or_default()
+                        );
+                    }
                     if let Some(e) = t.last_error {
                         println!("    last error: {e}");
                     }
@@ -915,6 +937,7 @@ async fn main() -> Result<()> {
             peer_addr,
             retention,
             limits,
+            relay,
         })) => {
             let target = match (local, peer) {
                 (Some(path), _) => Target::Local { path },
@@ -930,6 +953,7 @@ async fn main() -> Result<()> {
                 retention: retention.policy(),
                 upload_limit: limits.upload_limit,
                 window: limits.window,
+                relay,
             };
             let Reply::TargetAdded { id } = client.call(&req).await? else {
                 bail!("unexpected reply")
@@ -941,6 +965,8 @@ async fn main() -> Result<()> {
             place,
             retention,
             limits,
+            relay,
+            direct,
         })) => {
             let retention = match retention.policy() {
                 Some(p) => p,
@@ -964,6 +990,7 @@ async fn main() -> Result<()> {
                 retention,
                 upload_limit: limits.upload_limit,
                 window: limits.window,
+                relay: (relay || direct).then_some(relay),
             };
             client.call(&req).await?;
             println!("Saved. It keeps {retention}.");

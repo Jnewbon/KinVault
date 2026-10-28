@@ -2025,6 +2025,7 @@ async fn extra_places_get_copies_of_the_versions_they_keep() {
             retention: Some(daily),
             upload_limit: None,
             window: None,
+            relay: false,
         },
     )
     .await
@@ -2041,6 +2042,7 @@ async fn extra_places_get_copies_of_the_versions_they_keep() {
             retention: None,
             upload_limit: None,
             window: None,
+            relay: false,
         })
         .await
         .is_err()
@@ -2082,6 +2084,7 @@ async fn extra_places_get_copies_of_the_versions_they_keep() {
             },
             upload_limit: None,
             window: None,
+            relay: None,
         },
     )
     .await;
@@ -2161,6 +2164,7 @@ async fn extra_places_get_copies_of_the_versions_they_keep() {
             retention: None,
             upload_limit: None,
             window: None,
+            relay: false,
         },
     )
     .await;
@@ -2172,4 +2176,204 @@ async fn extra_places_get_copies_of_the_versions_they_keep() {
     assert_eq!(places.len(), 3, "{places:?}");
     assert!(places.contains(&serde_json::Value::Null));
     d.shutdown().await;
+}
+
+/// `host` invites `guest` to store backups there; returns `host`'s id.
+async fn join(host: &Daemon, guest: &Daemon, name: &str) -> String {
+    let Reply::Invite { ticket, .. } = call(
+        host,
+        Request::CreateInvite(CreateInvite {
+            name: Some("guest".into()),
+            ..Default::default()
+        }),
+    )
+    .await
+    else {
+        panic!()
+    };
+    call(
+        guest,
+        Request::RedeemInvite {
+            ticket,
+            name: Some(name.into()),
+            offer: None,
+            mine: false,
+        },
+    )
+    .await;
+    host.id().to_string()
+}
+
+fn files_in(dir: &Path) -> usize {
+    fs::read_dir(dir).map_or(0, |d| d.count())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_main_host_forwards_copies_on_its_own() {
+    use kinvault_daemon::api::RetentionPolicy;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let server = start(&tmp.path().join("server"), SecretKey::generate()).await;
+    let remote = start(&tmp.path().join("remote"), SecretKey::generate()).await;
+    let pc_state = tmp.path().join("pc");
+    let pc_secret = SecretKey::generate();
+    let pc = start(&pc_state, pc_secret.clone()).await;
+    let server_id = join(&server, &pc, "server").await;
+    let remote_id = join(&remote, &pc, "remote").await;
+
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.txt"), b"keep me safe").unwrap();
+    call(
+        &pc,
+        create_set(
+            "docs",
+            &src,
+            Target::Peer {
+                id: server_id.clone(),
+                addrs: Vec::new(),
+            },
+        ),
+    )
+    .await;
+    wait_for_backup(&pc, None).await;
+
+    let add = |target: Target| Request::AddSetTarget {
+        set: "docs".into(),
+        target,
+        retention: Some(RetentionPolicy {
+            daily: Some(7),
+            ..Default::default()
+        }),
+        upload_limit: None,
+        window: None,
+        relay: true,
+    };
+    // Only another computer can be forwarded to.
+    assert!(
+        pc.handle(add(Target::Local {
+            path: tmp.path().join("usb")
+        }))
+        .await
+        .is_err()
+    );
+    let Reply::TargetAdded { id } = call(
+        &pc,
+        add(Target::Peer {
+            id: remote_id.clone(),
+            addrs: Vec::new(),
+        }),
+    )
+    .await
+    else {
+        panic!()
+    };
+
+    // The next backup asks the server to forward; then the PC goes away.
+    call(&pc, Request::BackupNow { set: "docs".into() }).await;
+    wait_for_set(&pc, |s| {
+        s.state == SetState::Idle
+            && s.extra_targets[0].forwarding.is_some()
+            && s.extra_targets[0].last_error.is_none()
+    })
+    .await;
+    pc.shutdown().await;
+
+    // The server delivers to the remote by itself, into the PC's own space there.
+    let config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(pc_state.join("config.json")).unwrap()).unwrap();
+    let repo = config["sets"][0]["extra_targets"][0]["target"]["repo"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let stored = tmp
+        .path()
+        .join("remote/hosted")
+        .join(pc_secret.public().to_string())
+        .join(&repo);
+    for _ in 0..200 {
+        if files_in(&stored.join("snapshots")) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(files_in(&stored.join("snapshots")), 1, "nothing forwarded");
+    assert!(files_in(&stored.join("packs")) > 0);
+    // The remote never had to know the server.
+    assert!(peers(&remote).await.iter().all(|p| p.id != server_id));
+
+    // Back on, the PC learns it was delivered, and can restore from there.
+    let pc = start(&pc_state, pc_secret).await;
+    call(&pc, Request::BackupNow { set: "docs".into() }).await;
+    let s = wait_for_set(&pc, |s| {
+        s.state == SetState::Idle && s.extra_targets[0].last_copy.is_some()
+    })
+    .await;
+    let t = &s.extra_targets[0];
+    assert!(t.relay);
+    assert_eq!(t.last_copy.as_ref().unwrap().snapshots, 1);
+    assert!(t.forwarding.is_none(), "{:?}", t.forwarding);
+    assert!(t.last_error.is_none(), "{:?}", t.last_error);
+    let out = tmp.path().join("out");
+    call(
+        &pc,
+        Request::Restore {
+            set: "docs".into(),
+            snapshot: "latest".into(),
+            target: out.clone(),
+            include: None,
+            from: Some(id),
+        },
+    )
+    .await;
+    let restored = out.join(kinvault_core::snapshot_root_name(
+        &fs::canonicalize(&src).unwrap(),
+    ));
+    assert_eq!(fs::read(restored.join("a.txt")).unwrap(), b"keep me safe");
+
+    // If the remote stops taking the PC's backups, the PC hears about it.
+    call(
+        &remote,
+        Request::PeerRevoke {
+            id: pc.id().to_string(),
+        },
+    )
+    .await;
+    // A new day for the copy's rules: keep every version from now on.
+    call(
+        &pc,
+        Request::UpdateSetTarget {
+            set: "docs".into(),
+            target: "remote".into(),
+            retention: RetentionPolicy {
+                last: Some(3),
+                ..Default::default()
+            },
+            upload_limit: None,
+            window: None,
+            relay: None,
+        },
+    )
+    .await;
+    fs::write(src.join("a.txt"), b"changed").unwrap();
+    call(&pc, Request::BackupNow { set: "docs".into() }).await;
+    wait_for_set(&pc, |s| {
+        s.state == SetState::Idle && s.extra_targets[0].forwarding.is_some()
+    })
+    .await;
+    let mut error = None;
+    for _ in 0..100 {
+        call(&pc, Request::BackupNow { set: "docs".into() }).await;
+        let s = wait_for_set(&pc, |s| s.state == SetState::Idle).await;
+        error = s.extra_targets[0].last_error.clone();
+        if error.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let error = error.expect("the failure is reported");
+    assert!(error.contains("couldn't deliver"), "{error}");
+    pc.shutdown().await;
+    server.shutdown().await;
+    remote.shutdown().await;
 }

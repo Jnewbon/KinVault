@@ -175,12 +175,21 @@ impl<B: Backend> Repository<B> {
         for new in remote.difference(&local) {
             tracing::debug!(pack = %short(new), "reading the contents list of a pack");
             let (len, mut tail) = self.backend.get_pack_tail(new, pack::HEADER_TAIL_GUESS)?;
-            let needed = pack::header_tail_len(&tail)?;
-            if needed > tail.len() as u64 {
-                (_, tail) = self.backend.get_pack_tail(new, needed)?;
+            let entries = pack::header_tail_len(&tail).and_then(|needed| {
+                if needed > tail.len() as u64 {
+                    (_, tail) = self.backend.get_pack_tail(new, needed)?;
+                }
+                pack::read_header_tail(&self.keys, len, &tail)
+            });
+            match entries {
+                Ok(entries) => self.index.add_pack(new, &entries)?,
+                // Not one of ours (e.g. left by a misbehaving relay): ignore
+                // it rather than stop working with the whole repository.
+                Err(e @ (Error::Decrypt | Error::Corrupt(_))) => {
+                    tracing::warn!(pack = %short(new), "ignoring a pack that isn't ours: {e}");
+                }
+                Err(e) => return Err(e),
             }
-            let entries = pack::read_header_tail(&self.keys, len, &tail)?;
-            self.index.add_pack(new, &entries)?;
         }
         Ok(())
     }
