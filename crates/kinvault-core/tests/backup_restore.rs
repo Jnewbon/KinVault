@@ -452,7 +452,11 @@ fn a_large_file_reports_progress_while_it_is_read() {
     repo.backup(std::slice::from_ref(&src), "h").unwrap();
 
     let seen = seen.lock().unwrap();
-    let big = src.join("big").to_string_lossy().into_owned();
+    // Backups report resolved paths (macOS's temp dir sits behind a symlink).
+    let big = fs::canonicalize(src.join("big"))
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     let reading: Vec<_> = seen
         .iter()
         .filter(|p| p.step == BackupStep::Reading)
