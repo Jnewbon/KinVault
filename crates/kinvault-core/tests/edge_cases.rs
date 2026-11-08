@@ -72,9 +72,11 @@ fn progress_is_reported_while_backing_up() {
 
     // Otherwise one report per file, then the final totals once the scan is done.
     assert_eq!(seen.len(), 6);
+    // Backups report resolved paths (temp dirs can sit behind symlinks or
+    // short names).
     assert_eq!(
         seen[0].file.as_deref(),
-        Some(&*src.join("a").to_string_lossy())
+        Some(&*fs::canonicalize(src.join("a")).unwrap().to_string_lossy())
     );
     assert_eq!((seen[1].files, seen[1].bytes_read), (2, 7));
     assert!(seen[2].scanned && !seen[1].scanned);
