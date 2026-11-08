@@ -715,6 +715,31 @@ impl Receiver {
                 )
                 .await
             }
+            Delivery::Delete(d) => {
+                if d.owner != owner {
+                    return Err((ErrorCode::Denied, "the deletion isn't the owner's".into()));
+                }
+                d.check(&me, repo, unix_now())
+                    .map_err(|e| (ErrorCode::Denied, e))?;
+                let b = backend.clone();
+                blocking(move || {
+                    // Already gone is fine: the deletion may be passed on twice.
+                    let gone = |r: kinvault_core::Result<()>| match r {
+                        Err(kinvault_core::Error::NotFound(_)) => Ok(()),
+                        other => other,
+                    };
+                    for id in &d.snapshots {
+                        gone(b.trash_snapshot(id))?;
+                    }
+                    for id in &d.packs {
+                        gone(b.trash_pack(id))?;
+                    }
+                    Ok(())
+                })
+                .await?;
+                self.invalidate_usage(&owner);
+                Ok((Response::Ok, None))
+            }
             Delivery::Snapshot { id, len } => {
                 self.put_object(
                     &owner,
@@ -1170,6 +1195,42 @@ mod tests {
                 .unwrap();
             assert!(is_error(&resp, ErrorCode::Denied), "{d:?} {repo}: {resp:?}");
         }
+        // Deletions pass through only as the owner signed them.
+        use crate::protocol::Deletion;
+        let delete = |d: Deletion| deliver(&ok, "photos", Delivery::Delete(Box::new(d)), &[]);
+        let by_relay = Deletion::sign(
+            relay.secret_key(),
+            host_id,
+            "photos",
+            vec![],
+            vec![id],
+            later,
+        );
+        let elsewhere = Deletion::sign(&owner, host_id, "other", vec![], vec![id], later);
+        for d in [by_relay, elsewhere] {
+            let resp = raw_call(&relay, s.addr(), &delete(d)).await.unwrap();
+            assert!(is_error(&resp, ErrorCode::Denied), "{resp:?}");
+        }
+        assert!(
+            s.peer_dir()
+                .join("photos")
+                .join(format!("packs/{}", &id.to_hex()[..2]))
+                .join(id.to_hex())
+                .exists()
+        );
+        let signed = Deletion::sign(&owner, host_id, "photos", vec![], vec![id], later);
+        for _ in 0..2 {
+            // Twice is fine: it may be passed on again.
+            let resp = raw_call(&relay, s.addr(), &delete(signed.clone()))
+                .await
+                .unwrap();
+            assert!(matches!(resp, Response::Ok), "{resp:?}");
+        }
+        let listed = blocking_call(&s.remote("photos"), |r| r.list_packs())
+            .await
+            .unwrap();
+        assert!(listed.is_empty(), "{listed:?}");
+
         // And not once the owner may no longer store data here.
         s.receiver.revoke(&s.ep.id());
         let resp = raw_call(&relay, s.addr(), &deliver(&ok, "photos", put, &data))

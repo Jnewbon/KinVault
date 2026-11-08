@@ -195,10 +195,25 @@ instead of from your computer: tick **Send copies through …** (or add
 - Your computer learns what was delivered the next time it backs up.
   The place's line on the backup shows what's still on its way, and why
   it's waiting if it is.
-- Cleaning up and checking that place still need your computer to reach it,
-  so they happen when it can.
+- Cleaning up: when your computer can reach that place, it cleans up there
+  itself, as usual. When it can't, it works out which versions the place no
+  longer keeps and which packs only they used, signs a list of exactly
+  those, and the home server passes it on with the next copies. The place
+  checks your signature on the list itself, so the home server still can't
+  delete anything of its own accord. Mostly-unused packs can't be rewritten
+  this way, so this frees a little less space than cleaning up directly.
+- Checking that place's backups still needs your computer to reach it.
 
 Both the home server and the other place need this version of KinVault.
+
+### When the main place is offline
+
+If the backup's main place can't be reached, your computer backs up straight
+to each of its other places that would keep a new version now, by their own
+rules, hours and limits. With a "one a day" place, for example, the first
+backup of the day goes there directly. So a home server that's switched off
+doesn't leave your off-site copy behind. Those versions aren't on the main
+place; it carries on from the next backup once it's back.
 
 ## Upload speed and hours
 

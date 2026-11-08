@@ -382,6 +382,9 @@ impl Receiver {
             to.put_snapshot(&id, &data).await?;
             job.info.bytes_sent += data.len() as u64;
         }
+        for deletion in job.order.deletions.clone() {
+            to.delete(deletion).await?;
+        }
         conn.close(0u32.into(), b"done");
         Ok(())
     }

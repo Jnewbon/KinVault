@@ -728,6 +728,9 @@ function placesList(set) {
       const limits = [`keeps ${describePolicy(p.retention)}`];
       if (p.upload_limit) limits.push(`max ${bytes(p.upload_limit)}/s`);
       if (p.window) limits.push(`copies automatically ${p.window}`);
+      const upkeep = [];
+      if (p.last_prune) upkeep.push(`cleaned up ${ago(p.last_prune.time_unix)}`);
+      if (p.last_verify) upkeep.push(p.last_verify.ok ? `checked ${ago(p.last_verify.time_unix)}: all good` : `check ${ago(p.last_verify.time_unix)} found problems`);
       const relay = set.target.kind === "peer" ? peerName(set.target.id) : "the main place";
       const f = p.forwarding;
       return el("div", { class: "place" },
@@ -735,6 +738,7 @@ function placesList(set) {
           el("div", { class: "row" }, el("strong", {}, describeTarget(p.target)), presence(p.online, null),
             p.relay ? el("span", { class: "muted small" }, `via ${relay}`) : null),
           el("div", { class: "muted small" }, `${copy} · ${limits.join(" · ")}`),
+          upkeep.length ? el("div", { class: "muted small" }, upkeep.join(" · ")) : null,
           f ? el("div", { class: "small" },
             `${relay} is sending ${plural(f.packs_total, "pack")}: ${f.packs_sent} sent (${bytes(f.bytes_sent)})`,
             f.note ? el("span", { class: "muted" }, ` · ${f.note}`) : null) : null,

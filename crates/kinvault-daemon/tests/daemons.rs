@@ -2377,3 +2377,254 @@ async fn the_main_host_forwards_copies_on_its_own() {
     server.shutdown().await;
     remote.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn extra_places_get_backups_straight_away_while_the_main_host_is_off() {
+    use kinvault_daemon::api::RetentionPolicy;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let server = start(&tmp.path().join("server"), SecretKey::generate()).await;
+    let pc = start(&tmp.path().join("pc"), SecretKey::generate()).await;
+    let server_id = join(&server, &pc, "server").await;
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.txt"), b"one").unwrap();
+    call(
+        &pc,
+        create_set(
+            "docs",
+            &src,
+            Target::Peer {
+                id: server_id,
+                addrs: Vec::new(),
+            },
+        ),
+    )
+    .await;
+    wait_for_backup(&pc, None).await;
+    let Reply::TargetAdded { id } = call(
+        &pc,
+        Request::AddSetTarget {
+            set: "docs".into(),
+            target: Target::Local {
+                path: tmp.path().join("usb"),
+            },
+            retention: Some(RetentionPolicy {
+                last: Some(5),
+                ..Default::default()
+            }),
+            upload_limit: None,
+            window: None,
+            relay: false,
+        },
+    )
+    .await
+    else {
+        panic!()
+    };
+    call(&pc, Request::BackupNow { set: "docs".into() }).await;
+    wait_for_set(&pc, |s| {
+        s.state == SetState::Idle && s.extra_targets[0].last_copy.is_some()
+    })
+    .await;
+
+    // The server goes away; a change still reaches the other place.
+    server.shutdown().await;
+    fs::write(src.join("a.txt"), b"two").unwrap();
+    assert!(
+        pc.handle(Request::BackupNow { set: "docs".into() })
+            .await
+            .is_err()
+    );
+    let s = wait_for_set(&pc, |s| {
+        s.state != SetState::Running
+            && s.extra_targets[0]
+                .last_copy
+                .as_ref()
+                .is_some_and(|c| c.bytes > 0)
+    })
+    .await;
+    assert!(
+        s.extra_targets[0].last_error.is_none(),
+        "{:?}",
+        s.extra_targets[0].last_error
+    );
+    let list = Request::ListSnapshots {
+        set: "docs".into(),
+        from: Some(id.clone()),
+    };
+    assert_eq!(snapshot_count(call(&pc, list).await), 2);
+    let out = tmp.path().join("out");
+    call(
+        &pc,
+        Request::Restore {
+            set: "docs".into(),
+            snapshot: "latest".into(),
+            target: out.clone(),
+            include: None,
+            from: Some(id),
+        },
+    )
+    .await;
+    let restored = out.join(kinvault_core::snapshot_root_name(
+        &fs::canonicalize(&src).unwrap(),
+    ));
+    assert_eq!(fs::read(restored.join("a.txt")).unwrap(), b"two");
+    pc.shutdown().await;
+}
+
+/// Polls `dir` until it holds `n` entries.
+async fn wait_for_files(dir: &Path, n: usize) {
+    for _ in 0..200 {
+        if files_in(dir) == n {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("{} holds {} entries, not {n}", dir.display(), files_in(dir));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn places_out_of_reach_are_cleaned_up_through_the_relay() {
+    use kinvault_daemon::api::RetentionPolicy;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let server = start(&tmp.path().join("server"), SecretKey::generate()).await;
+    let remote = start(&tmp.path().join("remote"), SecretKey::generate()).await;
+    let pc_state = tmp.path().join("pc");
+    let pc_secret = SecretKey::generate();
+    let pc = start(&pc_state, pc_secret.clone()).await;
+    let server_id = join(&server, &pc, "server").await;
+    let remote_id = join(&remote, &pc, "remote").await;
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.txt"), b"one").unwrap();
+    call(
+        &pc,
+        create_set(
+            "docs",
+            &src,
+            Target::Peer {
+                id: server_id,
+                addrs: Vec::new(),
+            },
+        ),
+    )
+    .await;
+    wait_for_backup(&pc, None).await;
+    // The remote keeps just the latest version.
+    call(
+        &pc,
+        Request::AddSetTarget {
+            set: "docs".into(),
+            target: Target::Peer {
+                id: remote_id,
+                addrs: Vec::new(),
+            },
+            retention: Some(RetentionPolicy {
+                last: Some(1),
+                ..Default::default()
+            }),
+            upload_limit: None,
+            window: None,
+            relay: true,
+        },
+    )
+    .await;
+    let config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(pc_state.join("config.json")).unwrap()).unwrap();
+    let set_id = config["sets"][0]["id"].as_str().unwrap().to_string();
+    let repo = config["sets"][0]["extra_targets"][0]["target"]["repo"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let stored = tmp
+        .path()
+        .join("remote/hosted")
+        .join(pc_secret.public().to_string())
+        .join(&repo);
+
+    // Two versions get there; the PC hears of both.
+    call(&pc, Request::BackupNow { set: "docs".into() }).await;
+    wait_for_files(&stored.join("snapshots"), 1).await;
+    let packs_of_first = files_in_tree(&stored.join("packs"));
+    fs::write(src.join("a.txt"), b"two").unwrap();
+    call(&pc, Request::BackupNow { set: "docs".into() }).await;
+    wait_for_files(&stored.join("snapshots"), 2).await;
+    call(&pc, Request::BackupNow { set: "docs".into() }).await;
+    wait_for_set(&pc, |s| {
+        s.state == SetState::Idle && s.extra_targets[0].forwarding.is_none()
+    })
+    .await;
+    pc.shutdown().await;
+
+    // A day later, with the remote out of the PC's reach.
+    let extras_path = pc_state.join("sets").join(&set_id).join("extras.json");
+    let mut extras: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&extras_path).unwrap()).unwrap();
+    for e in extras.as_object_mut().unwrap().values_mut() {
+        e["since_unix"] = 0.into();
+        e["last_prune"] = serde_json::Value::Null;
+    }
+    fs::write(&extras_path, extras.to_string()).unwrap();
+    let pc = Daemon::start(DaemonOptions {
+        state_dir: pc_state.clone(),
+        endpoint: Some(local_endpoint(pc_secret).await),
+        nearby: Default::default(),
+        // Every check fails at once, so no host looks reachable.
+        reachability: ReachabilityOptions {
+            interval: Duration::from_secs(3600),
+            timeout: Duration::from_nanos(1),
+        },
+    })
+    .await
+    .unwrap();
+    call(&pc, Request::BackupNow { set: "docs".into() }).await;
+
+    // The relay passes on the PC's signed deletions: the old version goes,
+    // with the packs only it used.
+    wait_for_files(&stored.join("snapshots"), 1).await;
+    for _ in 0..100 {
+        if files_in_tree(&stored.join("packs")) < packs_of_first + 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(files_in_tree(&stored.join("packs")) < packs_of_first + 2);
+    let s = set_named(&pc, "docs").await;
+    let prune = s.extra_targets[0].last_prune.clone().expect("cleaned up");
+    assert_eq!(prune.snapshots_removed, 1);
+    assert!(prune.packs_deleted > 0, "{prune:?}");
+
+    // What's left still restores.
+    let out = tmp.path().join("out");
+    call(
+        &pc,
+        Request::Restore {
+            set: "docs".into(),
+            snapshot: "latest".into(),
+            target: out.clone(),
+            include: None,
+            from: Some("remote".into()),
+        },
+    )
+    .await;
+    let restored = out.join(kinvault_core::snapshot_root_name(
+        &fs::canonicalize(&src).unwrap(),
+    ));
+    assert_eq!(fs::read(restored.join("a.txt")).unwrap(), b"two");
+    pc.shutdown().await;
+    server.shutdown().await;
+    remote.shutdown().await;
+}
+
+/// Files anywhere under `dir`.
+fn files_in_tree(dir: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .map(|e| e.unwrap().path())
+        .map(|p| if p.is_dir() { files_in_tree(&p) } else { 1 })
+        .sum()
+}

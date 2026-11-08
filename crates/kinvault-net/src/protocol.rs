@@ -119,6 +119,87 @@ pub enum Delivery {
     Pack { id: PackId, len: u64 },
     /// A snapshot of `len` bytes follows.
     Snapshot { id: SnapshotId, len: u64 },
+    /// Moves objects the owner listed to the trash. The owner signs the
+    /// list itself, so a relay can only pass on deletions it was given.
+    Delete(Box<Deletion>),
+}
+
+/// Objects an owner wants deleted from one of its repositories on one
+/// host, signed by the owner. They go to the trash for the host's grace
+/// period, as when the owner deletes them itself.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Deletion {
+    pub owner: iroh::EndpointId,
+    pub host: iroh::EndpointId,
+    pub repo: String,
+    pub snapshots: Vec<SnapshotId>,
+    pub packs: Vec<PackId>,
+    pub expires_unix: i64,
+    pub signature: Vec<u8>,
+}
+
+impl Deletion {
+    /// Most objects one deletion may list, so it fits in a request.
+    pub const MAX_OBJECTS: usize = 1000;
+
+    pub fn sign(
+        owner: &iroh::SecretKey,
+        host: iroh::EndpointId,
+        repo: &str,
+        snapshots: Vec<SnapshotId>,
+        packs: Vec<PackId>,
+        expires_unix: i64,
+    ) -> Self {
+        let mut d = Self {
+            owner: owner.public(),
+            host,
+            repo: repo.to_string(),
+            snapshots,
+            packs,
+            expires_unix,
+            signature: Vec::new(),
+        };
+        d.signature = owner.sign(&d.signed_bytes()).to_bytes().to_vec();
+        d
+    }
+
+    fn signed_bytes(&self) -> Vec<u8> {
+        let fields = (
+            "kinvault deletion v1",
+            &self.owner,
+            &self.host,
+            &self.repo,
+            &self.snapshots,
+            &self.packs,
+            self.expires_unix,
+        );
+        postcard::to_allocvec(&fields).expect("serialising plain fields")
+    }
+
+    /// Checks the owner signed it for `host`'s `repo`, and it's still valid.
+    pub fn check(&self, host: &iroh::EndpointId, repo: &str, now: i64) -> Result<(), String> {
+        let signature: [u8; 64] = self
+            .signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| "malformed signature".to_string())?;
+        self.owner
+            .verify(
+                &self.signed_bytes(),
+                &iroh::Signature::from_bytes(&signature),
+            )
+            .map_err(|_| "the owner didn't sign this deletion".to_string())?;
+        if self.host != *host || self.repo != repo {
+            return Err("this deletion is for another repository".into());
+        }
+        if self.expires_unix < now {
+            return Err("this deletion has expired".into());
+        }
+        if self.snapshots.len() + self.packs.len() > Self::MAX_OBJECTS {
+            return Err("this deletion lists too many objects".into());
+        }
+        Ok(())
+    }
 }
 
 /// An owner's permission for one relay to deliver new objects into one of
@@ -222,6 +303,8 @@ pub struct ForwardOrder {
     /// Pace and hours for sending.
     pub upload_limit: Option<u64>,
     pub window: Option<crate::TimeWindow>,
+    /// Deletions the owner signed, passed on once everything is delivered.
+    pub deletions: Vec<Deletion>,
 }
 
 /// How a forwarding order is going.

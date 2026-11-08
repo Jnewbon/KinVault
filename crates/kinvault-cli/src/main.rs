@@ -793,6 +793,21 @@ async fn main() -> Result<()> {
                     if t.relay {
                         println!("    copies go through the main place's host");
                     }
+                    if let Some(p) = t.last_prune {
+                        println!(
+                            "    last clean-up {}: removed {} version(s), {} pack(s)",
+                            format_unix(p.time_unix),
+                            p.snapshots_removed,
+                            p.packs_deleted
+                        );
+                    }
+                    if let Some(v) = t.last_verify {
+                        println!(
+                            "    last check {}: {}",
+                            format_unix(v.time_unix),
+                            if v.ok { "ok" } else { "PROBLEMS" }
+                        );
+                    }
                     if let Some(f) = t.forwarding {
                         println!(
                             "    being forwarded: {} of {} pack(s) sent ({}){}",

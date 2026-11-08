@@ -18,7 +18,7 @@ use anyhow::{Context, Result, bail};
 use kinvault_core::{
     Backend, Excludes, Index, LocalDirBackend, MasterKey, PackId, Repository, SnapshotId,
 };
-use kinvault_net::protocol::{Delegation, ForwardOrder, ForwardState};
+use kinvault_net::protocol::{Delegation, Deletion, ForwardOrder, ForwardState};
 use kinvault_net::{Endpoint, EndpointAddr, EndpointId, RemoteBackend};
 use notify::event::{AccessKind, AccessMode};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -90,13 +90,17 @@ pub(crate) struct OrderRecord {
     /// `(id, time in ns)`, oldest first.
     pub snapshots: Vec<(String, i64)>,
     pub packs: Vec<String>,
+    /// Versions and packs it has the place delete, once it's delivered.
+    #[serde(default)]
+    pub deletes: Vec<String>,
+    #[serde(default)]
+    pub dropped_packs: Vec<String>,
 }
 
 /// How long a relay may deliver with a permission given in one order.
 const DELEGATION_SECS: i64 = 60 * 24 * 60 * 60;
-/// Delivered versions remembered for choosing new ones; older ones can't
-/// share an hour, day, week, month or year with new ones anyway.
-const DELIVERED_MEMORY_NS: i64 = 400 * 24 * 60 * 60 * 1_000_000_000;
+/// How often to ask the relay how orders are going while some are open.
+pub(crate) const FORWARD_POLL: Duration = Duration::from_secs(2 * 60);
 
 #[derive(Clone, Debug)]
 pub(crate) struct RunStatus {
@@ -530,6 +534,20 @@ struct ExtrasOutcome {
     pending: bool,
 }
 
+/// A clean-up done by passing deletions through the relay.
+fn relay_prune(kept: usize, removed: usize, packs: usize, bytes: u64) -> PruneSummary {
+    PruneSummary {
+        time_unix: unix_now(),
+        snapshots_kept: kept as u64,
+        snapshots_removed: removed as u64,
+        packs_deleted: packs as u64,
+        packs_repacked: 0,
+        bytes_deleted: bytes,
+        bytes_downloaded: 0,
+        bytes_uploaded: 0,
+    }
+}
+
 fn retry_delay(failures: u32) -> Duration {
     Duration::from_secs(60)
         .saturating_mul(1 << failures.saturating_sub(1).min(10))
@@ -801,45 +819,43 @@ impl Worker {
         outcome
     }
 
-    /// For a place copies are forwarded to: learns which orders the relay
-    /// finished, then orders the versions the place should get next.
-    /// Returns what was delivered since last time, if anything.
-    async fn forward_to(
+    /// For a place copies are forwarded to: learns from the relay which
+    /// orders it finished. Returns what was delivered since last time;
+    /// fails if an order failed (it's planned again next time).
+    async fn update_orders(
         &mut self,
         t: &crate::config::ExtraTarget,
     ) -> Result<Option<api::CopySummary>> {
         let relay = self.env.main_remote()?;
         let infos = relay.forward_status(&t.id).await?;
-        let mut state = self
-            .status
-            .lock()
-            .unwrap()
-            .extras
-            .get(&t.id)
-            .cloned()
-            .unwrap_or_default();
-
+        let mut state = self.extra_state(&t.id);
         let mut delivered: Option<api::CopySummary> = None;
-        let mut failed: Vec<String> = Vec::new();
+        let mut forget: Vec<String> = Vec::new();
         let mut failure: Option<String> = None;
         let mut progress = api::ForwardProgress::default();
         let mut pending = Vec::new();
         for order in std::mem::take(&mut state.orders) {
             match infos.iter().find(|i| i.id == order.id) {
                 Some(i) if i.state == ForwardState::Done => {
-                    let d = delivered.get_or_insert(api::CopySummary {
-                        time_unix: i.updated_unix,
-                        snapshot: String::new(),
-                        snapshots: 0,
-                        bytes: 0,
-                    });
-                    d.time_unix = d.time_unix.max(i.updated_unix);
-                    d.snapshots += order.snapshots.len() as u64;
-                    d.bytes += i.bytes_sent;
-                    if let Some((newest, _)) = order.snapshots.last() {
-                        d.snapshot = newest.clone();
+                    if !order.snapshots.is_empty() {
+                        let d = delivered.get_or_insert(api::CopySummary {
+                            time_unix: i.updated_unix,
+                            snapshot: String::new(),
+                            snapshots: 0,
+                            bytes: 0,
+                        });
+                        d.time_unix = d.time_unix.max(i.updated_unix);
+                        d.snapshots += order.snapshots.len() as u64;
+                        d.bytes += i.bytes_sent;
+                        if let Some((newest, _)) = order.snapshots.last() {
+                            d.snapshot = newest.clone();
+                        }
                     }
                     state.delivered.extend(order.snapshots);
+                    state
+                        .delivered
+                        .retain(|(id, _)| !order.deletes.contains(id));
+                    forget.extend(order.dropped_packs);
                 }
                 Some(i) if i.state == ForwardState::Pending => {
                     progress.orders += 1;
@@ -856,124 +872,336 @@ impl Worker {
                         Some(e) => format!("the relay couldn't deliver: {e}"),
                         None => "the relay lost track of copies it was sending".into(),
                     });
-                    failed.extend(order.packs);
+                    // Not there after all: forget them, so they're sent again.
+                    forget.extend(order.packs);
                 }
             }
         }
         state.orders = pending;
         state.forwarding = (progress.orders > 0).then_some(progress);
-        if let Some(newest) = state.delivered.iter().map(|&(_, t)| t).max() {
-            state
-                .delivered
-                .retain(|&(_, t)| t == newest || newest - t < DELIVERED_MEMORY_NS);
-        }
-        // What failed is forgotten, so it's ordered again next time.
-        let index_path = self.env.set_dir.join(index_file(Some(&t.id)));
-        if !failed.is_empty() {
-            let path = index_path.clone();
+        if !forget.is_empty() {
+            let path = self.env.set_dir.join(index_file(Some(&t.id)));
             tokio::task::spawn_blocking(move || -> Result<()> {
                 let mut sent = Index::open(&path)?;
-                for p in failed {
+                for p in forget {
                     sent.remove_pack(&PackId::from_hex(&p)?)?;
                 }
                 Ok(())
             })
             .await??;
         }
-        if let Some(failure) = failure {
-            self.save_extra(&t.id, |e| *e = state);
-            bail!(failure);
+        self.save_extra(&t.id, |e| *e = state);
+        match failure {
+            Some(failure) => bail!(failure),
+            None => Ok(delivered),
         }
+    }
 
-        // Order what the place should get next.
+    fn extra_state(&self, id: &str) -> ExtraState {
+        self.status
+            .lock()
+            .unwrap()
+            .extras
+            .get(id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// For a place copies are forwarded to: catches up with the relay, then
+    /// orders the versions the place should get next, and, when it's due
+    /// and the place can't be reached from here to clean it up directly,
+    /// deletions of what it no longer keeps.
+    async fn forward_to(
+        &mut self,
+        t: &crate::config::ExtraTarget,
+    ) -> Result<Option<api::CopySummary>> {
+        let delivered = self.update_orders(t).await?;
+        let mut state = self.extra_state(&t.id);
         let held: Vec<(SnapshotId, i64)> = state
             .delivered
             .iter()
             .chain(state.orders.iter().flat_map(|o| &o.snapshots))
             .filter_map(|(id, time)| Some((SnapshotId::from_hex(id).ok()?, *time)))
             .collect();
+        let reachable =
+            host_of(&t.target).is_some_and(|h| self.env.hosts.get(&h.id).online == Some(true));
+        let cleaning = state
+            .orders
+            .iter()
+            .any(|o| !o.deletes.is_empty() || !o.dropped_packs.is_empty());
+        let since = state
+            .last_prune
+            .as_ref()
+            .map_or(0, |p| p.time_unix)
+            .max(state.since_unix);
+        let prune = !reachable && !cleaning && unix_now() - since >= PRUNE_INTERVAL_SECS;
+        let delivered_ids: Vec<SnapshotId> = state
+            .delivered
+            .iter()
+            .filter_map(|(id, _)| SnapshotId::from_hex(id).ok())
+            .collect();
+
         let policy = t.retention;
+        let index_path = self.env.set_dir.join(index_file(Some(&t.id)));
         let path = index_path.clone();
-        let planned = self
+        let plan = self
             .with_repo(move |main| {
                 let source = main.snapshot_times()?;
                 let wanted = policy.to_copy(&source, &held);
-                if wanted.is_empty() {
-                    return Ok(None);
-                }
                 let mut sent = Index::open(&path)?;
-                let packs = main.plan_copy(&mut sent, &wanted)?;
+                let packs = if wanted.is_empty() {
+                    Vec::new()
+                } else {
+                    main.plan_copy(&mut sent, &wanted)?
+                };
                 let snapshots: Vec<(SnapshotId, i64)> = wanted
                     .iter()
                     .filter_map(|id| source.iter().find(|(s, _)| s == id).copied())
                     .collect();
-                Ok(Some((snapshots, packs)))
+                let mut cleanup = None;
+                if prune {
+                    // What the place keeps once the new versions are there.
+                    let mut all = held.clone();
+                    all.extend(snapshots.iter().copied());
+                    let keep = policy.select(&all);
+                    let drop: Vec<SnapshotId> = delivered_ids
+                        .iter()
+                        .filter(|id| !keep.contains(id))
+                        .copied()
+                        .collect();
+                    let keep: Vec<SnapshotId> = keep.into_iter().collect();
+                    // Without every kept version here to read, only drop versions.
+                    let unused = main.unused_packs(&sent, &keep)?.unwrap_or_default();
+                    let sizes = sent.pack_sizes()?;
+                    let bytes = unused.iter().filter_map(|p| sizes.get(p)).sum::<u64>();
+                    cleanup = Some((keep.len(), drop, unused, bytes));
+                }
+                Ok((snapshots, packs, cleanup))
             })
             .await?;
-        if let Some((snapshots, packs)) = planned {
-            let StoredTarget::Peer {
-                id: host,
-                repo,
-                addrs,
-                hosts,
-            } = &t.target
-            else {
-                bail!("copies can only be forwarded to another computer");
-            };
-            let StoredTarget::Peer { id: relay_id, .. } = &self.env.set.target else {
-                bail!("copies can only be forwarded when the main place is another computer");
-            };
-            let order = ForwardOrder {
-                id: hex::encode(kinvault_core::crypto::random_bytes::<8>()?),
-                place: t.id.clone(),
-                delegation: Delegation::sign(
-                    self.env.endpoint.secret_key(),
-                    EndpointId::from_str(relay_id)?,
-                    EndpointId::from_str(host)?,
-                    repo,
-                    unix_now() + DELEGATION_SECS,
-                ),
-                addrs: addrs.clone(),
-                hosts: hosts.clone(),
-                packs: packs.clone(),
-                snapshots: snapshots.iter().map(|(id, _)| *id).collect(),
-                upload_limit: t.upload_limit,
-                window: t.window,
-            };
-            tracing::debug!(
-                set = %self.env.set.name,
-                place = t.id,
-                versions = snapshots.len(),
-                packs = packs.len(),
-                "asking the relay to forward copies"
-            );
-            if let Err(e) = relay.forward(&order).await {
-                // Not ordered after all: forget the packs, so they're planned again.
-                tokio::task::spawn_blocking(move || -> Result<()> {
-                    let mut sent = Index::open(&index_path)?;
-                    for p in &packs {
-                        sent.remove_pack(p)?;
-                    }
-                    Ok(())
-                })
-                .await??;
-                self.save_extra(&t.id, |e| *e = state);
-                return Err(e.into());
+        let (snapshots, packs, cleanup) = plan;
+        let (drop, unused) = match &cleanup {
+            Some((_, drop, unused, _)) => (drop.clone(), unused.clone()),
+            None => (Vec::new(), Vec::new()),
+        };
+        if snapshots.is_empty() && drop.is_empty() && unused.is_empty() {
+            if let Some((kept, ..)) = cleanup {
+                // Nothing to delete: cleaning up is done until it's due again.
+                self.save_extra(&t.id, |e| e.last_prune = Some(relay_prune(kept, 0, 0, 0)));
             }
-            let progress = state.forwarding.get_or_insert_with(Default::default);
-            progress.orders += 1;
-            progress.packs_total += packs.len() as u64;
-            state.orders.push(OrderRecord {
-                id: order.id,
-                snapshots: snapshots
-                    .iter()
-                    .map(|(id, time)| (id.to_hex(), *time))
-                    .collect(),
-                packs: packs.iter().map(|p| p.to_hex()).collect(),
-            });
+            return Ok(delivered);
+        }
+
+        let StoredTarget::Peer {
+            id: host,
+            repo,
+            addrs,
+            hosts,
+        } = &t.target
+        else {
+            bail!("copies can only be forwarded to another computer");
+        };
+        let StoredTarget::Peer { id: relay_id, .. } = &self.env.set.target else {
+            bail!("copies can only be forwarded when the main place is another computer");
+        };
+        let host_id = EndpointId::from_str(host)?;
+        let owner = self.env.endpoint.secret_key();
+        let expires = unix_now() + DELEGATION_SECS;
+        let mut deletions = Vec::new();
+        let objects: Vec<(Option<SnapshotId>, Option<PackId>)> = drop
+            .iter()
+            .map(|s| (Some(*s), None))
+            .chain(unused.iter().map(|p| (None, Some(*p))))
+            .collect();
+        for batch in objects.chunks(Deletion::MAX_OBJECTS) {
+            deletions.push(Deletion::sign(
+                owner,
+                host_id,
+                repo,
+                batch.iter().filter_map(|(s, _)| *s).collect(),
+                batch.iter().filter_map(|(_, p)| *p).collect(),
+                expires,
+            ));
+        }
+        let order = ForwardOrder {
+            id: hex::encode(kinvault_core::crypto::random_bytes::<8>()?),
+            place: t.id.clone(),
+            delegation: Delegation::sign(
+                owner,
+                EndpointId::from_str(relay_id)?,
+                host_id,
+                repo,
+                expires,
+            ),
+            addrs: addrs.clone(),
+            hosts: hosts.clone(),
+            packs: packs.clone(),
+            snapshots: snapshots.iter().map(|(id, _)| *id).collect(),
+            upload_limit: t.upload_limit,
+            window: t.window,
+            deletions,
+        };
+        tracing::debug!(
+            set = %self.env.set.name,
+            place = t.id,
+            versions = snapshots.len(),
+            packs = packs.len(),
+            deleting_versions = drop.len(),
+            deleting_packs = unused.len(),
+            "asking the relay to forward copies"
+        );
+        let relay = self.env.main_remote()?;
+        if let Err(e) = relay.forward(&order).await {
+            // Not ordered after all: forget the packs, so they're planned again.
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut sent = Index::open(&index_path)?;
+                for p in &packs {
+                    sent.remove_pack(p)?;
+                }
+                Ok(())
+            })
+            .await??;
+            return Err(e.into());
+        }
+        let progress = state.forwarding.get_or_insert_with(Default::default);
+        progress.orders += 1;
+        progress.packs_total += packs.len() as u64;
+        state.orders.push(OrderRecord {
+            id: order.id,
+            snapshots: snapshots
+                .iter()
+                .map(|(id, time)| (id.to_hex(), *time))
+                .collect(),
+            packs: packs.iter().map(|p| p.to_hex()).collect(),
+            deletes: drop.iter().map(|s| s.to_hex()).collect(),
+            dropped_packs: unused.iter().map(|p| p.to_hex()).collect(),
+        });
+        if let Some((kept, drop, unused, bytes)) = cleanup {
+            state.last_prune = Some(relay_prune(kept, drop.len(), unused.len(), bytes));
         }
         self.save_extra(&t.id, |e| *e = state);
         Ok(delivered)
+    }
+
+    /// Asks the relay how open orders are going, for each place that has
+    /// some. Returns whether any are still open.
+    pub(crate) async fn refresh_forwarding(&mut self) -> bool {
+        let mut open = false;
+        for t in self.env.set.extra_targets.clone() {
+            if !t.relay || self.extra_state(&t.id).orders.is_empty() {
+                continue;
+            }
+            match self.update_orders(&t).await {
+                Ok(copied) => self.save_extra(&t.id, |e| {
+                    if copied.is_some() {
+                        e.last_copy = copied;
+                    }
+                    e.last_error = None;
+                }),
+                Err(e) => {
+                    tracing::debug!(set = %self.env.set.name, place = t.id, "couldn't check on forwarding: {e:#}");
+                    let msg = format!("{e:#}");
+                    if msg.contains("couldn't deliver") || msg.contains("lost track") {
+                        self.save_extra(&t.id, |e| e.last_error = Some(msg));
+                    }
+                }
+            }
+            open |= !self.extra_state(&t.id).orders.is_empty();
+        }
+        open
+    }
+
+    /// Whether any place has orders the relay hasn't finished.
+    fn forwarding_open(&self) -> bool {
+        self.status
+            .lock()
+            .unwrap()
+            .extras
+            .values()
+            .any(|e| !e.orders.is_empty())
+    }
+
+    /// While the main place's host is offline: backs up straight to each
+    /// extra place that wants a new version now (by its own rules, hours
+    /// and limits), so copies elsewhere don't fall behind meanwhile.
+    async fn fallback_backup(&mut self, explicit: bool) {
+        for t in self.env.set.extra_targets.clone() {
+            if !explicit && t.window.is_some_and(|w| !w.is_open_now()) {
+                continue;
+            }
+            if host_of(&t.target).is_some_and(|h| self.env.hosts.is_offline(&h.id)) {
+                continue;
+            }
+            set_state(&self.env, &self.status, SetState::Running);
+            match self.backup_to(&t).await {
+                Ok(None) => {}
+                Ok(Some((copy, time_ns))) => {
+                    tracing::info!(
+                        set = %self.env.set.name,
+                        place = t.id,
+                        uploaded = copy.bytes,
+                        "backed up straight to an extra place while the main one is offline"
+                    );
+                    self.save_extra(&t.id, |e| {
+                        // So the relay isn't asked for another one this period.
+                        if t.relay {
+                            e.delivered.push((copy.snapshot.clone(), time_ns));
+                        }
+                        e.last_copy = Some(copy);
+                        e.last_error = None;
+                    });
+                }
+                Err(e) => {
+                    let msg = format!("backing up here while the main place is offline: {e:#}");
+                    tracing::warn!(set = %self.env.set.name, place = t.id, "{msg}");
+                    self.save_extra(&t.id, |e| e.last_error = Some(msg));
+                }
+            }
+        }
+    }
+
+    /// Backs up straight to an extra place if it wants a new version now.
+    /// Returns what was stored and the new version's time.
+    async fn backup_to(
+        &mut self,
+        t: &crate::config::ExtraTarget,
+    ) -> Result<Option<(api::CopySummary, i64)>> {
+        let paths = self.env.set.paths.clone();
+        let policy = t.retention;
+        let progress = progress_reporter(&self.env);
+        self.with_extra(t.id.clone(), move |repo| {
+            let held = repo.snapshot_times()?;
+            let now_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as i64;
+            // Would a version taken now be one it keeps?
+            if policy
+                .to_copy(&[(SnapshotId([0; 32]), now_ns)], &held)
+                .is_empty()
+            {
+                return Ok(None);
+            }
+            let previous = held.iter().max_by_key(|(_, t)| *t).map(|(id, _)| *id);
+            let host = gethostname::gethostname().to_string_lossy().into_owned();
+            repo.set_progress(Some(progress));
+            let result = repo.backup_if_changed(&paths, &host, previous.as_ref());
+            repo.set_progress(None);
+            let (id, stats) = result?;
+            if Some(id) == previous {
+                return Ok(None);
+            }
+            Ok(Some((
+                api::CopySummary {
+                    time_unix: unix_now(),
+                    snapshot: id.to_hex(),
+                    snapshots: 1,
+                    bytes: stats.bytes_uploaded,
+                },
+                now_ns,
+            )))
+        })
+        .await
     }
 
     /// Copies to one extra place what it should have; `None` if nothing.
@@ -1101,6 +1329,10 @@ async fn run(
     let mut first_change: Option<Instant> = None;
     let mut waiting_for_window = false;
     let mut waiting_for_host = false;
+    // While the relay has open orders, ask it now and then how they're going.
+    let mut forward_check = worker
+        .forwarding_open()
+        .then(|| Instant::now() + FORWARD_POLL);
 
     loop {
         set_state(
@@ -1177,6 +1409,13 @@ async fn run(
                 }
                 false
             }
+            _ = tokio::time::sleep_until(forward_check.unwrap_or(far)), if forward_check.is_some() => {
+                forward_check = worker
+                    .refresh_forwarding()
+                    .await
+                    .then(|| Instant::now() + FORWARD_POLL);
+                false
+            }
             _ = tokio::time::sleep_until(next) => true,
         };
         if !run_now {
@@ -1213,6 +1452,9 @@ async fn run(
             );
             waiting_for_host = true;
             scheduled = Instant::now() + MAX_RETRY_DELAY;
+            if !paused && !worker.env.set.extra_targets.is_empty() {
+                worker.fallback_backup(false).await;
+            }
             continue;
         }
         waiting_for_host = false;
@@ -1257,6 +1499,9 @@ async fn run(
                 }
                 if !worker.env.set.extra_targets.is_empty() {
                     let outcome = worker.copy_to_extras(explicit).await;
+                    forward_check = worker
+                        .forwarding_open()
+                        .then(|| Instant::now() + FORWARD_POLL);
                     extras_pending = outcome.pending;
                     if let Some(wait) = outcome.wait
                         && !paused
@@ -1285,6 +1530,9 @@ async fn run(
                         scheduled = Instant::now() + MAX_RETRY_DELAY;
                         tracing::info!(set = %worker.env.set.name, "backup host is offline; waiting for it");
                         status.lock().unwrap().last_error = None;
+                    }
+                    if !worker.env.set.extra_targets.is_empty() && (!paused || explicit) {
+                        worker.fallback_backup(explicit).await;
                     }
                 } else if !paused {
                     failures += 1;

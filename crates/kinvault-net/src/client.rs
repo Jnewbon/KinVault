@@ -12,8 +12,9 @@ use crate::error::{NetError, transport};
 use crate::hosts::with_hosts;
 use crate::limits::RateLimiter;
 use crate::protocol::{
-    ALPN, Delegation, Delivery, ForwardInfo, ForwardOrder, MAX_OBJECT_LEN, MAX_RESPONSE_LEN, Offer,
-    Op, Request, Response, read_msg, read_payload, valid_repo_name, write_msg, write_payload,
+    ALPN, Delegation, Deletion, Delivery, ForwardInfo, ForwardOrder, MAX_OBJECT_LEN,
+    MAX_RESPONSE_LEN, Offer, Op, Request, Response, read_msg, read_payload, valid_repo_name,
+    write_msg, write_payload,
 };
 use crate::receiver::InviteAccepted;
 use crate::ticket::InviteTicket;
@@ -383,6 +384,11 @@ fn describe(op: &Op) -> String {
             Delivery::Snapshot { id, len } => {
                 format!("deliver snapshot {} ({len} bytes)", short(id))
             }
+            Delivery::Delete(d) => format!(
+                "delete {} snapshots and {} packs",
+                d.snapshots.len(),
+                d.packs.len()
+            ),
         },
     }
 }
@@ -460,6 +466,16 @@ impl Deliverer {
             len: delivery_len(data)?,
         };
         match self.send(item, Some(data)).await? {
+            Response::Ok => Ok(()),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    pub async fn delete(&self, deletion: Deletion) -> Result<(), NetError> {
+        match self
+            .send(Delivery::Delete(Box::new(deletion)), None)
+            .await?
+        {
             Response::Ok => Ok(()),
             other => Err(unexpected(&other)),
         }

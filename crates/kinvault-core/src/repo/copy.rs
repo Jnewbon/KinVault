@@ -110,6 +110,38 @@ impl<B: Backend> Repository<B> {
         Ok(packs)
     }
 
+    /// For cleaning up a place this repository can't reach (another host
+    /// passes deletions on): the packs `place` (an index of what it holds)
+    /// lists that none of `keep` need. `None` if a snapshot in `keep` isn't
+    /// here to read, since then what it needs can't be known and nothing
+    /// may be deleted.
+    pub fn unused_packs(&self, place: &Index, keep: &[SnapshotId]) -> Result<Option<Vec<PackId>>> {
+        let mut roots = Vec::with_capacity(keep.len());
+        for id in keep {
+            match self.load_snapshot(id) {
+                Ok(s) => roots.push(s.root),
+                Err(Error::NotFound(_)) => return Ok(None),
+                Err(e) => return Err(e),
+            }
+        }
+        let mut cache = VecDeque::new();
+        let mut quiet: &mut dyn FnMut(&super::MaintenanceProgress) = &mut |_| {};
+        let needed = self.reachable(&roots, &mut cache, &mut quiet)?;
+        let mut used = HashSet::new();
+        for chunk in &needed {
+            if let Some(location) = place.locate(chunk)? {
+                used.insert(location.pack);
+            }
+        }
+        Ok(Some(
+            place
+                .known_packs()?
+                .into_iter()
+                .filter(|p| !used.contains(p))
+                .collect(),
+        ))
+    }
+
     /// The snapshots this repository holds, as `(id, time in ns)` pairs.
     pub fn snapshot_times(&self) -> Result<Vec<(SnapshotId, i64)>> {
         Ok(self

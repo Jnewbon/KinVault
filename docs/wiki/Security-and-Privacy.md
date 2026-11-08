@@ -96,8 +96,11 @@ confirming.
 - **A host that forwards your copies goes bad.** It can only do what your
   signed permission allows: add data to that one backup on that one other
   computer, until the permission runs out (60 days, renewed with each new
-  order). It can't read, list or delete anything there. At worst it adds
-  junk, which uses your storage there and is ignored when you restore.
+  order). It can't read or list anything there, and it can only delete what
+  you signed a deletion list for: exact versions and packs, chosen by your
+  computer. At worst it adds junk, which uses your storage there and is
+  ignored when you restore, or holds back deletions, which leaves old
+  versions there for longer.
 
 ## What you need to protect
 
