@@ -354,7 +354,17 @@ impl SetHandle {
         } else {
             start_watcher(&env, tx.clone())
         };
-        let repo = RepoSlot::default();
+        // Shared with the previous task, so stopping this one also waits for
+        // work the previous one still has under way, even if this task is
+        // aborted before it finishes waiting for it. Told to stop now.
+        let repo = match &previous {
+            Some(p) => {
+                p.cancel.store(true, Ordering::Relaxed);
+                p.task.abort();
+                p.repo.clone()
+            }
+            None => RepoSlot::default(),
+        };
         let cancel = Arc::new(AtomicBool::new(false));
         let run = run(
             env.clone(),
@@ -636,9 +646,12 @@ impl Worker {
     ) -> Result<T> {
         let env = self.env.clone();
         let cancel = self.cancel.clone();
+        let slot = self.repo.clone();
         let span = tracing::debug_span!("set", name = %self.env.set.name, place = %id);
         tokio::task::spawn_blocking(move || {
             let _span = span.entered();
+            // Held so `SetHandle::stop` waits for this too.
+            let _held = slot.lock().unwrap_or_else(|e| e.into_inner());
             let mut repo = env.open_place(Some(&id))?;
             repo.set_cancel(Some(cancel));
             f(&mut repo)
@@ -881,7 +894,9 @@ impl Worker {
         state.forwarding = (progress.orders > 0).then_some(progress);
         if !forget.is_empty() {
             let path = self.env.set_dir.join(index_file(Some(&t.id)));
+            let slot = self.repo.clone();
             tokio::task::spawn_blocking(move || -> Result<()> {
+                let _held = slot.lock().unwrap_or_else(|e| e.into_inner());
                 let mut sent = Index::open(&path)?;
                 for p in forget {
                     sent.remove_pack(&PackId::from_hex(&p)?)?;
@@ -1053,7 +1068,9 @@ impl Worker {
         let relay = self.env.main_remote()?;
         if let Err(e) = relay.forward(&order).await {
             // Not ordered after all: forget the packs, so they're planned again.
+            let slot = self.repo.clone();
             tokio::task::spawn_blocking(move || -> Result<()> {
+                let _held = slot.lock().unwrap_or_else(|e| e.into_inner());
                 let mut sent = Index::open(&index_path)?;
                 for p in &packs {
                     sent.remove_pack(p)?;

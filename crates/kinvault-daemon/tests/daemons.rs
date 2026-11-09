@@ -2357,8 +2357,10 @@ async fn the_main_host_forwards_copies_on_its_own() {
     .await;
     fs::write(src.join("a.txt"), b"changed").unwrap();
     call(&pc, Request::BackupNow { set: "docs".into() }).await;
+    // The relay may fail the order before the PC is seen waiting on it.
     wait_for_set(&pc, |s| {
-        s.state == SetState::Idle && s.extra_targets[0].forwarding.is_some()
+        s.state == SetState::Idle
+            && (s.extra_targets[0].forwarding.is_some() || s.extra_targets[0].last_error.is_some())
     })
     .await;
     let mut error = None;
