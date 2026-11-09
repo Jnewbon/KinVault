@@ -44,6 +44,8 @@ struct Found {
     confirmed: bool,
     paired: bool,
     last_seen: Instant,
+    /// When the newest beacon accepted from it was sent (its clock).
+    sent_unix: i64,
 }
 
 impl Found {
@@ -59,6 +61,12 @@ impl Found {
 /// out for the whole session.
 fn record(devices: &mut Vec<Found>, beacon: Beacon, now: Instant) -> bool {
     if let Some(d) = devices.iter_mut().find(|d| d.addr.id == beacon.addr.id) {
+        // Beacons are signed, but an old one could be replayed to bring
+        // back a name or ports the device no longer uses.
+        if beacon.sent_unix < d.sent_unix {
+            return false;
+        }
+        d.sent_unix = beacon.sent_unix;
         let changed = d.name != beacon.name.as_str();
         d.name = beacon.name.into_string();
         d.addr = beacon.addr;
@@ -97,6 +105,7 @@ fn record(devices: &mut Vec<Found>, beacon: Beacon, now: Instant) -> bool {
         confirmed: false,
         paired: false,
         last_seen: now,
+        sent_unix: beacon.sent_unix,
     });
     true
 }
@@ -300,11 +309,8 @@ async fn run(inner: std::sync::Weak<Inner>, socket: NearbySocket) {
                     return;
                 }
                 let name = Daemon::instance_name(&*daemon.inner.config.lock().await);
-                let beacon = Beacon {
-                    addr: daemon.inner.endpoint.addr(),
-                    name: PeerName::lossy(&name),
-                };
-                socket.announce(&beacon).await;
+                let beacon = Beacon::new(daemon.inner.endpoint.addr(), PeerName::lossy(&name));
+                socket.announce(&beacon, daemon.inner.endpoint.secret_key()).await;
             }
             received = socket.recv() => match received {
                 Ok(beacon) => {
@@ -350,10 +356,7 @@ mod tests {
     fn beacon(ip: [u8; 4]) -> Beacon {
         let addr = EndpointAddr::new(SecretKey::generate().public())
             .with_ip_addr(SocketAddr::new(IpAddr::from(ip), 4433));
-        Beacon {
-            addr,
-            name: PeerName::lossy("device"),
-        }
+        Beacon::new(addr, PeerName::lossy("device"))
     }
 
     /// Fills the list from distinct senders, all seen at `at`.
@@ -433,11 +436,26 @@ mod tests {
         let mut b = beacon([10, 0, 0, 1]);
         assert!(record(&mut devices, b.clone(), now));
         b.name = PeerName::lossy("renamed");
+        b.sent_unix += 2;
         let later = now + Duration::from_secs(2);
         assert!(record(&mut devices, b.clone(), later));
         assert!(!record(&mut devices, b, later));
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].name, "renamed");
         assert_eq!(devices[0].last_seen, later);
+    }
+
+    #[test]
+    fn older_beacons_dont_undo_newer_ones() {
+        let now = Instant::now();
+        let mut devices = Vec::new();
+        let old = beacon([10, 0, 0, 1]);
+        let mut new = old.clone();
+        new.name = PeerName::lossy("renamed");
+        new.sent_unix += 60;
+        assert!(record(&mut devices, new, now));
+        // A replay of the earlier beacon (still validly signed) is ignored.
+        assert!(!record(&mut devices, old, now));
+        assert_eq!(devices[0].name, "renamed");
     }
 }
