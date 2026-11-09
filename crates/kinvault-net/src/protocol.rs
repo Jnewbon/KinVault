@@ -404,6 +404,30 @@ pub fn check_peer_info(name: Option<&str>, hosts: &[String]) -> Result<(), Strin
     Ok(())
 }
 
+/// Makes a name fit [`check_peer_info`]: drops control characters and cuts
+/// it to [`MAX_PEER_NAME_LEN`] bytes. Used on names this instance sends, so
+/// a long configured name doesn't make peers reject every request.
+pub fn clamp_peer_name(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.chars().filter(|c| !c.is_control()) {
+        if out.len() + c.len_utf8() > MAX_PEER_NAME_LEN {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Makes a host list fit [`check_peer_info`]: drops overlong entries and
+/// keeps the first [`MAX_PEER_HOSTS`].
+pub fn clamp_peer_hosts(hosts: Vec<String>) -> Vec<String> {
+    hosts
+        .into_iter()
+        .filter(|h| h.len() <= MAX_HOST_LEN)
+        .take(MAX_PEER_HOSTS)
+        .collect()
+}
+
 /// Repository names become directory names on the host.
 pub fn valid_repo_name(name: &str) -> bool {
     (1..=64).contains(&name.len())
@@ -504,5 +528,20 @@ mod tests {
         assert!(check_peer_info(Some("bad\nname"), &[]).is_err());
         assert!(check_peer_info(None, &vec!["h".to_string(); MAX_PEER_HOSTS + 1]).is_err());
         assert!(check_peer_info(None, &["h".repeat(MAX_HOST_LEN + 1)]).is_err());
+    }
+
+    #[test]
+    fn clamped_peer_info_passes_the_check() {
+        // Multi-byte characters straddling the limit must not be split.
+        let long = format!("a\n{}", "é".repeat(200));
+        let name = clamp_peer_name(&long);
+        assert!(name.len() <= MAX_PEER_NAME_LEN && !name.contains('\n'));
+        assert!(name.starts_with("aé"));
+        let mut hosts = vec!["h".repeat(MAX_HOST_LEN + 1)];
+        hosts.extend((0..40).map(|i| format!("host{i}.example:1")));
+        let hosts = clamp_peer_hosts(hosts);
+        assert_eq!(hosts.len(), MAX_PEER_HOSTS);
+        assert_eq!(hosts[0], "host0.example:1");
+        assert!(check_peer_info(Some(&name), &hosts).is_ok());
     }
 }

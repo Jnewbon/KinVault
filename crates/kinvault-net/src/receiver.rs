@@ -16,8 +16,8 @@ use crate::error::NetError;
 use crate::limits::{RateLimiter, TimeWindow};
 use crate::protocol::{
     Delegation, Delivery, ErrorCode, ForwardOrder, MAX_HAVE, MAX_OBJECT_LEN, MAX_ORDER_LEN,
-    MAX_REQUEST_LEN, Offer, Op, Request, Response, check_peer_info, read_msg, read_payload,
-    valid_repo_name, write_msg,
+    MAX_REQUEST_LEN, Offer, Op, Request, Response, check_peer_info, clamp_peer_name, read_msg,
+    read_payload, valid_repo_name, write_msg,
 };
 
 mod forward;
@@ -340,7 +340,8 @@ impl Receiver {
             .map_err(|e| (ErrorCode::Denied, e))?;
         Ok((
             Response::Redeemed {
-                host_name: accepted.host_name,
+                // Peers check the name, so send it trimmed to what they accept.
+                host_name: clamp_peer_name(&accepted.host_name),
                 quota_bytes: accepted.quota_bytes,
             },
             None,
@@ -353,7 +354,12 @@ impl Receiver {
             return Err((ErrorCode::Denied, "this host does not pair".into()));
         };
         let host_name = handler(request).await.map_err(|e| (ErrorCode::Denied, e))?;
-        Ok((Response::Paired { host_name }, None))
+        Ok((
+            Response::Paired {
+                host_name: clamp_peer_name(&host_name),
+            },
+            None,
+        ))
     }
 
     /// Hides a peer's repository; [`Self::purge_trash`] erases it later.

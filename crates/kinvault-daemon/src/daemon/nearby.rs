@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use kinvault_net::nearby::{Beacon, NearbySocket, pairing_code};
+use kinvault_net::protocol::clamp_peer_name;
 use kinvault_net::{EndpointAddr, EndpointId, NetError, PairRequest};
 
 use super::{Daemon, Inner, unix_now};
@@ -237,7 +238,10 @@ async fn run(inner: std::sync::Weak<Inner>, socket: NearbySocket) {
                     return;
                 }
                 let name = Daemon::instance_name(&*daemon.inner.config.lock().await);
-                let beacon = Beacon { addr: daemon.inner.endpoint.addr(), name };
+                let beacon = Beacon {
+                    addr: daemon.inner.endpoint.addr(),
+                    name: clamp_peer_name(&name),
+                };
                 socket.announce(&beacon).await;
             }
             received = socket.recv() => match received {

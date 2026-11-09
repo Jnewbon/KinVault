@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use kinvault_core::{LocalDirBackend, MasterKey};
+use kinvault_net::protocol::{MAX_PEER_HOSTS, MAX_PEER_NAME_LEN};
 use kinvault_net::{
     Endpoint, EndpointId, HostAddr, InviteAccepted, InviteRedemption, InviteTicket, Offer,
     Receiver, RemoteBackend,
@@ -385,6 +386,16 @@ impl Daemon {
             Request::SetInstanceName { name } => {
                 let name = name.trim().to_string();
                 ensure!(!name.is_empty(), "name must not be empty");
+                // Peers refuse names that break these limits when pairing
+                // or redeeming invites.
+                ensure!(
+                    name.len() <= MAX_PEER_NAME_LEN,
+                    "name must be at most {MAX_PEER_NAME_LEN} bytes"
+                );
+                ensure!(
+                    !name.chars().any(char::is_control),
+                    "name must not contain control characters"
+                );
                 let mut config = self.inner.config.lock().await;
                 config.name = Some(name);
                 config.save(&self.config_path())?;
@@ -793,6 +804,11 @@ impl Daemon {
                         hosts.push(host);
                     }
                 }
+                // Peers only accept this many from an instance.
+                ensure!(
+                    hosts.len() <= MAX_PEER_HOSTS,
+                    "at most {MAX_PEER_HOSTS} public addresses can be given"
+                );
                 settings.public_hosts = hosts;
                 let mut config = self.inner.config.lock().await;
                 config.listen_port = settings.listen_port;

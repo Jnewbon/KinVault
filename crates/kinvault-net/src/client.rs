@@ -13,8 +13,8 @@ use crate::hosts::with_hosts;
 use crate::limits::RateLimiter;
 use crate::protocol::{
     ALPN, Delegation, Deletion, Delivery, ForwardInfo, ForwardOrder, MAX_OBJECT_LEN,
-    MAX_RESPONSE_LEN, Offer, Op, Request, Response, read_msg, read_payload, valid_repo_name,
-    write_msg, write_payload,
+    MAX_RESPONSE_LEN, Offer, Op, Request, Response, clamp_peer_hosts, clamp_peer_name, read_msg,
+    read_payload, valid_repo_name, write_msg, write_payload,
 };
 use crate::receiver::InviteAccepted;
 use crate::ticket::InviteTicket;
@@ -307,11 +307,13 @@ pub async fn redeem_invite(
         .map_err(transport)?;
     let req = Request {
         repo: "invite".into(),
+        // Trimmed to what hosts accept, so an over-long configured name or
+        // host list doesn't get every request refused.
         op: Op::RedeemInvite {
             token: ticket.token,
-            name,
+            name: name.as_deref().map(clamp_peer_name),
             offer,
-            hosts,
+            hosts: clamp_peer_hosts(hosts),
         },
     };
     let result = call_once(&conn, &req, None, None).await;
@@ -341,7 +343,10 @@ pub async fn pair(
     let conn = endpoint.connect(addr, ALPN).await.map_err(transport)?;
     let req = Request {
         repo: "pair".into(),
-        op: Op::Pair { name, hosts },
+        op: Op::Pair {
+            name: clamp_peer_name(&name),
+            hosts: clamp_peer_hosts(hosts),
+        },
     };
     let result = call_once(&conn, &req, None, None).await;
     conn.close(0u32.into(), b"done");

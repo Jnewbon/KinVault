@@ -2630,3 +2630,43 @@ fn files_in_tree(dir: &Path) -> usize {
         .map(|p| if p.is_dir() { files_in_tree(&p) } else { 1 })
         .sum()
 }
+
+/// Peers refuse pair and invite requests whose name or host list break
+/// their limits, so the daemon doesn't let the user configure such values.
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_peers_would_refuse_are_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = start(tmp.path(), SecretKey::generate()).await;
+    for bad in ["x".repeat(257), "two\nlines".to_string()] {
+        let err = d
+            .handle(Request::SetInstanceName { name: bad.clone() })
+            .await
+            .unwrap_err();
+        assert!(err.contains("name must"), "{bad:?}: {err}");
+    }
+    call(
+        &d,
+        Request::SetInstanceName {
+            name: "é".repeat(128),
+        },
+    )
+    .await;
+
+    let hosts = |n: usize| (0..n).map(|i| format!("192.0.2.{i}:9000")).collect();
+    let err = d
+        .handle(Request::SetNetwork(NetworkSettings {
+            listen_port: None,
+            public_hosts: hosts(33),
+        }))
+        .await
+        .unwrap_err();
+    assert!(err.contains("at most 32"), "{err}");
+    call(
+        &d,
+        Request::SetNetwork(NetworkSettings {
+            listen_port: None,
+            public_hosts: hosts(32),
+        }),
+    )
+    .await;
+}
