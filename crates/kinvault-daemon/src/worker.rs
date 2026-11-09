@@ -6,6 +6,7 @@
 //! that touches the repository goes through this task, so operations never
 //! overlap.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -14,7 +15,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use kinvault_core::{Backend, Excludes, Index, LocalDirBackend, MasterKey, Repository, SnapshotId};
+use kinvault_core::{
+    Backend, Excludes, Index, LocalDirBackend, MasterKey, PackId, Repository, SnapshotId,
+};
+use kinvault_net::protocol::{Delegation, Deletion, ForwardOrder, ForwardState};
 use kinvault_net::{Endpoint, EndpointAddr, EndpointId, RemoteBackend};
 use notify::event::{AccessKind, AccessMode};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -24,7 +28,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::api::{BackupSummary, Event, PruneSummary, SetState, VerifySummary};
+use crate::api::{self, BackupSummary, Event, PruneSummary, SetState, VerifySummary};
 use crate::config::{SetConfig, StoredTarget, write_private};
 use crate::reachability::{HostTarget, Hosts};
 
@@ -44,8 +48,9 @@ type RepoSlot = Arc<Mutex<Option<Repository<Box<dyn Backend>>>>>;
 pub(crate) enum Trigger {
     Changed,
     Now(Reply<BackupSummary>),
-    Prune(Reply<PruneSummary>),
-    Verify(u64, Reply<VerifySummary>),
+    /// Prune the main place (`None`) or an extra one, by id.
+    Prune(Option<String>, Reply<PruneSummary>),
+    Verify(u64, Option<String>, Reply<VerifySummary>),
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -58,12 +63,53 @@ pub(crate) struct Maintenance {
     pub last_verify: Option<VerifySummary>,
 }
 
+/// How copying to, and maintaining, one of a set's extra places went.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct ExtraState {
+    /// When this place was first seen; maintenance is due an interval later.
+    #[serde(default)]
+    pub since_unix: i64,
+    pub last_copy: Option<api::CopySummary>,
+    pub last_error: Option<String>,
+    pub last_prune: Option<PruneSummary>,
+    pub last_verify: Option<VerifySummary>,
+    /// For a place copies are forwarded to: orders the relay hasn't
+    /// finished, and versions it has delivered (`(id, time in ns)`).
+    #[serde(default)]
+    pub orders: Vec<OrderRecord>,
+    #[serde(default)]
+    pub delivered: Vec<(String, i64)>,
+    #[serde(default)]
+    pub forwarding: Option<api::ForwardProgress>,
+}
+
+/// A forwarding order sent to the relay.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct OrderRecord {
+    pub id: String,
+    /// `(id, time in ns)`, oldest first.
+    pub snapshots: Vec<(String, i64)>,
+    pub packs: Vec<String>,
+    /// Versions and packs it has the place delete, once it's delivered.
+    #[serde(default)]
+    pub deletes: Vec<String>,
+    #[serde(default)]
+    pub dropped_packs: Vec<String>,
+}
+
+/// How long a relay may deliver with a permission given in one order.
+const DELEGATION_SECS: i64 = 60 * 24 * 60 * 60;
+/// How often to ask the relay how orders are going while some are open.
+pub(crate) const FORWARD_POLL: Duration = Duration::from_secs(2 * 60);
+
 #[derive(Clone, Debug)]
 pub(crate) struct RunStatus {
     pub state: SetState,
     pub last_backup: Option<BackupSummary>,
     pub last_error: Option<String>,
     pub maintenance: Maintenance,
+    /// By extra place id.
+    pub extras: BTreeMap<String, ExtraState>,
 }
 
 /// Everything needed to open a set's repository.
@@ -82,17 +128,39 @@ pub(crate) fn master_key_path(set_dir: &Path) -> PathBuf {
     set_dir.join("master.key")
 }
 
+/// The key new sets use unless they ask for their own; see [`shared_key`].
+pub(crate) fn shared_key_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("shared.key")
+}
+
 pub(crate) fn write_master_key(set_dir: &Path, key: &MasterKey) -> Result<()> {
-    write_private(
-        &master_key_path(set_dir),
-        hex::encode(key.to_bytes()).as_bytes(),
-    )
+    write_key(&master_key_path(set_dir), key)
 }
 
 pub(crate) fn read_master_key(set_dir: &Path) -> Result<MasterKey> {
-    let text = fs::read_to_string(master_key_path(set_dir)).context("reading set key")?;
+    read_key(&master_key_path(set_dir)).context("reading set key")
+}
+
+/// The instance's shared set key, created the first time it's needed.
+/// Each set using it still keeps its own copy in `master.key`.
+pub(crate) fn shared_key(state_dir: &Path) -> Result<MasterKey> {
+    let path = shared_key_path(state_dir);
+    if path.exists() {
+        return read_key(&path).context("reading the shared key");
+    }
+    let key = MasterKey::generate()?;
+    write_key(&path, &key)?;
+    Ok(key)
+}
+
+pub(crate) fn write_key(path: &Path, key: &MasterKey) -> Result<()> {
+    write_private(path, hex::encode(key.to_bytes()).as_bytes())
+}
+
+fn read_key(path: &Path) -> Result<MasterKey> {
+    let text = fs::read_to_string(path)?;
     let mut bytes = [0u8; 32];
-    hex::decode_to_slice(text.trim(), &mut bytes).context("set key is corrupt")?;
+    hex::decode_to_slice(text.trim(), &mut bytes).context("key is corrupt")?;
     Ok(MasterKey::from_bytes(bytes))
 }
 
@@ -120,9 +188,26 @@ impl SetEnv {
         })
     }
 
+    /// Opens the repository in the set's main place.
     pub fn open_repository(&self) -> Result<Repository<Box<dyn Backend>>> {
+        self.open_place(None)
+    }
+
+    /// Opens the repository in the main place (`None`) or an extra one, by
+    /// id. Each place has an index of its own.
+    pub fn open_place(&self, extra: Option<&str>) -> Result<Repository<Box<dyn Backend>>> {
         let master = read_master_key(&self.set_dir)?;
-        let backend: Box<dyn Backend> = match &self.set.target {
+        let (target, upload_limit) = match extra {
+            None => (&self.set.target, self.set.upload_limit),
+            Some(id) => {
+                let t = self
+                    .set
+                    .extra_target(id)
+                    .with_context(|| format!("{} has no extra place {id:?}", self.set.name))?;
+                (&t.target, t.upload_limit)
+            }
+        };
+        let backend: Box<dyn Backend> = match target {
             StoredTarget::Local { path } => Box::new(LocalDirBackend::open(path)?),
             StoredTarget::Peer {
                 id,
@@ -136,11 +221,11 @@ impl SetEnv {
                     repo,
                     self.runtime.clone(),
                 )?
-                .with_upload_limit(self.set.upload_limit)
+                .with_upload_limit(upload_limit)
                 .with_hosts(hosts.clone()),
             ),
         };
-        let index = Index::open(&self.set_dir.join("index.db"))?;
+        let index = Index::open(&self.set_dir.join(index_file(extra)))?;
         let mut repo = Repository::open(backend, &master, index);
         repo.set_excludes(self.excludes.clone());
         repo.set_exclude_patterns(self.exclude_patterns());
@@ -149,16 +234,31 @@ impl SetEnv {
 
     /// The host the set backs up to, unless it's a local folder.
     pub fn host(&self) -> Option<HostTarget> {
-        match &self.set.target {
-            StoredTarget::Peer {
-                id, addrs, hosts, ..
-            } => Some(HostTarget {
-                id: id.clone(),
-                addrs: addrs.clone(),
-                hosts: hosts.clone(),
-            }),
-            StoredTarget::Local { .. } => None,
-        }
+        host_of(&self.set.target)
+    }
+
+    /// The main place's host, for asking it to forward copies.
+    pub fn main_remote(&self) -> Result<RemoteBackend> {
+        let StoredTarget::Peer {
+            id,
+            repo,
+            addrs,
+            hosts,
+        } = &self.set.target
+        else {
+            bail!("copies can only be forwarded when the main place is another computer");
+        };
+        Ok(RemoteBackend::new(
+            self.endpoint.clone(),
+            peer_addr(id, addrs)?,
+            repo,
+            self.runtime.clone(),
+        )?
+        .with_hosts(hosts.clone()))
+    }
+
+    fn extras_path(&self) -> PathBuf {
+        self.set_dir.join("extras.json")
     }
 
     fn last_backup_path(&self) -> PathBuf {
@@ -167,6 +267,28 @@ impl SetEnv {
 
     fn maintenance_path(&self) -> PathBuf {
         self.set_dir.join("maintenance.json")
+    }
+}
+
+/// The index file of the set's main place (`None`) or an extra one.
+pub(crate) fn index_file(extra: Option<&str>) -> String {
+    match extra {
+        None => "index.db".into(),
+        Some(id) => format!("index-{id}.db"),
+    }
+}
+
+/// The host a place is on, unless it's a local folder.
+pub(crate) fn host_of(target: &StoredTarget) -> Option<HostTarget> {
+    match target {
+        StoredTarget::Peer {
+            id, addrs, hosts, ..
+        } => Some(HostTarget {
+            id: id.clone(),
+            addrs: addrs.clone(),
+            hosts: hosts.clone(),
+        }),
+        StoredTarget::Local { .. } => None,
     }
 }
 
@@ -212,6 +334,19 @@ impl SetHandle {
                 }
                 m
             }),
+            extras: {
+                let mut extras: BTreeMap<String, ExtraState> =
+                    read_json(&env.extras_path()).unwrap_or_default();
+                // Forget places that were removed; start the clock on new ones.
+                extras.retain(|id, _| env.set.extra_target(id).is_some());
+                for t in &env.set.extra_targets {
+                    extras.entry(t.id.clone()).or_insert_with(|| ExtraState {
+                        since_unix: unix_now(),
+                        ..Default::default()
+                    });
+                }
+                extras
+            },
         }));
         let (tx, rx) = mpsc::channel(64);
         let watcher = if env.set.paused {
@@ -219,7 +354,17 @@ impl SetHandle {
         } else {
             start_watcher(&env, tx.clone())
         };
-        let repo = RepoSlot::default();
+        // Shared with the previous task, so stopping this one also waits for
+        // work the previous one still has under way, even if this task is
+        // aborted before it finishes waiting for it. Told to stop now.
+        let repo = match &previous {
+            Some(p) => {
+                p.cancel.store(true, Ordering::Relaxed);
+                p.task.abort();
+                p.repo.clone()
+            }
+            None => RepoSlot::default(),
+        };
         let cancel = Arc::new(AtomicBool::new(false));
         let run = run(
             env.clone(),
@@ -354,24 +499,63 @@ fn maintenance_reporter(
 }
 
 /// Forwards backup progress to subscribers, at most four times a second,
-/// and always the final totals once every file has been looked at.
+/// but always when the backup moves to another step (sending a pack can
+/// take a while on a slow link) and the final totals once every file has
+/// been looked at.
 fn progress_reporter(env: &SetEnv) -> kinvault_core::ProgressFn {
+    use kinvault_core::BackupStep as S;
     let events = env.events.clone();
     let set = env.set.id.clone();
-    let last = Mutex::new(std::time::Instant::now() - Duration::from_secs(1));
+    let last = Mutex::new((
+        std::time::Instant::now() - Duration::from_secs(1),
+        api::BackupStep::Checking,
+    ));
     Arc::new(move |p: &kinvault_core::BackupProgress| {
+        let (step, sending_bytes) = match p.step {
+            S::Checking => (api::BackupStep::Checking, 0),
+            S::Reading => (api::BackupStep::Reading, 0),
+            S::Sending { bytes } => (api::BackupStep::Sending, bytes),
+        };
         let mut last = last.lock().unwrap();
-        if p.scanned || last.elapsed() >= Duration::from_millis(250) {
-            *last = std::time::Instant::now();
+        if p.scanned || step != last.1 || last.0.elapsed() >= Duration::from_millis(250) {
+            *last = (std::time::Instant::now(), step);
             let _ = events.send(Event::Progress {
                 set: set.clone(),
                 files: p.files,
                 total_bytes: p.total_bytes,
                 bytes_read: p.bytes_read,
                 bytes_uploaded: p.bytes_uploaded,
+                step,
+                file: p.file.clone(),
+                sending_bytes,
+                file_size: p.file_size,
+                file_read: p.file_read,
             });
         }
     })
+}
+
+/// What copying to the extra places left to do.
+#[derive(Default)]
+struct ExtrasOutcome {
+    /// Until the soonest skipped place's time window opens.
+    wait: Option<Duration>,
+    /// A place was skipped or failed; try again when its host is back.
+    pending: bool,
+}
+
+/// A clean-up done by passing deletions through the relay.
+fn relay_prune(kept: usize, removed: usize, packs: usize, bytes: u64) -> PruneSummary {
+    PruneSummary {
+        time_unix: unix_now(),
+        snapshots_kept: kept as u64,
+        snapshots_removed: removed as u64,
+        packs_deleted: packs as u64,
+        packs_repacked: 0,
+        bytes_deleted: bytes,
+        bytes_downloaded: 0,
+        bytes_uploaded: 0,
+    }
 }
 
 fn retry_delay(failures: u32) -> Duration {
@@ -396,7 +580,10 @@ impl Worker {
         let slot = self.repo.clone();
         let env = self.env.clone();
         let cancel = self.cancel.clone();
+        // Tags what the repository and the network log with the set's name.
+        let span = tracing::debug_span!("set", name = %self.env.set.name);
         tokio::task::spawn_blocking(move || {
+            let _span = span.entered();
             // Held for the whole operation; see `SetHandle::stop`.
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
             let repo = match &mut *slot {
@@ -451,13 +638,50 @@ impl Worker {
         })
     }
 
-    async fn prune(&mut self) -> Result<PruneSummary> {
+    /// Runs `f` on an extra place's repository in a blocking thread.
+    async fn with_extra<T: Send + 'static>(
+        &self,
+        id: String,
+        f: impl FnOnce(&mut Repository<Box<dyn Backend>>) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let env = self.env.clone();
+        let cancel = self.cancel.clone();
+        let slot = self.repo.clone();
+        let span = tracing::debug_span!("set", name = %self.env.set.name, place = %id);
+        tokio::task::spawn_blocking(move || {
+            let _span = span.entered();
+            // Held so `SetHandle::stop` waits for this too.
+            let _held = slot.lock().unwrap_or_else(|e| e.into_inner());
+            let mut repo = env.open_place(Some(&id))?;
+            repo.set_cancel(Some(cancel));
+            f(&mut repo)
+        })
+        .await?
+    }
+
+    fn extra(&self, id: &str) -> Result<crate::config::ExtraTarget> {
+        self.env
+            .set
+            .extra_target(id)
+            .cloned()
+            .with_context(|| format!("{} has no extra place {id:?}", self.env.set.name))
+    }
+
+    /// Prunes the main place (`None`) or an extra one with its own policy.
+    async fn prune(&mut self, from: Option<String>) -> Result<PruneSummary> {
+        let policy = match &from {
+            None => self.env.set.retention,
+            Some(id) => self.extra(id)?.retention,
+        };
         set_state(&self.env, &self.status, SetState::Pruning);
-        let policy = self.env.set.retention;
         let mut progress = maintenance_reporter(&self.env);
-        let s = self
-            .with_repo(move |repo| Ok(repo.prune_with_progress(&policy, &mut progress)?))
-            .await?;
+        let prune = move |repo: &mut Repository<Box<dyn Backend>>| {
+            Ok(repo.prune_with_progress(&policy, &mut progress)?)
+        };
+        let s = match from.clone() {
+            None => self.with_repo(prune).await?,
+            Some(id) => self.with_extra(id, prune).await?,
+        };
         let summary = PruneSummary {
             time_unix: unix_now(),
             snapshots_kept: s.snapshots_kept,
@@ -468,17 +692,27 @@ impl Worker {
             bytes_downloaded: s.bytes_downloaded,
             bytes_uploaded: s.bytes_uploaded,
         };
-        self.save_maintenance(|m| m.last_prune = Some(summary.clone()));
-        tracing::info!(set = %self.env.set.name, removed = s.snapshots_removed, freed = s.bytes_deleted, "prune complete");
+        match &from {
+            None => self.save_maintenance(|m| m.last_prune = Some(summary.clone())),
+            Some(id) => self.save_extra(id, |e| e.last_prune = Some(summary.clone())),
+        }
+        tracing::info!(set = %self.env.set.name, place = ?from, removed = s.snapshots_removed, freed = s.bytes_deleted, "prune complete");
         Ok(summary)
     }
 
-    async fn verify(&mut self, max_bytes: u64) -> Result<VerifySummary> {
+    async fn verify(&mut self, max_bytes: u64, from: Option<String>) -> Result<VerifySummary> {
+        if let Some(id) = &from {
+            self.extra(id)?;
+        }
         set_state(&self.env, &self.status, SetState::Verifying);
         let mut progress = maintenance_reporter(&self.env);
-        let r = self
-            .with_repo(move |repo| Ok(repo.verify_with_progress(max_bytes, &mut progress)?))
-            .await?;
+        let verify = move |repo: &mut Repository<Box<dyn Backend>>| {
+            Ok(repo.verify_with_progress(max_bytes, &mut progress)?)
+        };
+        let r = match from.clone() {
+            None => self.with_repo(verify).await?,
+            Some(id) => self.with_extra(id, verify).await?,
+        };
         let summary = VerifySummary {
             time_unix: unix_now(),
             ok: r.is_ok(),
@@ -489,13 +723,545 @@ impl Worker {
             damaged_packs: r.damaged_packs.len() as u64,
             errors: r.errors,
         };
-        self.save_maintenance(|m| m.last_verify = Some(summary.clone()));
+        match &from {
+            None => self.save_maintenance(|m| m.last_verify = Some(summary.clone())),
+            Some(id) => self.save_extra(id, |e| e.last_verify = Some(summary.clone())),
+        }
         if summary.ok {
-            tracing::info!(set = %self.env.set.name, checked = r.bytes_checked, "verification passed");
+            tracing::info!(set = %self.env.set.name, place = ?from, checked = r.bytes_checked, "verification passed");
         } else {
-            tracing::warn!(set = %self.env.set.name, "verification found problems: {:?}", summary.errors);
+            tracing::warn!(set = %self.env.set.name, place = ?from, "verification found problems: {:?}", summary.errors);
         }
         Ok(summary)
+    }
+
+    fn save_extra(&self, id: &str, update: impl FnOnce(&mut ExtraState)) {
+        let mut st = self.status.lock().unwrap();
+        update(st.extras.entry(id.to_string()).or_default());
+        if let Ok(json) = serde_json::to_string(&st.extras) {
+            let _ = fs::write(self.env.extras_path(), json);
+        }
+        let _ = self.env.events.send(Event::SetsChanged);
+    }
+
+    /// Copies to each extra place the versions it keeps but doesn't have
+    /// yet, then cleans up or checks there when due. Automatic runs skip
+    /// places outside their time window or whose host is offline;
+    /// `explicit` ones (asked for by the user) try them all.
+    async fn copy_to_extras(&mut self, explicit: bool) -> ExtrasOutcome {
+        let mut outcome = ExtrasOutcome::default();
+        for t in self.env.set.extra_targets.clone() {
+            // Orders for the relay can be sent any time; it keeps the
+            // place's hours, and waits for it to be online.
+            if !explicit
+                && !t.relay
+                && let Some(window) = t.window
+            {
+                let wait = window.until_open();
+                if !wait.is_zero() {
+                    tracing::debug!(set = %self.env.set.name, place = t.id, "outside its time window; copying in {}s", wait.as_secs());
+                    outcome.wait = Some(outcome.wait.map_or(wait, |w| w.min(wait)));
+                    continue;
+                }
+            }
+            if !explicit
+                && !t.relay
+                && let Some(h) = host_of(&t.target)
+                && self.env.hosts.is_offline(&h.id)
+            {
+                tracing::debug!(set = %self.env.set.name, place = t.id, "its host is offline; copying once it's back");
+                outcome.pending = true;
+                continue;
+            }
+            set_state(&self.env, &self.status, SetState::Copying);
+            let copied = if t.relay {
+                self.forward_to(&t).await
+            } else {
+                self.copy_to(&t).await
+            };
+            match copied {
+                Ok(copied) => {
+                    if let Some(c) = &copied {
+                        tracing::info!(set = %self.env.set.name, place = t.id, versions = c.snapshots, bytes = c.bytes, "copied versions");
+                    }
+                    self.save_extra(&t.id, |e| {
+                        if copied.is_some() {
+                            e.last_copy = copied;
+                        }
+                        e.last_error = None;
+                    });
+                }
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    tracing::warn!(set = %self.env.set.name, place = t.id, "copying failed: {msg}");
+                    self.save_extra(&t.id, |e| e.last_error = Some(msg));
+                    outcome.pending = true;
+                    continue;
+                }
+            }
+            let (pruned, verified, since) = {
+                let st = self.status.lock().unwrap();
+                let e = st.extras.get(&t.id).cloned().unwrap_or_default();
+                (
+                    e.last_prune.map_or(0, |p| p.time_unix),
+                    e.last_verify.map_or(0, |v| v.time_unix),
+                    e.since_unix,
+                )
+            };
+            // Cleaning up and checking need to reach the place from here.
+            if t.relay
+                && host_of(&t.target).is_none_or(|h| self.env.hosts.get(&h.id).online != Some(true))
+            {
+                continue;
+            }
+            let now = unix_now();
+            if now - pruned.max(since) >= PRUNE_INTERVAL_SECS
+                && let Err(e) = self.prune(Some(t.id.clone())).await
+            {
+                tracing::warn!(set = %self.env.set.name, place = t.id, "prune failed: {e:#}");
+                self.save_extra(&t.id, |s| {
+                    s.last_error = Some(format!("cleaning up: {e:#}"))
+                });
+            }
+            if now - verified.max(since) >= VERIFY_INTERVAL_SECS
+                && let Err(e) = self.verify(VERIFY_BUDGET_BYTES, Some(t.id.clone())).await
+            {
+                tracing::warn!(set = %self.env.set.name, place = t.id, "verification failed to run: {e:#}");
+            }
+        }
+        outcome
+    }
+
+    /// For a place copies are forwarded to: learns from the relay which
+    /// orders it finished. Returns what was delivered since last time;
+    /// fails if an order failed (it's planned again next time).
+    async fn update_orders(
+        &mut self,
+        t: &crate::config::ExtraTarget,
+    ) -> Result<Option<api::CopySummary>> {
+        let relay = self.env.main_remote()?;
+        let infos = relay.forward_status(&t.id).await?;
+        let mut state = self.extra_state(&t.id);
+        let mut delivered: Option<api::CopySummary> = None;
+        let mut forget: Vec<String> = Vec::new();
+        let mut failure: Option<String> = None;
+        let mut progress = api::ForwardProgress::default();
+        let mut pending = Vec::new();
+        for order in std::mem::take(&mut state.orders) {
+            match infos.iter().find(|i| i.id == order.id) {
+                Some(i) if i.state == ForwardState::Done => {
+                    if !order.snapshots.is_empty() {
+                        let d = delivered.get_or_insert(api::CopySummary {
+                            time_unix: i.updated_unix,
+                            snapshot: String::new(),
+                            snapshots: 0,
+                            bytes: 0,
+                        });
+                        d.time_unix = d.time_unix.max(i.updated_unix);
+                        d.snapshots += order.snapshots.len() as u64;
+                        d.bytes += i.bytes_sent;
+                        if let Some((newest, _)) = order.snapshots.last() {
+                            d.snapshot = newest.clone();
+                        }
+                    }
+                    state.delivered.extend(order.snapshots);
+                    state
+                        .delivered
+                        .retain(|(id, _)| !order.deletes.contains(id));
+                    forget.extend(order.dropped_packs);
+                }
+                Some(i) if i.state == ForwardState::Pending => {
+                    progress.orders += 1;
+                    progress.packs_sent += i.packs_sent;
+                    progress.packs_total += i.packs_total;
+                    progress.bytes_sent += i.bytes_sent;
+                    if i.error.is_some() {
+                        progress.note = i.error.clone();
+                    }
+                    pending.push(order);
+                }
+                found => {
+                    failure = Some(match found.and_then(|i| i.error.clone()) {
+                        Some(e) => format!("the relay couldn't deliver: {e}"),
+                        None => "the relay lost track of copies it was sending".into(),
+                    });
+                    // Not there after all: forget them, so they're sent again.
+                    forget.extend(order.packs);
+                }
+            }
+        }
+        state.orders = pending;
+        state.forwarding = (progress.orders > 0).then_some(progress);
+        if !forget.is_empty() {
+            let path = self.env.set_dir.join(index_file(Some(&t.id)));
+            let slot = self.repo.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let _held = slot.lock().unwrap_or_else(|e| e.into_inner());
+                let mut sent = Index::open(&path)?;
+                for p in forget {
+                    sent.remove_pack(&PackId::from_hex(&p)?)?;
+                }
+                Ok(())
+            })
+            .await??;
+        }
+        self.save_extra(&t.id, |e| *e = state);
+        match failure {
+            Some(failure) => bail!(failure),
+            None => Ok(delivered),
+        }
+    }
+
+    fn extra_state(&self, id: &str) -> ExtraState {
+        self.status
+            .lock()
+            .unwrap()
+            .extras
+            .get(id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// For a place copies are forwarded to: catches up with the relay, then
+    /// orders the versions the place should get next, and, when it's due
+    /// and the place can't be reached from here to clean it up directly,
+    /// deletions of what it no longer keeps.
+    async fn forward_to(
+        &mut self,
+        t: &crate::config::ExtraTarget,
+    ) -> Result<Option<api::CopySummary>> {
+        let delivered = self.update_orders(t).await?;
+        let mut state = self.extra_state(&t.id);
+        let held: Vec<(SnapshotId, i64)> = state
+            .delivered
+            .iter()
+            .chain(state.orders.iter().flat_map(|o| &o.snapshots))
+            .filter_map(|(id, time)| Some((SnapshotId::from_hex(id).ok()?, *time)))
+            .collect();
+        let reachable =
+            host_of(&t.target).is_some_and(|h| self.env.hosts.get(&h.id).online == Some(true));
+        let cleaning = state
+            .orders
+            .iter()
+            .any(|o| !o.deletes.is_empty() || !o.dropped_packs.is_empty());
+        let since = state
+            .last_prune
+            .as_ref()
+            .map_or(0, |p| p.time_unix)
+            .max(state.since_unix);
+        let prune = !reachable && !cleaning && unix_now() - since >= PRUNE_INTERVAL_SECS;
+        let delivered_ids: Vec<SnapshotId> = state
+            .delivered
+            .iter()
+            .filter_map(|(id, _)| SnapshotId::from_hex(id).ok())
+            .collect();
+
+        let policy = t.retention;
+        let index_path = self.env.set_dir.join(index_file(Some(&t.id)));
+        let path = index_path.clone();
+        let plan = self
+            .with_repo(move |main| {
+                let source = main.snapshot_times()?;
+                let wanted = policy.to_copy(&source, &held);
+                let mut sent = Index::open(&path)?;
+                let packs = if wanted.is_empty() {
+                    Vec::new()
+                } else {
+                    main.plan_copy(&mut sent, &wanted)?
+                };
+                let snapshots: Vec<(SnapshotId, i64)> = wanted
+                    .iter()
+                    .filter_map(|id| source.iter().find(|(s, _)| s == id).copied())
+                    .collect();
+                let mut cleanup = None;
+                if prune {
+                    // What the place keeps once the new versions are there.
+                    let mut all = held.clone();
+                    all.extend(snapshots.iter().copied());
+                    let keep = policy.select(&all);
+                    let drop: Vec<SnapshotId> = delivered_ids
+                        .iter()
+                        .filter(|id| !keep.contains(id))
+                        .copied()
+                        .collect();
+                    let keep: Vec<SnapshotId> = keep.into_iter().collect();
+                    // Without every kept version here to read, only drop versions.
+                    let unused = main.unused_packs(&sent, &keep)?.unwrap_or_default();
+                    let sizes = sent.pack_sizes()?;
+                    let bytes = unused.iter().filter_map(|p| sizes.get(p)).sum::<u64>();
+                    cleanup = Some((keep.len(), drop, unused, bytes));
+                }
+                Ok((snapshots, packs, cleanup))
+            })
+            .await?;
+        let (snapshots, packs, cleanup) = plan;
+        let (drop, unused) = match &cleanup {
+            Some((_, drop, unused, _)) => (drop.clone(), unused.clone()),
+            None => (Vec::new(), Vec::new()),
+        };
+        if snapshots.is_empty() && drop.is_empty() && unused.is_empty() {
+            if let Some((kept, ..)) = cleanup {
+                // Nothing to delete: cleaning up is done until it's due again.
+                self.save_extra(&t.id, |e| e.last_prune = Some(relay_prune(kept, 0, 0, 0)));
+            }
+            return Ok(delivered);
+        }
+
+        let StoredTarget::Peer {
+            id: host,
+            repo,
+            addrs,
+            hosts,
+        } = &t.target
+        else {
+            bail!("copies can only be forwarded to another computer");
+        };
+        let StoredTarget::Peer { id: relay_id, .. } = &self.env.set.target else {
+            bail!("copies can only be forwarded when the main place is another computer");
+        };
+        let host_id = EndpointId::from_str(host)?;
+        let owner = self.env.endpoint.secret_key();
+        let expires = unix_now() + DELEGATION_SECS;
+        let mut deletions = Vec::new();
+        let objects: Vec<(Option<SnapshotId>, Option<PackId>)> = drop
+            .iter()
+            .map(|s| (Some(*s), None))
+            .chain(unused.iter().map(|p| (None, Some(*p))))
+            .collect();
+        for batch in objects.chunks(Deletion::MAX_OBJECTS) {
+            deletions.push(Deletion::sign(
+                owner,
+                host_id,
+                repo,
+                batch.iter().filter_map(|(s, _)| *s).collect(),
+                batch.iter().filter_map(|(_, p)| *p).collect(),
+                expires,
+            ));
+        }
+        let order = ForwardOrder {
+            id: hex::encode(kinvault_core::crypto::random_bytes::<8>()?),
+            place: t.id.clone(),
+            delegation: Delegation::sign(
+                owner,
+                EndpointId::from_str(relay_id)?,
+                host_id,
+                repo,
+                expires,
+            ),
+            addrs: addrs.clone(),
+            hosts: hosts.clone(),
+            packs: packs.clone(),
+            snapshots: snapshots.iter().map(|(id, _)| *id).collect(),
+            upload_limit: t.upload_limit,
+            window: t.window,
+            deletions,
+        };
+        tracing::debug!(
+            set = %self.env.set.name,
+            place = t.id,
+            versions = snapshots.len(),
+            packs = packs.len(),
+            deleting_versions = drop.len(),
+            deleting_packs = unused.len(),
+            "asking the relay to forward copies"
+        );
+        let relay = self.env.main_remote()?;
+        if let Err(e) = relay.forward(&order).await {
+            // Not ordered after all: forget the packs, so they're planned again.
+            let slot = self.repo.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let _held = slot.lock().unwrap_or_else(|e| e.into_inner());
+                let mut sent = Index::open(&index_path)?;
+                for p in &packs {
+                    sent.remove_pack(p)?;
+                }
+                Ok(())
+            })
+            .await??;
+            return Err(e.into());
+        }
+        let progress = state.forwarding.get_or_insert_with(Default::default);
+        progress.orders += 1;
+        progress.packs_total += packs.len() as u64;
+        state.orders.push(OrderRecord {
+            id: order.id,
+            snapshots: snapshots
+                .iter()
+                .map(|(id, time)| (id.to_hex(), *time))
+                .collect(),
+            packs: packs.iter().map(|p| p.to_hex()).collect(),
+            deletes: drop.iter().map(|s| s.to_hex()).collect(),
+            dropped_packs: unused.iter().map(|p| p.to_hex()).collect(),
+        });
+        if let Some((kept, drop, unused, bytes)) = cleanup {
+            state.last_prune = Some(relay_prune(kept, drop.len(), unused.len(), bytes));
+        }
+        self.save_extra(&t.id, |e| *e = state);
+        Ok(delivered)
+    }
+
+    /// Asks the relay how open orders are going, for each place that has
+    /// some. Returns whether any are still open.
+    pub(crate) async fn refresh_forwarding(&mut self) -> bool {
+        let mut open = false;
+        for t in self.env.set.extra_targets.clone() {
+            if !t.relay || self.extra_state(&t.id).orders.is_empty() {
+                continue;
+            }
+            match self.update_orders(&t).await {
+                Ok(copied) => self.save_extra(&t.id, |e| {
+                    if copied.is_some() {
+                        e.last_copy = copied;
+                    }
+                    e.last_error = None;
+                }),
+                Err(e) => {
+                    tracing::debug!(set = %self.env.set.name, place = t.id, "couldn't check on forwarding: {e:#}");
+                    let msg = format!("{e:#}");
+                    if msg.contains("couldn't deliver") || msg.contains("lost track") {
+                        self.save_extra(&t.id, |e| e.last_error = Some(msg));
+                    }
+                }
+            }
+            open |= !self.extra_state(&t.id).orders.is_empty();
+        }
+        open
+    }
+
+    /// Whether any place has orders the relay hasn't finished.
+    fn forwarding_open(&self) -> bool {
+        self.status
+            .lock()
+            .unwrap()
+            .extras
+            .values()
+            .any(|e| !e.orders.is_empty())
+    }
+
+    /// While the main place's host is offline: backs up straight to each
+    /// extra place that wants a new version now (by its own rules, hours
+    /// and limits), so copies elsewhere don't fall behind meanwhile.
+    async fn fallback_backup(&mut self, explicit: bool) {
+        for t in self.env.set.extra_targets.clone() {
+            if !explicit && t.window.is_some_and(|w| !w.is_open_now()) {
+                continue;
+            }
+            if host_of(&t.target).is_some_and(|h| self.env.hosts.is_offline(&h.id)) {
+                continue;
+            }
+            set_state(&self.env, &self.status, SetState::Running);
+            match self.backup_to(&t).await {
+                Ok(None) => {}
+                Ok(Some((copy, time_ns))) => {
+                    tracing::info!(
+                        set = %self.env.set.name,
+                        place = t.id,
+                        uploaded = copy.bytes,
+                        "backed up straight to an extra place while the main one is offline"
+                    );
+                    self.save_extra(&t.id, |e| {
+                        // So the relay isn't asked for another one this period.
+                        if t.relay {
+                            e.delivered.push((copy.snapshot.clone(), time_ns));
+                        }
+                        e.last_copy = Some(copy);
+                        e.last_error = None;
+                    });
+                }
+                Err(e) => {
+                    let msg = format!("backing up here while the main place is offline: {e:#}");
+                    tracing::warn!(set = %self.env.set.name, place = t.id, "{msg}");
+                    self.save_extra(&t.id, |e| e.last_error = Some(msg));
+                }
+            }
+        }
+    }
+
+    /// Backs up straight to an extra place if it wants a new version now.
+    /// Returns what was stored and the new version's time.
+    async fn backup_to(
+        &mut self,
+        t: &crate::config::ExtraTarget,
+    ) -> Result<Option<(api::CopySummary, i64)>> {
+        let paths = self.env.set.paths.clone();
+        let policy = t.retention;
+        let progress = progress_reporter(&self.env);
+        self.with_extra(t.id.clone(), move |repo| {
+            let held = repo.snapshot_times()?;
+            let now_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as i64;
+            // Would a version taken now be one it keeps?
+            if policy
+                .to_copy(&[(SnapshotId([0; 32]), now_ns)], &held)
+                .is_empty()
+            {
+                return Ok(None);
+            }
+            let previous = held.iter().max_by_key(|(_, t)| *t).map(|(id, _)| *id);
+            let host = gethostname::gethostname().to_string_lossy().into_owned();
+            repo.set_progress(Some(progress));
+            let result = repo.backup_if_changed(&paths, &host, previous.as_ref());
+            repo.set_progress(None);
+            let (id, stats) = result?;
+            if Some(id) == previous {
+                return Ok(None);
+            }
+            Ok(Some((
+                api::CopySummary {
+                    time_unix: unix_now(),
+                    snapshot: id.to_hex(),
+                    snapshots: 1,
+                    bytes: stats.bytes_uploaded,
+                },
+                now_ns,
+            )))
+        })
+        .await
+    }
+
+    /// Copies to one extra place what it should have; `None` if nothing.
+    async fn copy_to(
+        &mut self,
+        t: &crate::config::ExtraTarget,
+    ) -> Result<Option<api::CopySummary>> {
+        let env = self.env.clone();
+        let cancel = self.cancel.clone();
+        let id = t.id.clone();
+        let policy = t.retention;
+        let events = self.env.events.clone();
+        let set = self.env.set.id.clone();
+        self.with_repo(move |main| {
+            let _span = tracing::debug_span!("copy", place = %id).entered();
+            let mut dest = env.open_place(Some(&id))?;
+            dest.set_cancel(Some(cancel));
+            let held = dest.snapshot_times()?;
+            let wanted = policy.to_copy(&main.snapshot_times()?, &held);
+            let Some(newest) = wanted.last().copied() else {
+                return Ok(None);
+            };
+            tracing::debug!(versions = wanted.len(), "copying versions");
+            let mut last = std::time::Instant::now() - Duration::from_secs(1);
+            let stats = main.copy_snapshots_to(&mut dest, &wanted, &mut |done, total| {
+                if done == 0 || done == total || last.elapsed() >= Duration::from_millis(250) {
+                    last = std::time::Instant::now();
+                    let _ = events.send(Event::CopyProgress {
+                        set: set.clone(),
+                        target: id.clone(),
+                        done,
+                        total,
+                    });
+                }
+            })?;
+            Ok(Some(api::CopySummary {
+                time_unix: unix_now(),
+                snapshot: newest.to_hex(),
+                snapshots: stats.snapshots,
+                bytes: stats.bytes,
+            }))
+        })
+        .await
     }
 
     fn save_maintenance(&self, update: impl FnOnce(&mut Maintenance)) {
@@ -528,12 +1294,12 @@ impl Worker {
         let now = unix_now();
         let mut heal = false;
         if now - last_prune >= PRUNE_INTERVAL_SECS
-            && let Err(e) = self.prune().await
+            && let Err(e) = self.prune(None).await
         {
             tracing::warn!(set = %self.env.set.name, "prune failed: {e:#}");
         }
         if now - last_verify >= VERIFY_INTERVAL_SECS {
-            match self.verify(VERIFY_BUDGET_BYTES).await {
+            match self.verify(VERIFY_BUDGET_BYTES, None).await {
                 Ok(v) => heal = !v.ok,
                 Err(e) => {
                     tracing::warn!(set = %self.env.set.name, "verification failed to run: {e:#}")
@@ -555,6 +1321,14 @@ async fn run(
     let rescan = Duration::from_secs(env.set.rescan_secs);
     let paused = env.set.paused;
     let host = env.host();
+    // Hosts of extra places: one coming back may have copies waiting.
+    let extra_hosts: Vec<String> = env
+        .set
+        .extra_targets
+        .iter()
+        .filter_map(|t| host_of(&t.target).map(|h| h.id))
+        .collect();
+    let mut extras_pending = false;
     let mut host_events = env.events.subscribe();
     let mut worker = Worker {
         env,
@@ -572,6 +1346,10 @@ async fn run(
     let mut first_change: Option<Instant> = None;
     let mut waiting_for_window = false;
     let mut waiting_for_host = false;
+    // While the relay has open orders, ask it now and then how they're going.
+    let mut forward_check = worker
+        .forwarding_open()
+        .then(|| Instant::now() + FORWARD_POLL);
 
     loop {
         set_state(
@@ -594,6 +1372,13 @@ async fn run(
             msg = rx.recv() => match msg {
                 None => return,
                 Some(Trigger::Changed) => {
+                    if change_deadline.is_none() {
+                        tracing::debug!(
+                            set = %worker.env.set.name,
+                            "files changed; backing up after {}s without further changes",
+                            debounce.as_secs()
+                        );
+                    }
                     let now = Instant::now();
                     let first = *first_change.get_or_insert(now);
                     change_deadline = Some((now + debounce).min(first + MAX_CHANGE_DELAY));
@@ -603,12 +1388,14 @@ async fn run(
                     waiters.push(reply);
                     true
                 }
-                Some(Trigger::Prune(reply)) => {
-                    let _ = reply.send(worker.prune().await.map_err(|e| format!("{e:#}")));
+                Some(Trigger::Prune(from, reply)) => {
+                    let _ = reply.send(worker.prune(from).await.map_err(|e| format!("{e:#}")));
                     false
                 }
-                Some(Trigger::Verify(max_bytes, reply)) => {
-                    let result = worker.verify(max_bytes).await;
+                Some(Trigger::Verify(max_bytes, from, reply)) => {
+                    let result = worker.verify(max_bytes, from).await;
+                    // Damaged data was removed; the next run puts it back
+                    // (backing up for the main place, copying for others).
                     if matches!(&result, Ok(v) if !v.ok) && !paused {
                         scheduled = Instant::now();
                     }
@@ -616,19 +1403,34 @@ async fn run(
                     false
                 }
             },
-            ev = host_events.recv(), if host.is_some() => {
+            ev = host_events.recv(), if host.is_some() || !extra_hosts.is_empty() => {
                 let id = host.as_ref().map(|h| h.id.as_str()).unwrap_or_default();
-                let back = match ev {
-                    Ok(Event::PeerOnline { id: peer, online }) => online && peer == id,
-                    // Missed events; it may have come back meanwhile.
-                    Err(broadcast::error::RecvError::Lagged(_)) => !worker.env.hosts.is_offline(id),
-                    _ => false,
+                let (back, extra_back) = match ev {
+                    Ok(Event::PeerOnline { id: peer, online }) => {
+                        (online && peer == id, online && extra_hosts.contains(&peer))
+                    }
+                    // Missed events; one may have come back meanwhile.
+                    Err(broadcast::error::RecvError::Lagged(_)) => (
+                        host.is_some() && !worker.env.hosts.is_offline(id),
+                        extra_hosts.iter().any(|h| !worker.env.hosts.is_offline(h)),
+                    ),
+                    _ => (false, false),
                 };
-                // Back up now rather than at the next retry.
+                // Back up (and copy) now rather than at the next retry.
                 if back && (waiting_for_host || failures > 0) && !paused {
                     waiting_for_host = false;
                     scheduled = Instant::now();
                 }
+                if extra_back && extras_pending && !paused && !waiting_for_host {
+                    scheduled = Instant::now();
+                }
+                false
+            }
+            _ = tokio::time::sleep_until(forward_check.unwrap_or(far)), if forward_check.is_some() => {
+                forward_check = worker
+                    .refresh_forwarding()
+                    .await
+                    .then(|| Instant::now() + FORWARD_POLL);
                 false
             }
             _ = tokio::time::sleep_until(next) => true,
@@ -644,6 +1446,11 @@ async fn run(
         {
             let wait = window.until_open();
             if !wait.is_zero() {
+                tracing::debug!(
+                    set = %worker.env.set.name,
+                    "outside the backup window {window}; waiting {}s for it to open",
+                    wait.as_secs()
+                );
                 waiting_for_window = true;
                 scheduled = Instant::now() + wait;
                 continue;
@@ -656,13 +1463,27 @@ async fn run(
             && let Some(h) = &host
             && worker.env.hosts.is_offline(&h.id)
         {
+            tracing::debug!(
+                set = %worker.env.set.name,
+                "the backup host is offline; waiting for it to come back"
+            );
             waiting_for_host = true;
             scheduled = Instant::now() + MAX_RETRY_DELAY;
+            if !paused && !worker.env.set.extra_targets.is_empty() {
+                worker.fallback_backup(false).await;
+            }
             continue;
         }
         waiting_for_host = false;
         set_state(&worker.env, &status, SetState::Running);
+        tracing::debug!(
+            set = %worker.env.set.name,
+            paths = ?worker.env.set.paths,
+            "backup started"
+        );
 
+        // Asked for by the user: copies go out even outside their windows.
+        let explicit = !waiters.is_empty();
         let result = worker.backup().await;
         match result {
             Ok(summary) => {
@@ -693,6 +1514,18 @@ async fn run(
                 for w in waiters.drain(..) {
                     let _ = w.send(Ok(summary.clone()));
                 }
+                if !worker.env.set.extra_targets.is_empty() {
+                    let outcome = worker.copy_to_extras(explicit).await;
+                    forward_check = worker
+                        .forwarding_open()
+                        .then(|| Instant::now() + FORWARD_POLL);
+                    extras_pending = outcome.pending;
+                    if let Some(wait) = outcome.wait
+                        && !paused
+                    {
+                        scheduled = scheduled.min(Instant::now() + wait);
+                    }
+                }
                 if worker.maintenance_if_due().await {
                     scheduled = Instant::now();
                 }
@@ -714,6 +1547,9 @@ async fn run(
                         scheduled = Instant::now() + MAX_RETRY_DELAY;
                         tracing::info!(set = %worker.env.set.name, "backup host is offline; waiting for it");
                         status.lock().unwrap().last_error = None;
+                    }
+                    if !worker.env.set.extra_targets.is_empty() && (!paused || explicit) {
+                        worker.fallback_backup(explicit).await;
                     }
                 } else if !paused {
                     failures += 1;

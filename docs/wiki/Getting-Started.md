@@ -47,9 +47,7 @@ Codes work once and expire after 7 days.
 2. Choose the folders to back up.
 3. Under **Where to keep the backup**, pick your friend.
 4. Leave **Old versions to keep** on **Recommended**.
-5. Choose a **recovery passphrase** (at least 8 characters) and write it
-   down somewhere safe.
-6. **Start backing up**.
+5. **Start backing up**.
 
 ```sh
 kinvault set create documents ~/Documents --peer their-name

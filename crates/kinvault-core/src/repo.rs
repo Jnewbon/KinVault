@@ -17,7 +17,9 @@ use crate::index::{CachedFile, Index};
 use crate::pack::{self, BlobKind, PackBuilder};
 use crate::snapshot::{self, Node, NodeKind, Snapshot, Tree};
 
+mod copy;
 mod maintenance;
+pub use copy::CopyStats;
 pub use maintenance::{MaintenanceProgress, MaintenanceStep, PruneStats, VerifyReport};
 
 const CHUNK_MIN: u32 = 256 * 1024;
@@ -27,14 +29,34 @@ const DEFAULT_PACK_TARGET: usize = 32 * 1024 * 1024;
 const PACK_CACHE_SLOTS: usize = 4;
 
 /// Running totals reported while a backup is in progress.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct BackupProgress {
+    /// Files looked at so far, and their size.
     pub files: u64,
     pub total_bytes: u64,
+    /// Bytes read from changed files, including the one being read.
     pub bytes_read: u64,
     pub bytes_uploaded: u64,
     /// Every file has been looked at: `files` and `total_bytes` are final.
     pub scanned: bool,
+    /// What the backup is doing right now.
+    pub step: BackupStep,
+    /// The file being checked or read.
+    pub file: Option<String>,
+    /// While reading a file: its size, and how much of it was read.
+    pub file_size: u64,
+    pub file_read: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum BackupStep {
+    /// Looking for changed files; unchanged ones are skipped quickly.
+    #[default]
+    Checking,
+    /// Reading, compressing and encrypting a changed file.
+    Reading,
+    /// Sending a pack of this many bytes, and waiting for it to be stored.
+    Sending { bytes: u64 },
 }
 
 pub type ProgressFn = Arc<dyn Fn(&BackupProgress) + Send + Sync>;
@@ -138,19 +160,36 @@ impl<B: Backend> Repository<B> {
     /// Reconciles the local index with the packs the backend actually holds.
     /// Only headers of packs we don't know yet are downloaded.
     pub fn sync_index(&mut self) -> Result<()> {
+        tracing::debug!("asking the backup for the packs it holds");
         let remote: HashSet<PackId> = self.backend.list_packs()?.into_iter().collect();
         let local = self.index.known_packs()?;
+        tracing::debug!(
+            held = remote.len(),
+            new = remote.difference(&local).count(),
+            gone = local.difference(&remote).count(),
+            "compared the backup's packs with the local index"
+        );
         for gone in local.difference(&remote) {
             self.index.remove_pack(gone)?;
         }
         for new in remote.difference(&local) {
+            tracing::debug!(pack = %short(new), "reading the contents list of a pack");
             let (len, mut tail) = self.backend.get_pack_tail(new, pack::HEADER_TAIL_GUESS)?;
-            let needed = pack::header_tail_len(&tail)?;
-            if needed > tail.len() as u64 {
-                (_, tail) = self.backend.get_pack_tail(new, needed)?;
+            let entries = pack::header_tail_len(&tail).and_then(|needed| {
+                if needed > tail.len() as u64 {
+                    (_, tail) = self.backend.get_pack_tail(new, needed)?;
+                }
+                pack::read_header_tail(&self.keys, len, &tail)
+            });
+            match entries {
+                Ok(entries) => self.index.add_pack(new, &entries)?,
+                // Not one of ours (e.g. left by a misbehaving relay): ignore
+                // it rather than stop working with the whole repository.
+                Err(e @ (Error::Decrypt | Error::Corrupt(_))) => {
+                    tracing::warn!(pack = %short(new), "ignoring a pack that isn't ours: {e}");
+                }
+                Err(e) => return Err(e),
             }
-            let entries = pack::read_header_tail(&self.keys, len, &tail)?;
-            self.index.add_pack(new, &entries)?;
         }
         Ok(())
     }
@@ -195,6 +234,7 @@ impl<B: Backend> Repository<B> {
             && old.paths == paths
             && old.hostname == hostname
         {
+            tracing::debug!(snapshot = %short(prev), "nothing changed since the last backup");
             return Ok((*prev, stats));
         }
 
@@ -211,6 +251,7 @@ impl<B: Backend> Repository<B> {
         };
         // Written last: a snapshot only becomes visible once all its data is stored.
         let (id, data) = snapshot::encode_snapshot(&self.keys, &snapshot)?;
+        tracing::debug!(snapshot = %short(&id), bytes = data.len(), "saving the snapshot");
         self.backend.put_snapshot(&id, &data)?;
         Ok((id, stats))
     }
@@ -221,11 +262,7 @@ impl<B: Backend> Repository<B> {
         &mut self,
         sources: &[PathBuf],
     ) -> Result<(ChunkId, Vec<String>, BackupStats)> {
-        let mut run = BackupRun {
-            repo: self,
-            writer: PackWriter::default(),
-            stats: BackupStats::default(),
-        };
+        let mut run = BackupRun::new(self);
 
         let mut nodes: Vec<Node> = Vec::new();
         let mut paths = Vec::new();
@@ -243,7 +280,9 @@ impl<B: Backend> Repository<B> {
         }
         nodes.sort_by(|a, b| a.name.cmp(&b.name));
         let root = run.store_tree(Tree { nodes })?;
+        run.file = None;
         run.flush()?;
+        run.step = BackupStep::Checking;
         run.report_progress(true);
         Ok((root, paths, run.stats))
     }
@@ -497,19 +536,26 @@ impl PackWriter {
         }
     }
 
+    /// Adds a blob. Returns true once its pack is full and should be sent
+    /// with [`Self::flush_kind`].
     fn add<B: Backend>(
         &mut self,
         repo: &mut Repository<B>,
         id: ChunkId,
         kind: BlobKind,
         plaintext: &[u8],
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let builder = self.builder(kind);
         builder.add(&repo.keys, id, kind, plaintext)?;
-        if builder.len() >= repo.pack_target {
-            self.flush_kind(repo, kind)?;
+        Ok(builder.len() >= repo.pack_target)
+    }
+
+    /// Bytes waiting in the pack of this kind.
+    fn pending(&self, kind: BlobKind) -> usize {
+        match kind {
+            BlobKind::Data => self.data.len(),
+            BlobKind::Tree => self.tree.len(),
         }
-        Ok(())
     }
 
     fn flush_kind<B: Backend>(&mut self, repo: &mut Repository<B>, kind: BlobKind) -> Result<()> {
@@ -518,7 +564,20 @@ impl PackWriter {
             return Ok(());
         }
         let finished = builder.finish(&repo.keys)?;
+        tracing::debug!(
+            pack = %short(&finished.id),
+            kind = ?kind,
+            bytes = finished.data.len(),
+            chunks = finished.entries.len(),
+            "sending a pack"
+        );
+        let started = std::time::Instant::now();
         repo.backend.put_pack(&finished.id, &finished.data)?;
+        tracing::debug!(
+            pack = %short(&finished.id),
+            took = ?started.elapsed(),
+            "pack stored"
+        );
         repo.index.add_pack(&finished.id, &finished.entries)?;
         // The pack is uploaded; make the index say so before going on.
         repo.index.commit_batch()?;
@@ -537,10 +596,60 @@ struct BackupRun<'a, B: Backend> {
     repo: &'a mut Repository<B>,
     writer: PackWriter,
     stats: BackupStats,
+    step: BackupStep,
+    /// The file being checked or read, kept only when progress is reported.
+    file: Option<String>,
+    /// Bytes read of the file being read that aren't in `stats` yet.
+    reading: u64,
+    /// The size of the file being checked or read, and how much of it was read.
+    file_size: u64,
+    file_read: u64,
 }
 
-impl<B: Backend> BackupRun<'_, B> {
+impl<'a, B: Backend> BackupRun<'a, B> {
+    fn new(repo: &'a mut Repository<B>) -> Self {
+        Self {
+            repo,
+            writer: PackWriter::default(),
+            stats: BackupStats::default(),
+            step: BackupStep::Checking,
+            file: None,
+            reading: 0,
+            file_size: 0,
+            file_read: 0,
+        }
+    }
+
+    /// Notes what the backup is doing, for progress reports.
+    fn now_at(&mut self, step: BackupStep, path: &Path, size: u64) {
+        self.step = step;
+        self.reading = 0;
+        self.file_size = size;
+        self.file_read = 0;
+        if self.repo.progress.is_some() {
+            self.file = Some(path.to_string_lossy().into_owned());
+        }
+    }
+
+    /// Sends the pack of this kind, telling progress while it goes.
+    fn send_pack(&mut self, kind: BlobKind) -> Result<()> {
+        let pending = self.writer.pending(kind);
+        if pending == 0 {
+            return Ok(());
+        }
+        let was = self.step;
+        self.step = BackupStep::Sending {
+            bytes: pending as u64,
+        };
+        self.report_progress(false);
+        self.writer.flush_kind(self.repo, kind)?;
+        self.step = was;
+        Ok(())
+    }
+
     fn warn(&mut self, path: &Path, err: impl std::fmt::Display) {
+        tracing::debug!("skipping {}: {err}", path.display());
+        self.reading = 0;
         self.stats
             .warnings
             .push(format!("{}: {err}", path.display()));
@@ -551,8 +660,11 @@ impl<B: Backend> BackupRun<'_, B> {
         if self.is_stored(&id)? {
             return Ok(id);
         }
-        self.writer.add(self.repo, id, kind, data)?;
+        let full = self.writer.add(self.repo, id, kind, data)?;
         self.stats.new_chunks += 1;
+        if full {
+            self.send_pack(kind)?;
+        }
         Ok(id)
     }
 
@@ -561,7 +673,8 @@ impl<B: Backend> BackupRun<'_, B> {
     }
 
     fn flush(&mut self) -> Result<()> {
-        self.writer.flush(self.repo)?;
+        self.send_pack(BlobKind::Data)?;
+        self.send_pack(BlobKind::Tree)?;
         self.stats.packs_uploaded = self.writer.packs;
         self.stats.bytes_uploaded = self.writer.bytes;
         Ok(())
@@ -572,9 +685,13 @@ impl<B: Backend> BackupRun<'_, B> {
             progress(&BackupProgress {
                 files: self.stats.files,
                 total_bytes: self.stats.total_bytes,
-                bytes_read: self.stats.bytes_read,
+                bytes_read: self.stats.bytes_read + self.reading,
                 bytes_uploaded: self.writer.bytes,
                 scanned,
+                step: self.step,
+                file: self.file.clone(),
+                file_size: self.file_size,
+                file_read: self.file_read,
             });
         }
     }
@@ -594,6 +711,7 @@ impl<B: Backend> BackupRun<'_, B> {
     ) -> Result<Option<Node>> {
         self.repo.check_cancelled()?;
         if self.repo.excludes.iter().any(|e| path.starts_with(e)) {
+            tracing::trace!("leaving out {}", path.display());
             return Ok(None);
         }
         // A listing's entry doesn't follow symlinks either. On Windows it
@@ -615,6 +733,10 @@ impl<B: Backend> BackupRun<'_, B> {
             self.repo.exclude_patterns.excludes_file(path)
         };
         if left_out {
+            tracing::trace!(
+                "leaving out {} (matches an exclude pattern)",
+                path.display()
+            );
             return Ok(None);
         }
         let kind = if ft.is_symlink() {
@@ -648,6 +770,7 @@ impl<B: Backend> BackupRun<'_, B> {
     }
 
     fn store_dir(&mut self, path: &Path) -> Result<ChunkId> {
+        tracing::trace!("scanning folder {}", path.display());
         self.stats.dirs += 1;
         let mut entries: Vec<fs::DirEntry> = match fs::read_dir(path) {
             Ok(rd) => rd.filter_map(|e| e.ok()).collect(),
@@ -680,6 +803,8 @@ impl<B: Backend> BackupRun<'_, B> {
                 .iter()
                 .try_fold(true, |ok, c| Ok::<_, Error>(ok && self.is_stored(c)?))?
         {
+            tracing::trace!("unchanged: {}", path.display());
+            self.now_at(BackupStep::Checking, path, size);
             self.stats.files += 1;
             self.stats.total_bytes += size;
             self.report_progress(false);
@@ -689,6 +814,7 @@ impl<B: Backend> BackupRun<'_, B> {
             }));
         }
 
+        tracing::debug!(bytes = size, "reading {}", path.display());
         match fs::File::open(path) {
             Ok(file) => self.store_contents(path, file, size, mtime, inode),
             Err(e) => {
@@ -709,6 +835,7 @@ impl<B: Backend> BackupRun<'_, B> {
         mtime: i64,
         inode: u64,
     ) -> Result<Option<NodeKind>> {
+        self.now_at(BackupStep::Reading, path, size);
         let mut head = Vec::new();
         if let Err(e) = (&mut reader)
             .take(CHUNK_MIN as u64 + 1)
@@ -728,6 +855,8 @@ impl<B: Backend> BackupRun<'_, B> {
                 chunks.push(self.store_blob(BlobKind::Data, &head)?);
             }
         } else {
+            // A large file: say which one, and how far it got as it goes.
+            self.report_progress(false);
             let rest = io::Cursor::new(head).chain(reader);
             for chunk in StreamCDC::new(rest, CHUNK_MIN, CHUNK_AVG, CHUNK_MAX) {
                 let chunk = match chunk {
@@ -740,8 +869,13 @@ impl<B: Backend> BackupRun<'_, B> {
                 self.repo.check_cancelled()?;
                 read += chunk.length as u64;
                 chunks.push(self.store_blob(BlobKind::Data, &chunk.data)?);
+                self.reading = read;
+                self.file_read = read;
+                self.report_progress(false);
             }
         }
+        self.reading = 0;
+        self.file_read = read;
         self.stats.files += 1;
         self.stats.files_changed += 1;
         self.stats.bytes_read += read;
@@ -760,6 +894,13 @@ impl<B: Backend> BackupRun<'_, B> {
         )?;
         Ok(Some(NodeKind::File { size: read, chunks }))
     }
+}
+
+/// The start of an id, enough to tell ids apart in logs.
+fn short(id: &impl std::fmt::Display) -> String {
+    let mut s = id.to_string();
+    s.truncate(12);
+    s
 }
 
 /// Name of a source in the snapshot root: its absolute path without the
@@ -903,11 +1044,7 @@ mod tests {
             &MasterKey::generate().unwrap(),
             Index::open_in_memory().unwrap(),
         );
-        let mut run = BackupRun {
-            repo: &mut repo,
-            writer: PackWriter::default(),
-            stats: BackupStats::default(),
-        };
+        let mut run = BackupRun::new(&mut repo);
         // Fails within the first chunk, then after it.
         for left in [10, CHUNK_MIN as usize + 100_000] {
             let stored = run

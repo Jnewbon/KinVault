@@ -59,6 +59,10 @@ pub struct StoppedSet {
 pub struct PendingDeletion {
     pub set_id: String,
     pub set_name: String,
+    /// Which of the set's places this is: `None` for the main one, else an
+    /// [`ExtraTarget`]'s id.
+    #[serde(default)]
+    pub target_id: Option<String>,
     pub target: StoredTarget,
     pub requested_unix: i64,
     #[serde(default)]
@@ -126,6 +130,50 @@ pub struct SetConfig {
     /// Files and folders to leave out; see [`kinvault_core::Excludes`].
     #[serde(default)]
     pub excludes: Vec<String>,
+    /// Encrypted with the instance's shared key rather than one of its own.
+    /// Sets made before keys could be shared each have their own.
+    #[serde(default)]
+    pub shared_key: bool,
+    /// More places that keep copies of the set's backups, each with its own
+    /// retention and limits. `target` above is the main one: backups go
+    /// there, and the others get copies of the versions they keep.
+    #[serde(default)]
+    pub extra_targets: Vec<ExtraTarget>,
+}
+
+impl SetConfig {
+    pub fn extra_target(&self, key: &str) -> Option<&ExtraTarget> {
+        self.extra_targets.iter().find(|t| t.id == key)
+    }
+
+    /// Every place the set's backups are kept: the main one (`None`), then
+    /// the extra ones by id.
+    pub fn all_targets(&self) -> impl Iterator<Item = (Option<&str>, &StoredTarget)> {
+        std::iter::once((None, &self.target)).chain(
+            self.extra_targets
+                .iter()
+                .map(|t| (Some(t.id.as_str()), &t.target)),
+        )
+    }
+}
+
+/// Another place a set's backups are copied to.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ExtraTarget {
+    /// Short random id, unique within the set.
+    pub id: String,
+    pub target: StoredTarget,
+    #[serde(default = "api::RetentionPolicy::recommended")]
+    pub retention: api::RetentionPolicy,
+    #[serde(default)]
+    pub upload_limit: Option<u64>,
+    /// Only copy automatically inside this daily window (local time).
+    #[serde(default)]
+    pub window: Option<api::TimeWindow>,
+    /// Copies go through the main place's host, which forwards them on its
+    /// own (even while this computer is off), instead of from here.
+    #[serde(default)]
+    pub relay: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

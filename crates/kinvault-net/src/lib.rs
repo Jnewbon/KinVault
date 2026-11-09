@@ -25,8 +25,8 @@ pub use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 pub use limits::{RateLimiter, TimeWindow};
 pub use protocol::Offer;
 pub use receiver::{
-    Grant, InviteAccepted, InviteHandler, InviteRedemption, PairHandler, PairRequest, PeerUsage,
-    REPO_DELETE_DELAY, Receiver,
+    ForwardQueue, Grant, InviteAccepted, InviteHandler, InviteRedemption, PairHandler, PairRequest,
+    PeerUsage, REPO_DELETE_DELAY, Receiver,
 };
 pub use ticket::InviteTicket;
 

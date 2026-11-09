@@ -11,14 +11,10 @@ In the app: **Backups → New backup**. On the command line:
 kinvault set create <name> <paths>… (--peer <peer> | --local <folder>) [options]
 ```
 
-Each backup asks for a **recovery passphrase** (at least 8 characters).
-KinVault keeps a second, passphrase-protected copy of the backup's key
-(`keyfile.json` in the state folder) alongside the key it uses day to day.
-Write the passphrase down. It's separate from the [[Recovery Kit]]
-passphrase.
-
-A new backup isn't in recovery kits you made before it, so export a new kit
-after creating one.
+A backup's key is kept in the state folder. To restore on another machine
+you need a [[Recovery Kit]], which holds every backup's key under one
+passphrase. A new backup isn't in recovery kits you made before it, so
+export a new kit after creating one.
 
 The first backup starts immediately.
 
@@ -73,6 +69,7 @@ This runs even outside the backup's hours (below) and waits until it's done.
 | Backing up | A backup is running |
 | Cleaning up | Removing old versions it no longer keeps; shows how far it got and roughly how long is left |
 | Checking | Checking the stored backups are complete and intact; shows progress the same way |
+| Copying | Copying new versions to the backup's other places (see below) |
 | Waiting for its hours | Changes are waiting for the backup's time window |
 | Waiting for destination | The computer it backs up to is offline; it backs up when it's back |
 | Not backed up yet | No backup has finished yet |
@@ -142,6 +139,81 @@ kinvault set retention documents --keep-all
 
 New rules apply at the next clean-up. To clean up now: **Clean up old
 versions** in the app, or `kinvault prune <set>`.
+
+## Keeping copies in more places
+
+A backup can keep copies in more than one place, each with its own keep
+rules. For example, a home server can keep every version while a friend's
+computer keeps one a day, then one a week and one a month.
+
+In the app: **Also keep copies in…** on the backup, then pick the place and
+which versions to keep there. On the command line:
+
+```sh
+kinvault set place add documents --peer friend --keep-daily 14 --keep-weekly 8 --keep-monthly 12
+```
+
+How it works:
+
+- Backups go to the backup's main place, as before. After each one, every
+  other place gets the versions it keeps but doesn't have yet. The data is
+  copied exactly as it is: encrypted, with the same key.
+- A new place starts with the versions its rules keep. After that, it gets
+  the **first** new version of each hour, day, week, month or year it keeps,
+  as soon as that version exists. With a "latest N" rule (like
+  **Recommended**), it gets every new version.
+- Each place cleans up with its own rules, and is checked about once a week.
+- Each place has its own upload speed limit and hours. A place whose
+  computer is offline catches up when it's back.
+- You can restore from any of them: pick it under **Restore from** (or use
+  `--from <place>` on the command line).
+- Copies are made from the main place, so give the main place the most
+  history (for example your home server), and make it one that's quick to
+  reach.
+
+Removing a place (**Remove…**, or `kinvault set place remove`) erases what
+it holds a week later, like deleting a backup. The backup's other places
+aren't affected.
+
+### Sending copies through the main place
+
+When the main place is another computer (say your home server) and so is
+the extra place (say a friend's), the copies can go through the home server
+instead of from your computer: tick **Send copies through …** (or add
+`--relay` to `set place add`). Then:
+
+- After each backup, your computer tells the home server which versions to
+  send and which packs they need. The home server sends them on its own, in
+  the place's hours and at its speed limit, even while your computer is off,
+  and retries while the other place is offline. Your own upload is only
+  used once, for the home server.
+- The other place stores them as your backup, counted against what it lets
+  *you* store. It doesn't need to know the home server.
+- The home server can't read anything it forwards, and you give it
+  permission only to *add* to that place, for 60 days at a time (renewed
+  with each new order): it can't list, read or delete what's there.
+- Your computer learns what was delivered the next time it backs up.
+  The place's line on the backup shows what's still on its way, and why
+  it's waiting if it is.
+- Cleaning up: when your computer can reach that place, it cleans up there
+  itself, as usual. When it can't, it works out which versions the place no
+  longer keeps and which packs only they used, signs a list of exactly
+  those, and the home server passes it on with the next copies. The place
+  checks your signature on the list itself, so the home server still can't
+  delete anything of its own accord. Mostly-unused packs can't be rewritten
+  this way, so this frees a little less space than cleaning up directly.
+- Checking that place's backups still needs your computer to reach it.
+
+Both the home server and the other place need this version of KinVault.
+
+### When the main place is offline
+
+If the backup's main place can't be reached, your computer backs up straight
+to each of its other places that would keep a new version now, by their own
+rules, hours and limits. With a "one a day" place, for example, the first
+backup of the day goes there directly. So a home server that's switched off
+doesn't leave your off-site copy behind. Those versions aren't on the main
+place; it carries on from the next backup once it's back.
 
 ## Upload speed and hours
 

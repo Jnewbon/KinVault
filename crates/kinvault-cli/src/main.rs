@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use kinvault_daemon::api::{
-    CreateInvite, CreateSet, GrantSpec, HostAddr, NetworkInfo, NetworkSettings, Reply, Request,
-    RetentionPolicy, SetState, Target, TimeWindow,
+    BackupStep, CreateInvite, CreateSet, GrantSpec, HostAddr, NetworkInfo, NetworkSettings, Reply,
+    Request, RetentionPolicy, SetState, Target, TimeWindow,
 };
 use kinvault_daemon::ipc::Client;
 
@@ -43,7 +43,13 @@ enum Command {
     /// Back up a set now (even outside its time window) and wait for it.
     Backup { set: String },
     /// List a set's snapshots.
-    Snapshots { set: String },
+    Snapshots {
+        set: String,
+        /// Use one of the set's extra places (its host's name, folder or
+        /// id) instead of the main one.
+        #[arg(long)]
+        from: Option<String>,
+    },
     /// Restore a snapshot (id prefix or "latest") into a target directory.
     Restore {
         set: String,
@@ -52,11 +58,27 @@ enum Command {
         /// Only restore this path (as stored in the snapshot, e.g. home/me/Documents).
         #[arg(long)]
         include: Option<String>,
+        /// Use one of the set's extra places (its host's name, folder or
+        /// id) instead of the main one.
+        #[arg(long)]
+        from: Option<String>,
     },
     /// Show how much space a set uses on the host it backs up to.
-    Usage { set: String },
+    Usage {
+        set: String,
+        /// Use one of the set's extra places (its host's name, folder or
+        /// id) instead of the main one.
+        #[arg(long)]
+        from: Option<String>,
+    },
     /// Remove snapshots the set's retention policy doesn't keep, freeing space.
-    Prune { set: String },
+    Prune {
+        set: String,
+        /// Use one of the set's extra places (its host's name, folder or
+        /// id) instead of the main one.
+        #[arg(long)]
+        from: Option<String>,
+    },
     /// Check that a set's backups are complete and can be decrypted.
     Verify {
         set: String,
@@ -66,6 +88,10 @@ enum Command {
         /// Download and check everything.
         #[arg(long)]
         full: bool,
+        /// Use one of the set's extra places (its host's name, folder or
+        /// id) instead of the main one.
+        #[arg(long)]
+        from: Option<String>,
     },
     /// Show live activity until interrupted.
     Watch,
@@ -132,6 +158,10 @@ enum SetCommand {
         /// patterns so the shell doesn't expand them. See `set exclude`.
         #[arg(long = "exclude", value_name = "PATTERN")]
         excludes: Vec<String>,
+        /// Encrypt with a key of its own instead of the key your other sets
+        /// share.
+        #[arg(long)]
+        own_key: bool,
     },
     /// Show or change the files and folders a set leaves out. Changes apply
     /// from the next backup; earlier versions keep what they hold until
@@ -179,6 +209,59 @@ enum SetCommand {
         #[arg(long)]
         yes: bool,
     },
+    /// Keep copies of a set's backups in more places, each with its own
+    /// retention, e.g. every version on a home server and a few on a
+    /// friend's. After each backup, each place gets the versions it keeps.
+    #[command(subcommand)]
+    Place(PlaceCommand),
+}
+
+#[derive(Subcommand)]
+enum PlaceCommand {
+    /// Copy a set's backups to another place too. It starts with the
+    /// versions its retention keeps, then gets the first new version of each
+    /// hour, day, week... it keeps (or every one with --keep-last).
+    Add {
+        set: String,
+        /// A local directory (external disk, NAS mount).
+        #[arg(long, conflicts_with = "peer", required_unless_present = "peer")]
+        local: Option<PathBuf>,
+        /// Another instance: a peer's name or id.
+        #[arg(long)]
+        peer: Option<String>,
+        /// Known direct address of the peer (optional).
+        #[arg(long, requires = "peer")]
+        peer_addr: Vec<SocketAddr>,
+        /// Which versions it keeps (default: the recommended set).
+        #[command(flatten)]
+        retention: RetentionArgs,
+        /// Upload limit and time window for copying there.
+        #[command(flatten)]
+        limits: SetLimits,
+        /// Send copies through the main place's host, which forwards them
+        /// on its own, even while this computer is off. Both must be peers.
+        #[arg(long, requires = "peer")]
+        relay: bool,
+    },
+    /// Change an extra place's retention (kept if no --keep-* option is
+    /// given), upload limit and time window (omitted ones are cleared).
+    Change {
+        set: String,
+        /// The place: its host's name, its folder, or its id.
+        place: String,
+        #[command(flatten)]
+        retention: RetentionArgs,
+        #[command(flatten)]
+        limits: SetLimits,
+        /// Send copies through the main place's host from now on.
+        #[arg(long, conflicts_with = "direct")]
+        relay: bool,
+        /// Send copies from this computer from now on.
+        #[arg(long)]
+        direct: bool,
+    },
+    /// Stop copying to a place. What it holds is erased a week later.
+    Remove { set: String, place: String },
 }
 
 #[derive(Subcommand)]
@@ -451,22 +534,6 @@ fn format_unix(secs: i64) -> String {
     format_time(secs * 1_000_000_000)
 }
 
-fn recovery_passphrase() -> Result<String> {
-    if let Ok(p) = std::env::var(PASSPHRASE_ENV) {
-        return Ok(p);
-    }
-    println!("Choose a recovery passphrase. With it and the set's recovery file you can");
-    println!("restore on a new machine; without both, the backups can't be decrypted.");
-    let p = rpassword::prompt_password("Recovery passphrase: ")?;
-    if p.chars().count() < 8 {
-        bail!("passphrase must be at least 8 characters");
-    }
-    if rpassword::prompt_password("Repeat passphrase: ")? != p {
-        bail!("passphrases do not match");
-    }
-    Ok(p)
-}
-
 fn parse_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
     let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
@@ -633,6 +700,7 @@ async fn main() -> Result<()> {
                     SetState::Running => "backing up",
                     SetState::Pruning => "cleaning up old versions",
                     SetState::Verifying => "checking its backups",
+                    SetState::Copying => "copying versions to its other places",
                 };
                 let online = match set.target_online {
                     Some(true) => " (online)",
@@ -668,6 +736,9 @@ async fn main() -> Result<()> {
                     println!("  last error: {e}");
                 }
                 println!("  keeps {}", set.retention);
+                if set.own_key {
+                    println!("  has its own encryption key");
+                }
                 if !set.excludes.is_empty() {
                     println!("  leaves out {}", set.excludes.join(", "));
                 }
@@ -691,6 +762,64 @@ async fn main() -> Result<()> {
                         result,
                         format_bytes(v.bytes_checked)
                     );
+                }
+                for t in set.extra_targets {
+                    let online = match t.online {
+                        Some(true) => " (online)",
+                        Some(false) => " (offline)",
+                        None => "",
+                    };
+                    println!(
+                        "  also copied to {}{online} [{}], keeps {}",
+                        describe_target(&t.target),
+                        t.id,
+                        t.retention
+                    );
+                    if let Some(l) = t.upload_limit {
+                        println!("    upload limit {}/s", format_bytes(l));
+                    }
+                    if let Some(w) = t.window {
+                        println!("    copies automatically during {w}");
+                    }
+                    match t.last_copy {
+                        Some(c) => println!(
+                            "    last copy {}: {} version(s), {} sent",
+                            format_unix(c.time_unix),
+                            c.snapshots,
+                            format_bytes(c.bytes)
+                        ),
+                        None => println!("    nothing copied yet"),
+                    }
+                    if t.relay {
+                        println!("    copies go through the main place's host");
+                    }
+                    if let Some(p) = t.last_prune {
+                        println!(
+                            "    last clean-up {}: removed {} version(s), {} pack(s)",
+                            format_unix(p.time_unix),
+                            p.snapshots_removed,
+                            p.packs_deleted
+                        );
+                    }
+                    if let Some(v) = t.last_verify {
+                        println!(
+                            "    last check {}: {}",
+                            format_unix(v.time_unix),
+                            if v.ok { "ok" } else { "PROBLEMS" }
+                        );
+                    }
+                    if let Some(f) = t.forwarding {
+                        println!(
+                            "    being forwarded: {} of {} pack(s) sent ({}){}",
+                            f.packs_sent,
+                            f.packs_total,
+                            format_bytes(f.bytes_sent),
+                            f.note.map(|n| format!("; {n}")).unwrap_or_default()
+                        );
+                    }
+                    if let Some(e) = t.last_error {
+                        println!("    last error: {e}");
+                    }
                 }
             }
             for set in s.stopped_sets {
@@ -739,6 +868,7 @@ async fn main() -> Result<()> {
             debounce,
             limits,
             excludes,
+            own_key,
         }) => {
             let target = match (local, peer) {
                 (Some(path), _) => Target::Local { path },
@@ -752,13 +882,13 @@ async fn main() -> Result<()> {
                 name: name.clone(),
                 paths,
                 target,
-                recovery_passphrase: recovery_passphrase()?,
                 debounce_secs: debounce,
                 rescan_secs: None,
                 upload_limit: limits.upload_limit,
                 window: limits.window,
                 retention: retention.policy(),
                 excludes,
+                own_key,
             });
             let Reply::SetCreated { id } = client.call(&req).await? else {
                 bail!("unexpected reply")
@@ -815,6 +945,77 @@ async fn main() -> Result<()> {
             client.call(&Request::SetRetention { set, policy }).await?;
             println!("Retention set to: {policy}.");
         }
+        Command::Set(SetCommand::Place(PlaceCommand::Add {
+            set,
+            local,
+            peer,
+            peer_addr,
+            retention,
+            limits,
+            relay,
+        })) => {
+            let target = match (local, peer) {
+                (Some(path), _) => Target::Local { path },
+                (None, Some(id)) => Target::Peer {
+                    id,
+                    addrs: peer_addr,
+                },
+                (None, None) => unreachable!("clap requires --local or --peer"),
+            };
+            let req = Request::AddSetTarget {
+                set,
+                target,
+                retention: retention.policy(),
+                upload_limit: limits.upload_limit,
+                window: limits.window,
+                relay,
+            };
+            let Reply::TargetAdded { id } = client.call(&req).await? else {
+                bail!("unexpected reply")
+            };
+            println!("Added place {id}. Copies go there after the next backup.");
+        }
+        Command::Set(SetCommand::Place(PlaceCommand::Change {
+            set,
+            place,
+            retention,
+            limits,
+            relay,
+            direct,
+        })) => {
+            let retention = match retention.policy() {
+                Some(p) => p,
+                None => {
+                    let Reply::Status(status) = client.call(&Request::Status).await? else {
+                        bail!("unexpected reply")
+                    };
+                    status
+                        .sets
+                        .iter()
+                        .filter(|s| s.name == set || s.id == set)
+                        .flat_map(|s| &s.extra_targets)
+                        .find(|t| t.id == place || describe_target(&t.target).contains(&place))
+                        .map(|t| t.retention)
+                        .context("no such place; see `kinvault status`")?
+                }
+            };
+            let req = Request::UpdateSetTarget {
+                set,
+                target: place,
+                retention,
+                upload_limit: limits.upload_limit,
+                window: limits.window,
+                relay: (relay || direct).then_some(relay),
+            };
+            client.call(&req).await?;
+            println!("Saved. It keeps {retention}.");
+        }
+        Command::Set(SetCommand::Place(PlaceCommand::Remove { set, place })) => {
+            client
+                .call(&Request::RemoveSetTarget { set, target: place })
+                .await?;
+            println!("Removed. What it holds is erased a week from now.");
+        }
         Command::Set(SetCommand::Pause { set }) => {
             client.call(&Request::PauseSet { set }).await?;
             println!("Paused.");
@@ -824,8 +1025,8 @@ async fn main() -> Result<()> {
             client.call(&Request::ResumeSet { set, paths }).await?;
             println!("Resumed; a backup is starting.");
         }
-        Command::Prune { set } => {
-            let Reply::Pruned(p) = client.call(&Request::Prune { set }).await? else {
+        Command::Prune { set, from } => {
+            let Reply::Pruned(p) = client.call(&Request::Prune { set, from }).await? else {
                 bail!("unexpected reply")
             };
             println!(
@@ -842,9 +1043,19 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        Command::Verify { set, max, full } => {
+        Command::Verify {
+            set,
+            max,
+            full,
+            from,
+        } => {
             let max_bytes = if full { Some(u64::MAX) } else { max };
-            let Reply::Verified(v) = client.call(&Request::Verify { set, max_bytes }).await? else {
+            let req = Request::Verify {
+                set,
+                max_bytes,
+                from,
+            };
+            let Reply::Verified(v) = client.call(&req).await? else {
                 bail!("unexpected reply")
             };
             println!(
@@ -865,7 +1076,7 @@ async fn main() -> Result<()> {
                 println!("All good.");
             } else {
                 println!(
-                    "Damaged data was removed; the next backup re-uploads whatever still exists here."
+                    "Damaged data was removed; the next backup puts back whatever still exists."
                 );
                 std::process::exit(1);
             }
@@ -906,14 +1117,34 @@ async fn main() -> Result<()> {
                         set,
                         files,
                         total_bytes,
+                        bytes_read,
                         bytes_uploaded,
-                        ..
-                    } => println!(
-                        "{}: {files} files scanned ({}), uploaded {}",
-                        name(&set),
-                        format_bytes(total_bytes),
-                        format_bytes(bytes_uploaded)
-                    ),
+                        step,
+                        file,
+                        sending_bytes,
+                        file_size,
+                        file_read,
+                    } => {
+                        let doing = match (step, file) {
+                            (BackupStep::Sending, _) => {
+                                format!("sending {}", format_bytes(sending_bytes))
+                            }
+                            (BackupStep::Reading, Some(f)) => format!(
+                                "reading {f} ({} of {})",
+                                format_bytes(file_read),
+                                format_bytes(file_size)
+                            ),
+                            (_, Some(f)) => format!("checking {f}"),
+                            (_, None) => "checking".to_string(),
+                        };
+                        println!(
+                            "{}: {doing}; {files} files ({}) looked at, {} read, {} uploaded",
+                            name(&set),
+                            format_bytes(total_bytes),
+                            format_bytes(bytes_read),
+                            format_bytes(bytes_uploaded)
+                        )
+                    }
                     Event::MaintenanceProgress {
                         set,
                         step,
@@ -948,6 +1179,17 @@ async fn main() -> Result<()> {
                     Event::BackupFailed { set, error } => {
                         println!("{}: backup failed: {error}", name(&set))
                     }
+                    Event::CopyProgress {
+                        set,
+                        target,
+                        done,
+                        total,
+                    } => println!(
+                        "{}: copying to place {target}: {} of {}",
+                        name(&set),
+                        format_bytes(done),
+                        format_bytes(total)
+                    ),
                     Event::SetsChanged => println!("(backup sets changed)"),
                     Event::PeersChanged => println!("(peers changed)"),
                     Event::NetworkChanged => println!("(network settings changed)"),
@@ -1058,8 +1300,9 @@ async fn main() -> Result<()> {
                 format_bytes(b.bytes_uploaded)
             );
         }
-        Command::Snapshots { set } => {
-            let Reply::Snapshots(snaps) = client.call(&Request::ListSnapshots { set }).await?
+        Command::Snapshots { set, from } => {
+            let Reply::Snapshots(snaps) =
+                client.call(&Request::ListSnapshots { set, from }).await?
             else {
                 bail!("unexpected reply")
             };
@@ -1079,6 +1322,7 @@ async fn main() -> Result<()> {
             snapshot,
             target,
             include,
+            from,
         } => {
             let shown = target.clone();
             let req = Request::Restore {
@@ -1086,6 +1330,7 @@ async fn main() -> Result<()> {
                 snapshot,
                 target,
                 include,
+                from,
             };
             let Reply::Restored(r) = client.call(&req).await? else {
                 bail!("unexpected reply")
@@ -1099,11 +1344,11 @@ async fn main() -> Result<()> {
                 shown.display()
             );
         }
-        Command::Usage { set } => {
+        Command::Usage { set, from } => {
             let Reply::Usage {
                 used_bytes,
                 quota_bytes,
-            } = client.call(&Request::RemoteUsage { set }).await?
+            } = client.call(&Request::RemoteUsage { set, from }).await?
             else {
                 bail!("unexpected reply")
             };

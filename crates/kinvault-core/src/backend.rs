@@ -85,6 +85,11 @@ impl LocalDirBackend {
         &self.root
     }
 
+    /// Whether the pack is stored (without reading it).
+    pub fn has_pack(&self, id: &PackId) -> bool {
+        self.pack_path(id).is_file()
+    }
+
     fn pack_path(&self, id: &PackId) -> PathBuf {
         let hex = id.to_hex();
         self.root.join("packs").join(&hex[..2]).join(hex)

@@ -17,6 +17,10 @@ struct Args {
     /// (e.g. to match a container's published port).
     #[arg(long, env = "KINVAULT_LISTEN_PORT", value_parser = clap::value_parser!(u16).range(1..))]
     listen_port: Option<u16>,
+    /// Log more: -v for KinVault's debug output, -vv for everything.
+    /// Overrides RUST_LOG.
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
     /// Serve the web interface on this address, e.g. 0.0.0.0:8080.
     #[cfg(feature = "web")]
     #[arg(long, env = "KINVAULT_WEB")]
@@ -25,13 +29,15 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,iroh=error".into()),
-        )
-        .init();
     let args = Args::parse();
+    tracing_subscriber::fmt()
+        .with_env_filter(log_filter(args.verbose))
+        .init();
+    match args.verbose {
+        0 => {}
+        1 => tracing::info!("verbose logging on: debug messages from KinVault"),
+        _ => tracing::info!("very verbose logging on: debug messages from everything"),
+    }
     let state_dir = match args.state {
         Some(d) => d,
         None => {
@@ -120,4 +126,23 @@ async fn shutdown_signal() {
     }
     #[cfg(not(unix))]
     let _ = tokio::signal::ctrl_c().await;
+}
+
+/// What to log: `-v` and `-vv` win over `RUST_LOG`, which wins over the
+/// default of KinVault's info messages and only errors from the network
+/// library.
+fn log_filter(verbose: u8) -> tracing_subscriber::EnvFilter {
+    const OURS: [&str; 4] = [
+        "kinvaultd",
+        "kinvault_daemon",
+        "kinvault_core",
+        "kinvault_net",
+    ];
+    let ours = |level: &str| OURS.map(|c| format!("{c}={level}")).join(",");
+    match verbose {
+        0 => tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "info,iroh=error".into()),
+        1 => format!("info,iroh=warn,{}", ours("debug")).into(),
+        _ => format!("debug,{}", ours("trace")).into(),
+    }
 }

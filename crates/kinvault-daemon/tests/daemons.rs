@@ -117,13 +117,13 @@ async fn daemon_backs_up_changes_to_peer() {
                 id: host.id().to_string(),
                 addrs: vec![host_addr],
             },
-            recovery_passphrase: "a long recovery phrase".into(),
             debounce_secs: Some(1),
             rescan_secs: None,
             upload_limit: None,
             window: None,
             retention: None,
             excludes: Vec::new(),
+            own_key: false,
         }),
     )
     .await;
@@ -169,7 +169,14 @@ async fn daemon_backs_up_changes_to_peer() {
         .unwrap_err();
     assert!(err.to_string().contains("no backup set"), "{err}");
 
-    let Reply::Snapshots(snaps) = call(&pc, Request::ListSnapshots { set: "docs".into() }).await
+    let Reply::Snapshots(snaps) = call(
+        &pc,
+        Request::ListSnapshots {
+            set: "docs".into(),
+            from: None,
+        },
+    )
+    .await
     else {
         panic!()
     };
@@ -183,6 +190,7 @@ async fn daemon_backs_up_changes_to_peer() {
             snapshot: "latest".into(),
             target: out.clone(),
             include: None,
+            from: None,
         },
     )
     .await;
@@ -203,7 +211,14 @@ async fn daemon_backs_up_changes_to_peer() {
     let Reply::Usage {
         used_bytes,
         quota_bytes,
-    } = call(&pc, Request::RemoteUsage { set: "docs".into() }).await
+    } = call(
+        &pc,
+        Request::RemoteUsage {
+            set: "docs".into(),
+            from: None,
+        },
+    )
+    .await
     else {
         panic!()
     };
@@ -398,13 +413,13 @@ async fn friends_pair_with_an_invite_and_back_up_to_each_other() {
                 id: "alice-nas".into(),
                 addrs: vec![],
             },
-            recovery_passphrase: "bobs recovery phrase".into(),
             debounce_secs: Some(1),
             rescan_secs: None,
             upload_limit: Some(10_000_000),
             window: None,
             retention: None,
             excludes: Vec::new(),
+            own_key: false,
         }),
     )
     .await;
@@ -436,13 +451,13 @@ async fn friends_pair_with_an_invite_and_back_up_to_each_other() {
                 id: "bob".into(),
                 addrs: bob.endpoint().bound_sockets(),
             },
-            recovery_passphrase: "alices recovery phrase".into(),
             debounce_secs: Some(1),
             rescan_secs: None,
             upload_limit: None,
             window: Some(closed),
             retention: None,
             excludes: Vec::new(),
+            own_key: false,
         }),
     )
     .await;
@@ -556,13 +571,13 @@ async fn recovery_kit_restores_backups_on_a_new_machine() {
                 id: host.id().to_string(),
                 addrs: host.endpoint().bound_sockets(),
             },
-            recovery_passphrase: "set recovery phrase".into(),
             debounce_secs: Some(60),
             rescan_secs: None,
             upload_limit: None,
             window: None,
             retention: None,
             excludes: Vec::new(),
+            own_key: false,
         }),
     )
     .await;
@@ -577,6 +592,7 @@ async fn recovery_kit_restores_backups_on_a_new_machine() {
         Request::Verify {
             set: "docs".into(),
             max_bytes: None,
+            from: None,
         },
     )
     .await
@@ -595,7 +611,15 @@ async fn recovery_kit_restores_backups_on_a_new_machine() {
         },
     )
     .await;
-    let Reply::Pruned(p) = call(&pc, Request::Prune { set: "docs".into() }).await else {
+    let Reply::Pruned(p) = call(
+        &pc,
+        Request::Prune {
+            set: "docs".into(),
+            from: None,
+        },
+    )
+    .await
+    else {
         panic!()
     };
     assert_eq!((p.snapshots_kept, p.snapshots_removed), (1, 1));
@@ -628,6 +652,11 @@ async fn recovery_kit_restores_backups_on_a_new_machine() {
     assert_eq!(summary.sets, vec!["docs".to_string()]);
     assert_eq!(summary.instance_id, pc_id.to_string());
     assert!(recovery::import_offline(&new_state, &json, "kit passphrase!", false).is_err());
+    // New sets on the new machine keep sharing the key.
+    assert_eq!(
+        fs::read_to_string(new_state.join("shared.key")).unwrap(),
+        fs::read_to_string(old_state.join("shared.key")).unwrap()
+    );
 
     // It comes back with the old identity, so the host recognises it.
     let secret = kinvault_net::load_or_create_secret(&new_state.join("identity.key")).unwrap();
@@ -649,6 +678,7 @@ async fn recovery_kit_restores_backups_on_a_new_machine() {
             snapshot: "latest".into(),
             target: out.clone(),
             include: None,
+            from: None,
         },
     )
     .await;
@@ -678,6 +708,69 @@ async fn recovery_kit_restores_backups_on_a_new_machine() {
 
     new_pc.shutdown().await;
     host.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sets_share_a_key_unless_they_ask_for_their_own() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let daemon = start(&state, SecretKey::generate()).await;
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.txt"), b"a").unwrap();
+
+    let mut ids = Vec::new();
+    for (name, own_key) in [("one", false), ("two", false), ("apart", true)] {
+        let Reply::SetCreated { id } = call(
+            &daemon,
+            Request::CreateSet(CreateSet {
+                name: name.into(),
+                paths: vec![src.clone()],
+                target: Target::Local {
+                    path: tmp.path().join(format!("backup-{name}")),
+                },
+                debounce_secs: Some(60),
+                rescan_secs: None,
+                upload_limit: None,
+                window: None,
+                retention: None,
+                excludes: Vec::new(),
+                own_key,
+            }),
+        )
+        .await
+        else {
+            panic!()
+        };
+        ids.push(id);
+    }
+    let key =
+        |id: &str| fs::read_to_string(state.join("sets").join(id).join("master.key")).unwrap();
+    let shared = fs::read_to_string(state.join("shared.key")).unwrap();
+    assert_eq!(key(&ids[0]), shared);
+    assert_eq!(key(&ids[1]), shared);
+    assert_ne!(key(&ids[2]), shared);
+
+    let Reply::Status(st) = call(&daemon, Request::Status).await else {
+        panic!()
+    };
+    let own: Vec<(String, bool)> = st.sets.into_iter().map(|s| (s.name, s.own_key)).collect();
+    assert_eq!(
+        own,
+        vec![
+            ("apart".to_string(), true),
+            ("one".to_string(), false),
+            ("two".to_string(), false)
+        ]
+    );
+
+    // Removing a set leaves the shared key for the others.
+    call(&daemon, Request::RemoveSet { set: "one".into() }).await;
+    assert_eq!(
+        fs::read_to_string(state.join("shared.key")).unwrap(),
+        shared
+    );
+    daemon.shutdown().await;
 }
 
 fn hex_master_key(state: &Path) -> String {
@@ -720,13 +813,13 @@ async fn subscribers_see_state_changes_and_results() {
             target: Target::Local {
                 path: tmp.path().join("disk"),
             },
-            recovery_passphrase: "recovery phrase".into(),
             debounce_secs: Some(60),
             rescan_secs: None,
             upload_limit: None,
             window: None,
             retention: None,
             excludes: Vec::new(),
+            own_key: false,
         }),
     )
     .await;
@@ -768,12 +861,14 @@ async fn subscribers_see_state_changes_and_results() {
             Request::Verify {
                 set: "local".into(),
                 max_bytes: None,
+                from: None,
             },
             SetState::Verifying,
         ),
         (
             Request::Prune {
                 set: "local".into(),
+                from: None,
             },
             SetState::Pruning,
         ),
@@ -1148,13 +1243,13 @@ fn create_set(name: &str, src: &Path, target: Target) -> Request {
         name: name.into(),
         paths: vec![src.to_path_buf()],
         target,
-        recovery_passphrase: "a long recovery phrase".into(),
         debounce_secs: Some(1),
         rescan_secs: None,
         upload_limit: None,
         window: None,
         retention: None,
         excludes: Vec::new(),
+        own_key: false,
     })
 }
 
@@ -1373,7 +1468,14 @@ async fn stopped_sets_can_be_restored_until_their_grace_period_ends() {
     assert!(pc_state.join("sets").join(&set_id).exists());
 
     // Still restorable, by name or id.
-    let Reply::Snapshots(snaps) = call(&pc, Request::ListSnapshots { set: "docs".into() }).await
+    let Reply::Snapshots(snaps) = call(
+        &pc,
+        Request::ListSnapshots {
+            set: "docs".into(),
+            from: None,
+        },
+    )
+    .await
     else {
         panic!()
     };
@@ -1386,6 +1488,7 @@ async fn stopped_sets_can_be_restored_until_their_grace_period_ends() {
             snapshot: "latest".into(),
             target: out.clone(),
             include: None,
+            from: None,
         },
     )
     .await;
@@ -1422,7 +1525,14 @@ async fn stopped_sets_can_be_restored_until_their_grace_period_ends() {
     )
     .unwrap();
     let pc = start(&pc_state, pc_secret).await;
-    let Reply::Snapshots(snaps) = call(&pc, Request::ListSnapshots { set: "docs".into() }).await
+    let Reply::Snapshots(snaps) = call(
+        &pc,
+        Request::ListSnapshots {
+            set: "docs".into(),
+            from: None,
+        },
+    )
+    .await
     else {
         panic!()
     };
@@ -1449,9 +1559,12 @@ async fn stopped_sets_can_be_restored_until_their_grace_period_ends() {
     };
     assert!(status.stopped_sets.is_empty());
     assert!(
-        pc.handle(Request::ListSnapshots { set: "docs".into() })
-            .await
-            .is_err()
+        pc.handle(Request::ListSnapshots {
+            set: "docs".into(),
+            from: None
+        })
+        .await
+        .is_err()
     );
 
     // A stopped set can also be deleted for good straight away.
@@ -1593,6 +1706,7 @@ async fn restores_run_in_the_background_with_progress() {
         snapshot: "latest".into(),
         target: tmp.path().join(target),
         include: None,
+        from: None,
     };
 
     // It answers at once; progress and the result arrive as events.
@@ -1850,11 +1964,669 @@ async fn pausing_stops_a_running_backup_and_resuming_finishes_it() {
     .await;
     let backup = wait_for_backup(&d, None).await;
     assert_eq!(backup.files, 200);
-    let Reply::Snapshots(snapshots) = call(&d, Request::ListSnapshots { set: "docs".into() }).await
+    let Reply::Snapshots(snapshots) = call(
+        &d,
+        Request::ListSnapshots {
+            set: "docs".into(),
+            from: None,
+        },
+    )
+    .await
     else {
         panic!()
     };
     assert_eq!(snapshots.len(), 1, "{snapshots:?}");
 
     d.shutdown().await;
+}
+
+fn snapshot_count(reply: Reply) -> usize {
+    let Reply::Snapshots(s) = reply else {
+        panic!("{reply:?}")
+    };
+    s.len()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn extra_places_get_copies_of_the_versions_they_keep() {
+    use kinvault_daemon::api::RetentionPolicy;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.txt"), b"one").unwrap();
+    let d = start(&state, SecretKey::generate()).await;
+    call(
+        &d,
+        create_set(
+            "docs",
+            &src,
+            Target::Local {
+                path: tmp.path().join("main"),
+            },
+        ),
+    )
+    .await;
+    wait_for_backup(&d, None).await;
+
+    // A second place that keeps one version a day.
+    let daily = RetentionPolicy {
+        daily: Some(7),
+        ..Default::default()
+    };
+    let Reply::TargetAdded { id } = call(
+        &d,
+        Request::AddSetTarget {
+            set: "docs".into(),
+            target: Target::Local {
+                path: tmp.path().join("extra"),
+            },
+            retention: Some(daily),
+            upload_limit: None,
+            window: None,
+            relay: false,
+        },
+    )
+    .await
+    else {
+        panic!()
+    };
+    // The same place twice is refused.
+    assert!(
+        d.handle(Request::AddSetTarget {
+            set: "docs".into(),
+            target: Target::Local {
+                path: tmp.path().join("extra"),
+            },
+            retention: None,
+            upload_limit: None,
+            window: None,
+            relay: false,
+        })
+        .await
+        .is_err()
+    );
+
+    let list = |from: Option<&str>| Request::ListSnapshots {
+        set: "docs".into(),
+        from: from.map(Into::into),
+    };
+    let copied = |s: &SetStatus| {
+        s.extra_targets
+            .iter()
+            .find(|t| t.id == id)
+            .and_then(|t| t.last_copy.clone())
+    };
+    // The next backup copies it the version it keeps.
+    call(&d, Request::BackupNow { set: "docs".into() }).await;
+    let s = wait_for_set(&d, |s| copied(s).is_some() && s.state == SetState::Idle).await;
+    assert_eq!(copied(&s).unwrap().snapshots, 1);
+    assert_eq!(snapshot_count(call(&d, list(Some(&id))).await), 1);
+
+    // A change later the same day: the main place gets it, the daily one doesn't.
+    fs::write(src.join("a.txt"), b"two").unwrap();
+    call(&d, Request::BackupNow { set: "docs".into() }).await;
+    wait_for_set(&d, |s| s.state == SetState::Idle).await;
+    assert_eq!(snapshot_count(call(&d, list(None)).await), 2);
+    assert_eq!(snapshot_count(call(&d, list(Some(&id))).await), 1);
+
+    // Keeping the latest few there too: newer versions follow, by folder name as well as id.
+    let extra_path = tmp.path().join("extra").display().to_string();
+    call(
+        &d,
+        Request::UpdateSetTarget {
+            set: "docs".into(),
+            target: extra_path.clone(),
+            retention: RetentionPolicy {
+                last: Some(5),
+                ..daily
+            },
+            upload_limit: None,
+            window: None,
+            relay: None,
+        },
+    )
+    .await;
+    fs::write(src.join("a.txt"), b"three").unwrap();
+    call(&d, Request::BackupNow { set: "docs".into() }).await;
+    wait_for_set(&d, |s| {
+        copied(s).is_some_and(|c| c.snapshots == 2) && s.state == SetState::Idle
+    })
+    .await;
+    assert_eq!(snapshot_count(call(&d, list(Some(&extra_path))).await), 3);
+
+    // Restoring from it gives the latest version; checking it finds it complete.
+    let out = tmp.path().join("out");
+    call(
+        &d,
+        Request::Restore {
+            set: "docs".into(),
+            snapshot: "latest".into(),
+            target: out.clone(),
+            include: None,
+            from: Some(id.clone()),
+        },
+    )
+    .await;
+    let restored = out.join(kinvault_core::snapshot_root_name(
+        &fs::canonicalize(&src).unwrap(),
+    ));
+    assert_eq!(fs::read(restored.join("a.txt")).unwrap(), b"three");
+    let Reply::Verified(v) = call(
+        &d,
+        Request::Verify {
+            set: "docs".into(),
+            max_bytes: Some(u64::MAX),
+            from: Some(id.clone()),
+        },
+    )
+    .await
+    else {
+        panic!()
+    };
+    assert!(v.ok, "{v:?}");
+    let s = set_named(&d, "docs").await;
+    assert!(
+        s.extra_targets[0]
+            .last_verify
+            .as_ref()
+            .is_some_and(|v| v.ok)
+    );
+    assert!(s.last_verify.is_none(), "the main place wasn't checked");
+
+    // Removing it stops the copies and queues what it holds for erasing,
+    // without touching the set's key.
+    call(
+        &d,
+        Request::RemoveSetTarget {
+            set: "docs".into(),
+            target: id.clone(),
+        },
+    )
+    .await;
+    assert!(set_named(&d, "docs").await.extra_targets.is_empty());
+    let pending = pending_deletions(&state);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0]["target_id"], id.as_str());
+    fs::write(src.join("a.txt"), b"four").unwrap();
+    call(&d, Request::BackupNow { set: "docs".into() }).await;
+    assert_eq!(snapshot_count(call(&d, list(None)).await), 4);
+
+    // Deleting the set erases every place it's kept in, and then its key.
+    call(
+        &d,
+        Request::AddSetTarget {
+            set: "docs".into(),
+            target: Target::Local {
+                path: tmp.path().join("third"),
+            },
+            retention: None,
+            upload_limit: None,
+            window: None,
+            relay: false,
+        },
+    )
+    .await;
+    call(&d, Request::DeleteSet { set: "docs".into() }).await;
+    let places: Vec<serde_json::Value> = pending_deletions(&state)
+        .iter()
+        .map(|p| p["target_id"].clone())
+        .collect();
+    assert_eq!(places.len(), 3, "{places:?}");
+    assert!(places.contains(&serde_json::Value::Null));
+    d.shutdown().await;
+}
+
+/// `host` invites `guest` to store backups there; returns `host`'s id.
+async fn join(host: &Daemon, guest: &Daemon, name: &str) -> String {
+    let Reply::Invite { ticket, .. } = call(
+        host,
+        Request::CreateInvite(CreateInvite {
+            name: Some("guest".into()),
+            ..Default::default()
+        }),
+    )
+    .await
+    else {
+        panic!()
+    };
+    call(
+        guest,
+        Request::RedeemInvite {
+            ticket,
+            name: Some(name.into()),
+            offer: None,
+            mine: false,
+        },
+    )
+    .await;
+    host.id().to_string()
+}
+
+fn files_in(dir: &Path) -> usize {
+    fs::read_dir(dir).map_or(0, |d| d.count())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_main_host_forwards_copies_on_its_own() {
+    use kinvault_daemon::api::RetentionPolicy;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let server = start(&tmp.path().join("server"), SecretKey::generate()).await;
+    let remote = start(&tmp.path().join("remote"), SecretKey::generate()).await;
+    let pc_state = tmp.path().join("pc");
+    let pc_secret = SecretKey::generate();
+    let pc = start(&pc_state, pc_secret.clone()).await;
+    let server_id = join(&server, &pc, "server").await;
+    let remote_id = join(&remote, &pc, "remote").await;
+
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.txt"), b"keep me safe").unwrap();
+    call(
+        &pc,
+        create_set(
+            "docs",
+            &src,
+            Target::Peer {
+                id: server_id.clone(),
+                addrs: Vec::new(),
+            },
+        ),
+    )
+    .await;
+    wait_for_backup(&pc, None).await;
+
+    let add = |target: Target| Request::AddSetTarget {
+        set: "docs".into(),
+        target,
+        retention: Some(RetentionPolicy {
+            daily: Some(7),
+            ..Default::default()
+        }),
+        upload_limit: None,
+        window: None,
+        relay: true,
+    };
+    // Only another computer can be forwarded to.
+    assert!(
+        pc.handle(add(Target::Local {
+            path: tmp.path().join("usb")
+        }))
+        .await
+        .is_err()
+    );
+    let Reply::TargetAdded { id } = call(
+        &pc,
+        add(Target::Peer {
+            id: remote_id.clone(),
+            addrs: Vec::new(),
+        }),
+    )
+    .await
+    else {
+        panic!()
+    };
+
+    // The next backup asks the server to forward; then the PC goes away.
+    call(&pc, Request::BackupNow { set: "docs".into() }).await;
+    wait_for_set(&pc, |s| {
+        s.state == SetState::Idle
+            && s.extra_targets[0].forwarding.is_some()
+            && s.extra_targets[0].last_error.is_none()
+    })
+    .await;
+    pc.shutdown().await;
+
+    // The server delivers to the remote by itself, into the PC's own space there.
+    let config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(pc_state.join("config.json")).unwrap()).unwrap();
+    let repo = config["sets"][0]["extra_targets"][0]["target"]["repo"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let stored = tmp
+        .path()
+        .join("remote/hosted")
+        .join(pc_secret.public().to_string())
+        .join(&repo);
+    for _ in 0..200 {
+        if files_in(&stored.join("snapshots")) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(files_in(&stored.join("snapshots")), 1, "nothing forwarded");
+    assert!(files_in(&stored.join("packs")) > 0);
+    // The remote never had to know the server.
+    assert!(peers(&remote).await.iter().all(|p| p.id != server_id));
+
+    // Back on, the PC learns it was delivered, and can restore from there.
+    let pc = start(&pc_state, pc_secret).await;
+    call(&pc, Request::BackupNow { set: "docs".into() }).await;
+    let s = wait_for_set(&pc, |s| {
+        s.state == SetState::Idle && s.extra_targets[0].last_copy.is_some()
+    })
+    .await;
+    let t = &s.extra_targets[0];
+    assert!(t.relay);
+    assert_eq!(t.last_copy.as_ref().unwrap().snapshots, 1);
+    assert!(t.forwarding.is_none(), "{:?}", t.forwarding);
+    assert!(t.last_error.is_none(), "{:?}", t.last_error);
+    let out = tmp.path().join("out");
+    call(
+        &pc,
+        Request::Restore {
+            set: "docs".into(),
+            snapshot: "latest".into(),
+            target: out.clone(),
+            include: None,
+            from: Some(id),
+        },
+    )
+    .await;
+    let restored = out.join(kinvault_core::snapshot_root_name(
+        &fs::canonicalize(&src).unwrap(),
+    ));
+    assert_eq!(fs::read(restored.join("a.txt")).unwrap(), b"keep me safe");
+
+    // If the remote stops taking the PC's backups, the PC hears about it.
+    call(
+        &remote,
+        Request::PeerRevoke {
+            id: pc.id().to_string(),
+        },
+    )
+    .await;
+    // A new day for the copy's rules: keep every version from now on.
+    call(
+        &pc,
+        Request::UpdateSetTarget {
+            set: "docs".into(),
+            target: "remote".into(),
+            retention: RetentionPolicy {
+                last: Some(3),
+                ..Default::default()
+            },
+            upload_limit: None,
+            window: None,
+            relay: None,
+        },
+    )
+    .await;
+    fs::write(src.join("a.txt"), b"changed").unwrap();
+    call(&pc, Request::BackupNow { set: "docs".into() }).await;
+    // The relay may fail the order before the PC is seen waiting on it.
+    wait_for_set(&pc, |s| {
+        s.state == SetState::Idle
+            && (s.extra_targets[0].forwarding.is_some() || s.extra_targets[0].last_error.is_some())
+    })
+    .await;
+    let mut error = None;
+    for _ in 0..100 {
+        call(&pc, Request::BackupNow { set: "docs".into() }).await;
+        let s = wait_for_set(&pc, |s| s.state == SetState::Idle).await;
+        error = s.extra_targets[0].last_error.clone();
+        if error.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let error = error.expect("the failure is reported");
+    assert!(error.contains("couldn't deliver"), "{error}");
+    pc.shutdown().await;
+    server.shutdown().await;
+    remote.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn extra_places_get_backups_straight_away_while_the_main_host_is_off() {
+    use kinvault_daemon::api::RetentionPolicy;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let server = start(&tmp.path().join("server"), SecretKey::generate()).await;
+    let pc = start(&tmp.path().join("pc"), SecretKey::generate()).await;
+    let server_id = join(&server, &pc, "server").await;
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.txt"), b"one").unwrap();
+    call(
+        &pc,
+        create_set(
+            "docs",
+            &src,
+            Target::Peer {
+                id: server_id,
+                addrs: Vec::new(),
+            },
+        ),
+    )
+    .await;
+    wait_for_backup(&pc, None).await;
+    let Reply::TargetAdded { id } = call(
+        &pc,
+        Request::AddSetTarget {
+            set: "docs".into(),
+            target: Target::Local {
+                path: tmp.path().join("usb"),
+            },
+            retention: Some(RetentionPolicy {
+                last: Some(5),
+                ..Default::default()
+            }),
+            upload_limit: None,
+            window: None,
+            relay: false,
+        },
+    )
+    .await
+    else {
+        panic!()
+    };
+    call(&pc, Request::BackupNow { set: "docs".into() }).await;
+    wait_for_set(&pc, |s| {
+        s.state == SetState::Idle && s.extra_targets[0].last_copy.is_some()
+    })
+    .await;
+
+    // The server goes away; a change still reaches the other place.
+    server.shutdown().await;
+    fs::write(src.join("a.txt"), b"two").unwrap();
+    assert!(
+        pc.handle(Request::BackupNow { set: "docs".into() })
+            .await
+            .is_err()
+    );
+    let s = wait_for_set(&pc, |s| {
+        s.state != SetState::Running
+            && s.extra_targets[0]
+                .last_copy
+                .as_ref()
+                .is_some_and(|c| c.bytes > 0)
+    })
+    .await;
+    assert!(
+        s.extra_targets[0].last_error.is_none(),
+        "{:?}",
+        s.extra_targets[0].last_error
+    );
+    let list = Request::ListSnapshots {
+        set: "docs".into(),
+        from: Some(id.clone()),
+    };
+    assert_eq!(snapshot_count(call(&pc, list).await), 2);
+    let out = tmp.path().join("out");
+    call(
+        &pc,
+        Request::Restore {
+            set: "docs".into(),
+            snapshot: "latest".into(),
+            target: out.clone(),
+            include: None,
+            from: Some(id),
+        },
+    )
+    .await;
+    let restored = out.join(kinvault_core::snapshot_root_name(
+        &fs::canonicalize(&src).unwrap(),
+    ));
+    assert_eq!(fs::read(restored.join("a.txt")).unwrap(), b"two");
+    pc.shutdown().await;
+}
+
+/// Polls `dir` until it holds `n` entries.
+async fn wait_for_files(dir: &Path, n: usize) {
+    for _ in 0..200 {
+        if files_in(dir) == n {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("{} holds {} entries, not {n}", dir.display(), files_in(dir));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn places_out_of_reach_are_cleaned_up_through_the_relay() {
+    use kinvault_daemon::api::RetentionPolicy;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let server = start(&tmp.path().join("server"), SecretKey::generate()).await;
+    let remote = start(&tmp.path().join("remote"), SecretKey::generate()).await;
+    let pc_state = tmp.path().join("pc");
+    let pc_secret = SecretKey::generate();
+    let pc = start(&pc_state, pc_secret.clone()).await;
+    let server_id = join(&server, &pc, "server").await;
+    let remote_id = join(&remote, &pc, "remote").await;
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.txt"), b"one").unwrap();
+    call(
+        &pc,
+        create_set(
+            "docs",
+            &src,
+            Target::Peer {
+                id: server_id,
+                addrs: Vec::new(),
+            },
+        ),
+    )
+    .await;
+    wait_for_backup(&pc, None).await;
+    // The remote keeps just the latest version.
+    call(
+        &pc,
+        Request::AddSetTarget {
+            set: "docs".into(),
+            target: Target::Peer {
+                id: remote_id,
+                addrs: Vec::new(),
+            },
+            retention: Some(RetentionPolicy {
+                last: Some(1),
+                ..Default::default()
+            }),
+            upload_limit: None,
+            window: None,
+            relay: true,
+        },
+    )
+    .await;
+    let config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(pc_state.join("config.json")).unwrap()).unwrap();
+    let set_id = config["sets"][0]["id"].as_str().unwrap().to_string();
+    let repo = config["sets"][0]["extra_targets"][0]["target"]["repo"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let stored = tmp
+        .path()
+        .join("remote/hosted")
+        .join(pc_secret.public().to_string())
+        .join(&repo);
+
+    // Two versions get there; the PC hears of both.
+    call(&pc, Request::BackupNow { set: "docs".into() }).await;
+    wait_for_files(&stored.join("snapshots"), 1).await;
+    let packs_of_first = files_in_tree(&stored.join("packs"));
+    fs::write(src.join("a.txt"), b"two").unwrap();
+    call(&pc, Request::BackupNow { set: "docs".into() }).await;
+    wait_for_files(&stored.join("snapshots"), 2).await;
+    call(&pc, Request::BackupNow { set: "docs".into() }).await;
+    wait_for_set(&pc, |s| {
+        s.state == SetState::Idle && s.extra_targets[0].forwarding.is_none()
+    })
+    .await;
+    pc.shutdown().await;
+
+    // A day later, with the remote out of the PC's reach.
+    let extras_path = pc_state.join("sets").join(&set_id).join("extras.json");
+    let mut extras: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&extras_path).unwrap()).unwrap();
+    for e in extras.as_object_mut().unwrap().values_mut() {
+        e["since_unix"] = 0.into();
+        e["last_prune"] = serde_json::Value::Null;
+    }
+    fs::write(&extras_path, extras.to_string()).unwrap();
+    let pc = Daemon::start(DaemonOptions {
+        state_dir: pc_state.clone(),
+        endpoint: Some(local_endpoint(pc_secret).await),
+        nearby: Default::default(),
+        // Every check fails at once, so no host looks reachable.
+        reachability: ReachabilityOptions {
+            interval: Duration::from_secs(3600),
+            timeout: Duration::from_nanos(1),
+        },
+    })
+    .await
+    .unwrap();
+    call(&pc, Request::BackupNow { set: "docs".into() }).await;
+
+    // The relay passes on the PC's signed deletions: the old version goes,
+    // with the packs only it used.
+    wait_for_files(&stored.join("snapshots"), 1).await;
+    for _ in 0..100 {
+        if files_in_tree(&stored.join("packs")) < packs_of_first + 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(files_in_tree(&stored.join("packs")) < packs_of_first + 2);
+    let s = set_named(&pc, "docs").await;
+    let prune = s.extra_targets[0].last_prune.clone().expect("cleaned up");
+    assert_eq!(prune.snapshots_removed, 1);
+    assert!(prune.packs_deleted > 0, "{prune:?}");
+
+    // What's left still restores.
+    let out = tmp.path().join("out");
+    call(
+        &pc,
+        Request::Restore {
+            set: "docs".into(),
+            snapshot: "latest".into(),
+            target: out.clone(),
+            include: None,
+            from: Some("remote".into()),
+        },
+    )
+    .await;
+    let restored = out.join(kinvault_core::snapshot_root_name(
+        &fs::canonicalize(&src).unwrap(),
+    ));
+    assert_eq!(fs::read(restored.join("a.txt")).unwrap(), b"two");
+    pc.shutdown().await;
+    server.shutdown().await;
+    remote.shutdown().await;
+}
+
+/// Files anywhere under `dir`.
+fn files_in_tree(dir: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .map(|e| e.unwrap().path())
+        .map(|p| if p.is_dir() { files_in_tree(&p) } else { 1 })
+        .sum()
 }

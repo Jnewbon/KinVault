@@ -39,13 +39,23 @@ share): anyone with access to the folder sees only encrypted packs.
 |---|---|
 | Data and metadata | XChaCha20-Poly1305, with separate keys for data and metadata |
 | Chunk ids (for deduplication) | Keyed BLAKE3, so ids reveal nothing without the key |
-| Keys | A random 256-bit key per backup set; sub-keys derived with BLAKE3 |
-| Passphrase-protected keys (recovery file, recovery kit) | Argon2id (64 MiB, 3 passes) |
+| Keys | A random 256-bit key shared by your backup sets, or one of its own for a set that asks; sub-keys derived with BLAKE3 |
+| Passphrase-protected keys (recovery kit) | Argon2id (64 MiB, 3 passes) |
 | Connections between instances | QUIC (TLS 1.3), authenticated by each instance's key |
 
-Every backup set has its own key, so deduplication only happens within a set.
-Two friends backing up the same file store it twice, and a host can't tell
-they're the same.
+By default your backup sets share one key. A set can have a key of its own
+instead: tick **Use a separate encryption key** when creating it (or pass
+`--own-key` to `kinvault set create`). Backups made before keys were shared
+each keep their own key.
+
+A separate key matters when one host stores several of your backups. With a
+shared key, that host could tell when two of them hold the same file, and
+could swap versions between them so a restore shows another backup's
+versions. With separate keys it can do neither.
+
+Deduplication only happens within a set, whatever the key. Two friends
+backing up the same file store it twice, and a host can't tell they're the
+same.
 
 ## Connections
 
@@ -82,6 +92,15 @@ confirming.
   then erased, so recent history survives a short-lived compromise. Backups
   you stop are also only erased after a grace period. A whole backup set
   deleted with **Delete permanently** is erased after a week.
+
+- **A host that forwards your copies goes bad.** It can only do what your
+  signed permission allows: add data to that one backup on that one other
+  computer, until the permission runs out (60 days, renewed with each new
+  order). It can't read or list anything there, and it can only delete what
+  you signed a deletion list for: exact versions and packs, chosen by your
+  computer. At worst it adds junk, which uses your storage there and is
+  ignored when you restore, or holds back deletions, which leaves old
+  versions there for longer.
 
 ## What you need to protect
 

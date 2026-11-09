@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use kinvault_core::{
-    Backend, Index, LocalDirBackend, MasterKey, PackId, Repository, Result, SnapshotId,
+    Backend, BackupStep, Index, LocalDirBackend, MasterKey, PackId, Repository, Result, SnapshotId,
 };
 
 /// Wraps a backend and counts bytes sent to it, to check incremental traffic.
@@ -404,7 +404,7 @@ fn backup_progress_counts_files_and_their_size_together() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let sink = seen.clone();
     repo.set_progress(Some(Arc::new(move |p: &kinvault_core::BackupProgress| {
-        sink.lock().unwrap().push(*p)
+        sink.lock().unwrap().push(p.clone())
     })));
 
     // The first run reads every file; the second finds them all unchanged.
@@ -412,7 +412,10 @@ fn backup_progress_counts_files_and_their_size_together() {
         seen.lock().unwrap().clear();
         let (_, stats) = repo.backup(std::slice::from_ref(&src), "h").unwrap();
         let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 21, "run {run}: one per file, then the totals");
+        // Once per file (and per pack sent), then the totals.
+        let mut counts: Vec<u64> = seen.iter().map(|p| p.files).collect();
+        counts.dedup();
+        assert_eq!(counts, (1..=20).collect::<Vec<u64>>(), "run {run}");
         for p in seen.iter() {
             assert_eq!(p.total_bytes, p.files * size as u64, "run {run}: {p:?}");
         }
@@ -423,6 +426,66 @@ fn backup_progress_counts_files_and_their_size_together() {
             (stats.files, stats.total_bytes)
         );
     }
+}
+
+#[test]
+fn a_large_file_reports_progress_while_it_is_read() {
+    use std::sync::{Arc, Mutex};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    let mut data = vec![0u8; 12 << 20];
+    blake3::Hasher::new().finalize_xof().fill(&mut data);
+    fs::write(src.join("big"), &data).unwrap();
+    let mut repo = Repository::open(
+        LocalDirBackend::create(tmp.path().join("store")).unwrap(),
+        &MasterKey::generate().unwrap(),
+        Index::open_in_memory().unwrap(),
+    );
+    repo.set_pack_target(4 << 20);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    repo.set_progress(Some(Arc::new(move |p: &kinvault_core::BackupProgress| {
+        sink.lock().unwrap().push(p.clone())
+    })));
+    repo.backup(std::slice::from_ref(&src), "h").unwrap();
+
+    let seen = seen.lock().unwrap();
+    // Backups report resolved paths (macOS's temp dir sits behind a symlink).
+    let big = fs::canonicalize(src.join("big"))
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let reading: Vec<_> = seen
+        .iter()
+        .filter(|p| p.step == BackupStep::Reading)
+        .collect();
+    // Named before any of it is read, then counted as it's read.
+    assert_eq!(reading[0].file.as_deref(), Some(big.as_str()));
+    assert_eq!(reading[0].bytes_read, 0);
+    assert!(
+        reading
+            .iter()
+            .all(|p| p.file_size == data.len() as u64 && p.file_read == p.bytes_read)
+    );
+    assert!(
+        reading
+            .windows(2)
+            .all(|w| w[0].bytes_read <= w[1].bytes_read)
+    );
+    // Partway through it, before it counts as looked at.
+    let partway = reading.iter().filter(|p| p.files == 0).count();
+    assert!(partway > 3, "{partway}");
+    // Full packs are sent while the file is still being read.
+    let sent_early = seen
+        .iter()
+        .filter(|p| matches!(p.step, BackupStep::Sending { .. }) && p.files == 0)
+        .count();
+    assert!(sent_early >= 2, "{sent_early}");
+    let last = seen.last().unwrap();
+    assert!(last.scanned);
+    assert_eq!((last.files, last.bytes_read), (1, data.len() as u64));
 }
 
 #[test]
@@ -469,4 +532,99 @@ fn a_cancelled_backup_stops_and_the_next_one_finishes_it() {
     assert!(stats.files_changed < 20, "stored data is reused: {stats:?}");
     let out = tmp.path().join("out");
     repo.restore(&id, &out, None).unwrap();
+}
+
+#[test]
+fn snapshots_copy_to_a_second_store_with_only_what_it_lacks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    make_tree(&src);
+    let master = MasterKey::generate().unwrap();
+    let open = |dir: &str| {
+        Repository::open(
+            Counting {
+                inner: LocalDirBackend::create(tmp.path().join(dir)).unwrap(),
+                uploaded: AtomicU64::new(0),
+            },
+            &master,
+            Index::open_in_memory().unwrap(),
+        )
+    };
+    let mut main = open("main");
+    let mut copy = open("copy");
+
+    let (first, _) = main.backup(std::slice::from_ref(&src), "h").unwrap();
+    fs::write(src.join("new.txt"), pseudo_random(300_000, "new")).unwrap();
+    let (second, _) = main.backup(std::slice::from_ref(&src), "h").unwrap();
+
+    // Only the first: the copy gets what it needs, and restores the same.
+    let stats = main
+        .copy_snapshots_to(&mut copy, &[first], &mut |_, _| {})
+        .unwrap();
+    assert_eq!(stats.snapshots, 1);
+    assert!(stats.packs > 0);
+    assert_eq!(copy.snapshot_times().unwrap().len(), 1);
+    let out = tmp.path().join("out1");
+    copy.restore(&first, &out, None).unwrap();
+    let root = out.join(kinvault_core::snapshot_root_name(
+        &fs::canonicalize(&src).unwrap(),
+    ));
+    assert_eq!(
+        fs::read(root.join("big.bin")).unwrap(),
+        fs::read(src.join("big.bin")).unwrap()
+    );
+    assert!(!root.join("new.txt").exists());
+
+    // Then the second: only the new data travels.
+    let before = copy.backend().uploaded.load(Ordering::Relaxed);
+    let mut seen = Vec::new();
+    let stats = main
+        .copy_snapshots_to(&mut copy, &[second], &mut |done, total| {
+            seen.push((done, total))
+        })
+        .unwrap();
+    let sent = copy.backend().uploaded.load(Ordering::Relaxed) - before;
+    assert!(sent < 400_000, "{sent}");
+    assert_eq!(seen.last().map(|&(d, t)| d == t), Some(true));
+    // The total leaves out pack headers, so it's a little short of what was sent.
+    let total = seen.last().unwrap().1;
+    assert!(
+        stats.bytes >= total && stats.bytes < total + 4096,
+        "{stats:?} {total}"
+    );
+    let out = tmp.path().join("out2");
+    copy.restore(&second, &out, None).unwrap();
+    assert_same(
+        &src,
+        &out.join(kinvault_core::snapshot_root_name(
+            &fs::canonicalize(&src).unwrap(),
+        )),
+    );
+
+    // Copying again sends nothing; a store with another key is refused.
+    let again = main
+        .copy_snapshots_to(&mut copy, &[second], &mut |_, _| {})
+        .unwrap();
+    assert_eq!((again.packs, again.bytes), (0, 0));
+    let mut stranger = Repository::open(
+        LocalDirBackend::create(tmp.path().join("other")).unwrap(),
+        &MasterKey::generate().unwrap(),
+        Index::open_in_memory().unwrap(),
+    );
+    assert!(
+        main.copy_snapshots_to(&mut stranger, &[first], &mut |_, _| {})
+            .is_err()
+    );
+
+    // The copy keeps its own versions: pruning it to one leaves the main store alone.
+    copy.prune(&kinvault_core::RetentionPolicy {
+        last: Some(1),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(copy.snapshot_times().unwrap().len(), 1);
+    assert_eq!(main.snapshot_times().unwrap().len(), 2);
+    copy.verify(u64::MAX)
+        .map(|r| assert!(r.is_ok(), "{r:?}"))
+        .unwrap();
 }

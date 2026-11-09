@@ -21,6 +21,10 @@ pub const MAX_OBJECT_LEN: u64 = 512 * 1024 * 1024;
 pub(crate) const MAX_REQUEST_LEN: usize = 64 * 1024;
 /// Largest response a client reads (a long list of pack ids).
 pub(crate) const MAX_RESPONSE_LEN: usize = 32 * 1024 * 1024;
+/// Most packs one `Delivery::Have` asks about, so the request stays small.
+pub(crate) const MAX_HAVE: usize = 1000;
+/// Largest forwarding order a host accepts (about 400,000 packs).
+pub(crate) const MAX_ORDER_LEN: u64 = 16 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Request {
@@ -83,6 +87,247 @@ pub enum Op {
     /// it after [`REPO_DELETE_DELAY`](crate::REPO_DELETE_DELAY), so a
     /// compromised sender can't destroy backups instantly.
     DeleteRepo,
+    // New variants go last: postcard numbers them by position.
+    /// Asks this host to forward objects of the sender's repository to
+    /// another host: `len` bytes of a postcard [`ForwardOrder`] follow.
+    Forward {
+        len: u64,
+    },
+    /// How the sender's forwarding orders for one of its places are going.
+    ForwardStatus {
+        place: String,
+    },
+    /// Drops the sender's unfinished forwarding orders for a place.
+    ForwardCancel {
+        place: String,
+    },
+    /// Delivers to `delegation.owner`'s repository here (`repo`), on the
+    /// owner's behalf. Allowed from a relay this host doesn't know, as long
+    /// as the owner signed `delegation` for it.
+    Deliver {
+        delegation: Delegation,
+        item: Delivery,
+    },
+}
+
+/// What a relay delivers, or asks about, for an owner.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum Delivery {
+    /// Which of these packs the owner's repository holds already.
+    Have { packs: Vec<PackId> },
+    /// A pack of `len` bytes follows.
+    Pack { id: PackId, len: u64 },
+    /// A snapshot of `len` bytes follows.
+    Snapshot { id: SnapshotId, len: u64 },
+    /// Moves objects the owner listed to the trash. The owner signs the
+    /// list itself, so a relay can only pass on deletions it was given.
+    Delete(Box<Deletion>),
+}
+
+/// Objects an owner wants deleted from one of its repositories on one
+/// host, signed by the owner. They go to the trash for the host's grace
+/// period, as when the owner deletes them itself.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Deletion {
+    pub owner: iroh::EndpointId,
+    pub host: iroh::EndpointId,
+    pub repo: String,
+    pub snapshots: Vec<SnapshotId>,
+    pub packs: Vec<PackId>,
+    pub expires_unix: i64,
+    pub signature: Vec<u8>,
+}
+
+impl Deletion {
+    /// Most objects one deletion may list, so it fits in a request.
+    pub const MAX_OBJECTS: usize = 1000;
+
+    pub fn sign(
+        owner: &iroh::SecretKey,
+        host: iroh::EndpointId,
+        repo: &str,
+        snapshots: Vec<SnapshotId>,
+        packs: Vec<PackId>,
+        expires_unix: i64,
+    ) -> Self {
+        let mut d = Self {
+            owner: owner.public(),
+            host,
+            repo: repo.to_string(),
+            snapshots,
+            packs,
+            expires_unix,
+            signature: Vec::new(),
+        };
+        d.signature = owner.sign(&d.signed_bytes()).to_bytes().to_vec();
+        d
+    }
+
+    fn signed_bytes(&self) -> Vec<u8> {
+        let fields = (
+            "kinvault deletion v1",
+            &self.owner,
+            &self.host,
+            &self.repo,
+            &self.snapshots,
+            &self.packs,
+            self.expires_unix,
+        );
+        postcard::to_allocvec(&fields).expect("serialising plain fields")
+    }
+
+    /// Checks the owner signed it for `host`'s `repo`, and it's still valid.
+    pub fn check(&self, host: &iroh::EndpointId, repo: &str, now: i64) -> Result<(), String> {
+        let signature: [u8; 64] = self
+            .signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| "malformed signature".to_string())?;
+        self.owner
+            .verify(
+                &self.signed_bytes(),
+                &iroh::Signature::from_bytes(&signature),
+            )
+            .map_err(|_| "the owner didn't sign this deletion".to_string())?;
+        if self.host != *host || self.repo != repo {
+            return Err("this deletion is for another repository".into());
+        }
+        if self.expires_unix < now {
+            return Err("this deletion has expired".into());
+        }
+        if self.snapshots.len() + self.packs.len() > Self::MAX_OBJECTS {
+            return Err("this deletion lists too many objects".into());
+        }
+        Ok(())
+    }
+}
+
+/// An owner's permission for one relay to deliver new objects into one of
+/// its repositories on one host, until `expires_unix`. Nothing else: the
+/// relay can't list, read or delete anything there.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Delegation {
+    pub owner: iroh::EndpointId,
+    pub relay: iroh::EndpointId,
+    pub host: iroh::EndpointId,
+    pub repo: String,
+    pub expires_unix: i64,
+    /// The owner's Ed25519 signature over the fields above.
+    pub signature: Vec<u8>,
+}
+
+impl Delegation {
+    pub fn sign(
+        owner: &iroh::SecretKey,
+        relay: iroh::EndpointId,
+        host: iroh::EndpointId,
+        repo: &str,
+        expires_unix: i64,
+    ) -> Self {
+        let mut d = Self {
+            owner: owner.public(),
+            relay,
+            host,
+            repo: repo.to_string(),
+            expires_unix,
+            signature: Vec::new(),
+        };
+        d.signature = owner.sign(&d.signed_bytes()).to_bytes().to_vec();
+        d
+    }
+
+    fn signed_bytes(&self) -> Vec<u8> {
+        let fields = (
+            "kinvault delegation v1",
+            &self.owner,
+            &self.relay,
+            &self.host,
+            &self.repo,
+            self.expires_unix,
+        );
+        postcard::to_allocvec(&fields).expect("serialising plain fields")
+    }
+
+    /// Checks the signature and that it lets `relay` deliver to `host`'s
+    /// `repo` at `now`. Says why not otherwise.
+    pub fn check(
+        &self,
+        relay: &iroh::EndpointId,
+        host: &iroh::EndpointId,
+        repo: &str,
+        now: i64,
+    ) -> Result<(), String> {
+        let signature: [u8; 64] = self
+            .signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| "malformed signature".to_string())?;
+        self.owner
+            .verify(
+                &self.signed_bytes(),
+                &iroh::Signature::from_bytes(&signature),
+            )
+            .map_err(|_| "the owner didn't sign this permission".to_string())?;
+        if self.relay != *relay {
+            return Err("this permission is for another relay".into());
+        }
+        if self.host != *host {
+            return Err("this permission is for another host".into());
+        }
+        if self.repo != repo {
+            return Err("this permission is for another repository".into());
+        }
+        if self.expires_unix < now {
+            return Err("this permission has expired".into());
+        }
+        Ok(())
+    }
+}
+
+/// Objects of the sender's repository on this host for it to copy to
+/// another host, as `delegation` allows. Packs go first, then snapshots in
+/// order, so the other host never lists a snapshot it can't restore.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ForwardOrder {
+    /// Chosen by the sender, unique among its orders.
+    pub id: String,
+    /// The sender's name for the destination, for status and cancelling.
+    pub place: String,
+    pub delegation: Delegation,
+    /// How to reach `delegation.host`: known addresses and configured
+    /// host names (see [`crate::HostAddr`]).
+    pub addrs: Vec<std::net::SocketAddr>,
+    pub hosts: Vec<String>,
+    pub packs: Vec<PackId>,
+    pub snapshots: Vec<SnapshotId>,
+    /// Pace and hours for sending.
+    pub upload_limit: Option<u64>,
+    pub window: Option<crate::TimeWindow>,
+    /// Deletions the owner signed, passed on once everything is delivered.
+    pub deletions: Vec<Deletion>,
+}
+
+/// How a forwarding order is going.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ForwardInfo {
+    pub id: String,
+    pub state: ForwardState,
+    pub packs_sent: u64,
+    pub packs_total: u64,
+    pub bytes_sent: u64,
+    /// The last problem, if any (it's retried while `Pending`).
+    pub error: Option<String>,
+    /// When it last changed (Unix seconds).
+    pub updated_unix: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardState {
+    /// Waiting, or under way; retried until it's done or fails for good.
+    Pending,
+    Done,
+    /// Can't be done (e.g. the other host refused); not retried.
+    Failed,
 }
 
 /// Storage one peer offers another.
@@ -124,6 +369,10 @@ pub enum Response {
         /// When the host erases the repository (Unix seconds).
         erase_after_unix: i64,
     },
+    // New variants go last: postcard numbers them by position.
+    /// For each pack asked about, whether it's stored.
+    Present(Vec<bool>),
+    Forwarding(Vec<ForwardInfo>),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]

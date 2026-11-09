@@ -18,11 +18,15 @@ const state = {
   invites: [],
   network: null, // NetworkInfo
   nearby: { until_unix: null, devices: [] }, // NearbyStatus
-  progress: {}, // set id -> latest Progress event
+  progress: {}, // set id -> latest Progress event, plus when sending its pack started
+  rates: {}, // set id -> recent { t, read, sent } samples, for the backup's speeds
+  copying: {}, // set id -> latest CopyProgress event
   maintenance: {}, // set id -> latest MaintenanceProgress event, plus when its step started
   autostart: false,
   restoreSet: null,
+  restoreFrom: null, // which of the restore set's places: null for the main one, else an extra place's id
   snapshotsSet: null, // the set whose versions are in `snapshots`
+  snapshotsFrom: null, // and which of its places they came from
   snapshots: [],
   snapshotsError: null, // why the restore set's versions couldn't be loaded
   snapshotsLoading: false,
@@ -476,7 +480,7 @@ function renderBanner() {
 
 /** Backing up, cleaning up or checking: the set's backups are in use. */
 function busy(set) {
-  return ["running", "pruning", "verifying"].includes(set.state);
+  return ["running", "pruning", "verifying", "copying"].includes(set.state);
 }
 
 /** "less than a minute", "12 min", "1.5 h". */
@@ -531,6 +535,7 @@ function stateChip(set) {
   if (set.state === "running") return el("span", { class: "chip run" }, "Backing up");
   if (set.state === "pruning") return el("span", { class: "chip run" }, "Cleaning up");
   if (set.state === "verifying") return el("span", { class: "chip run" }, "Checking");
+  if (set.state === "copying") return el("span", { class: "chip run" }, "Copying");
   if (set.state === "paused") return el("span", { class: "chip warn" }, "Paused");
   if (set.state === "waiting_for_host") return el("span", { class: "chip warn" }, "Waiting for destination");
   if (set.last_error) return el("span", { class: "chip bad" }, "Needs attention");
@@ -577,21 +582,78 @@ function restorableSets() {
   return [...(state.status?.sets || []), ...(state.status?.stopped_sets || [])];
 }
 
-function backupProgressText(progress) {
-  return progress
-    ? `Scanned ${plural(progress.files, "file")} (${bytes(progress.total_bytes)}), read ${bytes(progress.bytes_read)}, sent ${bytes(progress.bytes_uploaded)}`
-    : "Starting…";
+/** Records a Progress event, keeping about five seconds of samples for the speeds. */
+function noteProgress(ev) {
+  const now = performance.now();
+  const prev = state.progress[ev.set];
+  if (ev.step === "sending") ev.sendingSince = prev?.step === "sending" ? prev.sendingSince : now;
+  state.progress[ev.set] = ev;
+  const samples = (state.rates[ev.set] ||= []);
+  samples.push({ t: now, read: ev.bytes_read, sent: ev.bytes_uploaded });
+  while (samples.length > 2 && now - samples[1].t > 5000) samples.shift();
+}
+
+function forgetProgress(set) {
+  delete state.progress[set];
+  delete state.rates[set];
+}
+
+/** Bytes per second of `key` over the recent samples, or null with too little to go on. */
+function rate(set, key) {
+  const s = state.rates[set];
+  if (!s || s.length < 2) return null;
+  const first = s[0], last = s[s.length - 1];
+  const secs = (last.t - first.t) / 1000;
+  return secs >= 1 ? (last[key] - first[key]) / secs : null;
+}
+
+/** "3.2 GiB" plus its speed when there is one, e.g. "3.2 GiB at 85 MiB/s". */
+function withRate(total, perSec) {
+  return perSec === null || perSec <= 0 ? bytes(total) : `${bytes(total)} at ${bytes(Math.round(perSec))}/s`;
+}
+
+/** What a running backup is doing now, and how far it got. */
+function backupProgressLines(set) {
+  const p = state.progress[set.id];
+  if (!p) return [el("div", {}, "Starting…")];
+  let now;
+  if (p.step === "sending") {
+    const secs = Math.floor((performance.now() - p.sendingSince) / 1000);
+    now = el("div", { class: "now" },
+      `Sending ${bytes(p.sending_bytes)} to ${describeTarget(set.target)}…`,
+      secs >= 2 ? el("span", { class: "muted" }, ` ${secs} s`) : null);
+  } else if (p.file) {
+    const cut = Math.max(p.file.lastIndexOf("/"), p.file.lastIndexOf("\\"));
+    const reading = p.step === "reading";
+    // Only worth saying for a file that takes a while.
+    const howFar = reading && p.file_size >= 64 * MiB
+      ? ` (${bytes(p.file_read)} of ${bytes(p.file_size)})` : "";
+    now = el("div", { class: "now", title: p.file },
+      reading ? "Reading " : "Looking for changes: ",
+      el("strong", {}, p.file.slice(cut + 1)), howFar,
+      el("span", { class: "muted" }, ` in ${p.file.slice(0, Math.max(cut, 1))}`));
+  } else {
+    now = el("div", { class: "now" }, "Looking for changes…");
+  }
+  const totals = [
+    p.files ? `${plural(p.files, "file")} (${bytes(p.total_bytes)}) looked at` : null,
+    `read ${withRate(p.bytes_read, rate(set.id, "read"))}`,
+    `sent ${withRate(p.bytes_uploaded, rate(set.id, "sent"))}`,
+  ];
+  return [now, el("div", { class: "muted" }, totals.filter(Boolean).join(" · "))];
 }
 
 function setCard(set) {
   const lines = el("div", { class: "lines" });
-  const progress = state.progress[set.id];
   if (set.state === "running") {
-    lines.append(el("div", { id: `backup-progress-${set.id}` }, backupProgressText(progress)));
+    lines.append(el("div", { id: `backup-progress-${set.id}`, class: "lines tight" }, ...backupProgressLines(set)));
     lines.append(el("div", { class: "progress indeterminate" }, el("div")));
   }
   if (set.state === "pruning" || set.state === "verifying") {
     lines.append(el("div", { id: `maintenance-${set.id}` }, ...maintenanceLines(set)));
+  }
+  if (set.state === "copying") {
+    lines.append(el("div", { id: `copy-progress-${set.id}`, class: "lines tight" }, ...copyLines(set)));
   }
   if (set.last_backup) {
     const b = set.last_backup;
@@ -631,6 +693,7 @@ function setCard(set) {
     toast(`${set.name}: removed ${p.snapshots_removed} old version(s), freed about ${bytes(p.bytes_deleted)}`);
   }, prune));
   const more = el("button", { class: "btn small", onclick: () => setSettingsDialog(set) }, "Settings…");
+  const addPlace = el("button", { class: "btn small", onclick: () => placeDialog(set) }, "Also keep copies in…");
 
   const offline = set.target.kind === "peer" && set.target_online === false;
   return el("div", { class: "card" },
@@ -644,9 +707,162 @@ function setCard(set) {
       `${peerName(set.target.id)} can't be reached right now${lastOnline(set.target.id)}. `
       + "Changes are backed up automatically as soon as it's back online.") : null,
     set.state === "paused" ? el("div", { class: "notice warn" }, "Paused: changes aren't being backed up. Restores still work.") : null,
+    placesList(set),
     el("div", { class: "actions" }, backup,
       el("button", { class: "btn small", onclick: () => { state.restoreSet = set.id; go("restore"); } }, "Restore…"),
-      check, prune, pause, more));
+      check, prune, pause, addPlace, more));
+}
+
+// ----- extra places -----
+
+/** The extra places a set's versions are copied to, each with its own keep rules. */
+function placesList(set) {
+  const places = set.extra_targets || [];
+  if (!places.length) return null;
+  return el("div", { class: "places" },
+    el("div", { class: "places-head" }, "Copies also kept in"),
+    ...places.map((p) => {
+      const copy = p.last_copy
+        ? `last copied ${ago(p.last_copy.time_unix)} (${plural(p.last_copy.snapshots, "version")}, ${bytes(p.last_copy.bytes)})`
+        : "nothing copied yet";
+      const limits = [`keeps ${describePolicy(p.retention)}`];
+      if (p.upload_limit) limits.push(`max ${bytes(p.upload_limit)}/s`);
+      if (p.window) limits.push(`copies automatically ${p.window}`);
+      const upkeep = [];
+      if (p.last_prune) upkeep.push(`cleaned up ${ago(p.last_prune.time_unix)}`);
+      if (p.last_verify) upkeep.push(p.last_verify.ok ? `checked ${ago(p.last_verify.time_unix)}: all good` : `check ${ago(p.last_verify.time_unix)} found problems`);
+      const relay = set.target.kind === "peer" ? peerName(set.target.id) : "the main place";
+      const f = p.forwarding;
+      return el("div", { class: "place" },
+        el("div", { class: "place-main" },
+          el("div", { class: "row" }, el("strong", {}, describeTarget(p.target)), presence(p.online, null),
+            p.relay ? el("span", { class: "muted small" }, `via ${relay}`) : null),
+          el("div", { class: "muted small" }, `${copy} · ${limits.join(" · ")}`),
+          upkeep.length ? el("div", { class: "muted small" }, upkeep.join(" · ")) : null,
+          f ? el("div", { class: "small" },
+            `${relay} is sending ${plural(f.packs_total, "pack")}: ${f.packs_sent} sent (${bytes(f.bytes_sent)})`,
+            f.note ? el("span", { class: "muted" }, ` · ${f.note}`) : null) : null,
+          p.last_error ? el("div", { class: "notice bad" }, p.last_error) : null),
+        el("div", { class: "row" },
+          el("button", { class: "btn small", onclick: () => placeDialog(set, p) }, "Change…"),
+          el("button", { class: "btn small danger", onclick: () => removePlace(set, p) }, "Remove…")));
+    }));
+}
+
+/** What copying to an extra place shows while it runs. */
+function copyLines(set) {
+  const c = state.copying[set.id];
+  const place = c && (set.extra_targets || []).find((p) => p.id === c.target);
+  if (!c || !place) return [el("div", {}, "Copying versions to its other places…")];
+  const percent = c.total ? (100 * c.done) / c.total : 100;
+  return [
+    el("div", {}, `Copying to ${describeTarget(place.target)}: ${bytes(c.done)} of ${bytes(c.total)}`),
+    el("div", { class: "progress" }, el("div", { style: `width:${percent.toFixed(1)}%` })),
+  ];
+}
+
+function updateCopyProgress(setId) {
+  const box = document.getElementById(`copy-progress-${setId}`);
+  const set = state.status?.sets.find((s) => s.id === setId);
+  if (box && set) box.replaceChildren(...copyLines(set));
+}
+
+// Keep rules for extra places. Only rules without "latest N" keep the place
+// sparse: with them, every new version is copied.
+const PLACE_PRESETS = [
+  ["daily", "A version a day for 2 weeks, then weekly, monthly and yearly", { daily: 14, weekly: 8, monthly: 12, yearly: 5 }],
+  ["weekly", "A version a week for 2 months, then monthly and yearly", { weekly: 8, monthly: 12, yearly: 5 }],
+  ["monthly", "A version a month for a year, then yearly", { monthly: 12, yearly: 5 }],
+  ["recommended", "Recommended (every new version, thinned out over time)", { last: 10, hourly: 24, daily: 14, weekly: 8, monthly: 12, yearly: 5 }],
+  ["all", "Every version (uses the most space)", {}],
+];
+const POLICY_KEYS = ["last", "hourly", "daily", "weekly", "monthly", "yearly"];
+
+function samePolicy(a, b) {
+  return POLICY_KEYS.every((k) => (a[k] ?? null) === (b[k] ?? null));
+}
+
+/** Adds an extra place to a set, or changes one (`place`). */
+async function placeDialog(set, place) {
+  document.getElementById("modal").close();
+  const taken = new Set([set.target, ...(set.extra_targets || []).map((p) => p.target)]
+    .filter((t) => t.kind === "peer").map((t) => t.id));
+  const hosts = state.peers.filter((p) => !taken.has(p.id))
+    .sort((a, b) => !!b.mine - !!a.mine || !!b.hosts_us - !!a.hosts_us);
+  const options = [
+    ...hosts.map((p) => [`peer:${p.id}`, `${p.mine ? "" : "Friend: "}${p.name || shortId(p.id)}${p.online === false ? " · offline" : ""}`]),
+    ["local", "A folder or external drive…"],
+    ["id", "Another KinVault instance (paste its id)…"],
+  ];
+  const r = place?.retention || PLACE_PRESETS[0][2];
+  const preset = PLACE_PRESETS.find(([, , p]) => samePolicy(p, r))?.[0] || "custom";
+  const [ws, we] = (place?.window || "-").split("-");
+  const custom = preset === "custom";
+  // Copies can go through the main place's host only when both are other computers.
+  const relayHost = set.target.kind === "peer" ? peerName(set.target.id) : null;
+  const v = await form({
+    title: place ? `Copies of ${set.name} in ${describeTarget(place.target)}` : `Also keep copies of ${set.name}`,
+    intro: place ? null : "After each backup, this place gets the versions it keeps, encrypted the same way. "
+      + "With a version a day, the first backup of each day is copied straight away. You can restore from either place.",
+    fields: [
+      ...(place ? [] : [
+        { name: "dest", label: "Where", type: "select", options, value: options[0][0], onchange: (d) => { show("peerId", d === "id"); show("localPath", d === "local"); } },
+        { name: "peerId", label: "Instance id", placeholder: "64-character id", hidden: options[0][0] !== "id" },
+        { name: "localPath", label: "Folder", type: "folders", hidden: options[0][0] !== "local" },
+      ]),
+      { name: "keep", label: "Versions to keep there", type: "select", value: preset,
+        options: [...PLACE_PRESETS.map(([k, label]) => [k, label]), ["custom", "Choose…"]],
+        onchange: (k) => { for (const n of ["pLast", "pDaily", "pWeekly", "pMonthly"]) show(n, k === "custom"); } },
+      { type: "pair", fields: [
+        { name: "pLast", label: "Keep latest", type: "number", min: "0", value: r.last ?? "", hidden: !custom },
+        { name: "pDaily", label: "Keep daily", type: "number", min: "0", value: r.daily ?? "", hidden: !custom },
+      ] },
+      { type: "pair", fields: [
+        { name: "pWeekly", label: "Keep weekly", type: "number", min: "0", value: r.weekly ?? "", hidden: !custom },
+        { name: "pMonthly", label: "Keep monthly", type: "number", min: "0", value: r.monthly ?? "", hidden: !custom },
+      ] },
+      { name: "rate", label: "Upload speed limit (MB/s)", type: "number", min: "0", step: "any", placeholder: "No limit", value: place?.upload_limit ? (place.upload_limit / MiB).toFixed(1) : "" },
+      { type: "pair", fields: [
+        { name: "from", label: "Copy automatically from", type: "time", value: ws || "", hint: "Leave empty for any time" },
+        { name: "to", label: "until", type: "time", value: we || "" },
+      ] },
+      ...(relayHost && place?.target.kind !== "local" ? [{
+        name: "relay", type: "checkbox", value: place ? place.relay : true,
+        label: `Send copies through ${relayHost}`,
+        hint: `${relayHost} forwards them on its own, even while this computer is off, and your upload is only used once. `
+          + "It can't read them, and can only add to this place: it can't see or delete what's there. (Not for folders.)",
+      }] : []),
+    ],
+    ok: place ? "Save" : "Add",
+    validate: (v) => {
+      if (!place && v.dest === "id" && !/^[0-9a-f]{64}$/i.test(v.peerId)) return "Paste the 64-character instance id.";
+      if (!place && v.dest === "local" && !v.localPath.length) return "Choose the folder.";
+      return windowProblem(v);
+    },
+    onSubmit: async (v) => {
+      const num = (x) => (x === "" ? null : Math.max(0, Math.floor(Number(x))));
+      const retention = v.keep === "custom"
+        ? { last: num(v.pLast), hourly: r.hourly ?? null, daily: num(v.pDaily), weekly: num(v.pWeekly), monthly: num(v.pMonthly), yearly: r.yearly ?? null }
+        : PLACE_PRESETS.find(([k]) => k === v.keep)[2];
+      const limits = { upload_limit: toBytes(v.rate, MiB), window: windowFrom(v.from, v.to) };
+      const relay = !!v.relay;
+      if (place) {
+        await call("update_set_target", { set: set.id, target: place.id, retention, ...limits, relay });
+      } else {
+        const target = v.dest === "local" ? { kind: "local", path: v.localPath[0] }
+          : { kind: "peer", id: v.dest === "id" ? v.peerId.toLowerCase() : v.dest.slice(5), addrs: [] };
+        await call("add_set_target", { set: set.id, target, retention, ...limits, relay: relay && v.dest !== "local" });
+      }
+    },
+  });
+  if (v) toast(place ? "Saved" : "Added. Copies go there after the next backup.");
+}
+
+async function removePlace(set, place) {
+  if (!await confirmDialog(`Stop keeping copies in ${describeTarget(place.target)}?`,
+    `${set.name} stops copying versions there, and what it holds is erased in a week. Backups in its other places aren't affected.`,
+    "Stop keeping copies")) return;
+  await attempt(() => call("remove_set_target", { set: set.id, target: place.id }));
 }
 
 async function resumeSet(set) {
@@ -778,8 +994,7 @@ async function newSetDialog() {
         { name: "from", label: "Back up automatically from", type: "time", hint: "Leave empty for any time" },
         { name: "to", label: "until", type: "time" },
       ] },
-      { name: "pass", label: "Recovery passphrase", type: "password", hint: "Protects this backup's recovery file. At least 8 characters." },
-      { name: "pass2", label: "Repeat passphrase", type: "password" },
+      { name: "ownKey", label: "Use a separate encryption key for this backup", type: "checkbox", value: false, hint: "Normally your backups share one key. A separate key keeps this one apart even from hosts that also store your other backups." },
     ],
     ok: "Start backing up",
     validate: (v) => {
@@ -787,8 +1002,6 @@ async function newSetDialog() {
       if (!v.paths.length) return "Choose at least one folder to back up.";
       if (v.dest === "id" && !/^[0-9a-f]{64}$/i.test(v.peerId)) return "Paste the 64-character instance id.";
       if (v.dest === "local" && !v.localPath.length) return "Choose the backup folder.";
-      if (v.pass.length < 8) return "The passphrase needs at least 8 characters.";
-      if (v.pass !== v.pass2) return "The passphrases don't match.";
       return windowProblem(v);
     },
     onSubmit: async (v) => {
@@ -796,9 +1009,10 @@ async function newSetDialog() {
         : { kind: "peer", id: v.dest === "id" ? v.peerId.toLowerCase() : v.dest.slice(5), addrs: [] };
       const retention = { recommended: null, all: {}, month: { last: 3, daily: 31, monthly: 12 } }[v.keep];
       await call("create_set", {
-        name: v.name, paths: v.paths, target, recovery_passphrase: v.pass,
+        name: v.name, paths: v.paths, target,
         debounce_secs: null, rescan_secs: null, upload_limit: toBytes(v.rate, MiB),
         window: windowFrom(v.from, v.to), retention, excludes: excludesFrom(v.excludes),
+        own_key: v.ownKey,
       });
     },
   });
@@ -809,17 +1023,20 @@ async function newSetDialog() {
 
 let snapshotsRequest = 0;
 
-async function loadSnapshots(setId) {
+/** Loads a backup's versions from one of its places (`from`: null for the main one). */
+async function loadSnapshots(setId, from = setId === state.restoreSet ? state.restoreFrom : null) {
   const request = ++snapshotsRequest;
   state.restoreSet = setId;
+  state.restoreFrom = from;
   state.snapshotsSet = setId;
+  state.snapshotsFrom = from;
   state.selectedSnapshot = null;
   state.snapshots = [];
   state.snapshotsError = null;
   state.snapshotsLoading = true;
   render();
   try {
-    const snaps = await call("list_snapshots", { set: setId });
+    const snaps = await call("list_snapshots", { set: setId, from });
     if (request !== snapshotsRequest) return; // another backup was chosen meanwhile
     state.snapshots = snaps.reverse();
   } catch (e) {
@@ -830,15 +1047,21 @@ async function loadSnapshots(setId) {
   if (state.page === "restore") render();
 }
 
+/** The place of a set that versions are being restored from. */
+function restorePlace(set) {
+  return (set?.extra_targets || []).find((p) => p.id === state.restoreFrom)?.target || set?.target;
+}
+
 /** What the versions card shows instead of the table, if anything. */
 function snapshotsNotice(set) {
+  const target = restorePlace(set);
   if (state.snapshotsLoading) {
-    const from = set?.target.kind === "peer" ? ` from ${peerName(set.target.id)}` : "";
+    const from = target?.kind === "peer" ? ` from ${peerName(target.id)}` : "";
     return el("div", { class: "muted" }, `Loading versions${from}…`);
   }
   if (state.snapshotsError) {
-    const offline = set?.target.kind === "peer"
-      ? ` Check that ${peerName(set.target.id)} is switched on and connected, then try again.` : "";
+    const offline = target?.kind === "peer"
+      ? ` Check that ${peerName(target.id)} is switched on and connected, then try again.` : "";
     return el("div", { class: "notice bad" }, `Couldn't load the versions: ${state.snapshotsError}.${offline}`);
   }
   if (!state.snapshots.length) return el("div", { class: "muted" }, "No versions yet. They appear after the first backup finishes.");
@@ -861,7 +1084,13 @@ function renderRestore() {
   const picker = el("select", { onchange: (e) => loadSnapshots(e.target.value) },
     sets.map((s) => el("option", { value: s.id, selected: s.id === state.restoreSet },
       s.stopped_unix ? `${s.name} (stopped)` : s.name)));
-  page.append(el("div", { class: "card" }, el("div", { class: "field", style: "margin-top:0" }, el("label", {}, "Backup"), picker)));
+  const chosen = sets.find((s) => s.id === state.restoreSet);
+  const places = chosen?.extra_targets || [];
+  const source = places.length ? el("div", { class: "field" }, el("label", {}, "Restore from"),
+    el("select", { onchange: (e) => loadSnapshots(state.restoreSet, e.target.value || null) },
+      el("option", { value: "", selected: !state.restoreFrom }, `${describeTarget(chosen.target)} (main)`),
+      places.map((p) => el("option", { value: p.id, selected: p.id === state.restoreFrom }, describeTarget(p.target))))) : null;
+  page.append(el("div", { class: "card" }, el("div", { class: "field", style: "margin-top:0" }, el("label", {}, "Backup"), picker), source));
 
   const table = el("table", {}, el("thead", {}, el("tr", {}, el("th", {}, "Version from"), el("th", {}, "Computer"), el("th", {}, "Files"), el("th", {}, "Size"))));
   const tbody = el("tbody");
@@ -894,7 +1123,7 @@ async function restoreDialog() {
     ok: "Restore",
     validate: (v) => (v.target.length ? null : "Choose where to restore to."),
     onSubmit: async (v) => {
-      await call("start_restore", { set: state.restoreSet, snapshot: snap.id, target: v.target[0], include: v.include || null });
+      await call("start_restore", { set: state.restoreSet, snapshot: snap.id, target: v.target[0], include: v.include || null, from: state.restoreFrom });
     },
   });
   if (v) toast("Restoring in the background. You can keep using KinVault meanwhile.");
@@ -931,9 +1160,10 @@ function restoreCard(job) {
  * Shows a backup's latest progress without redrawing the page, which would
  * restart the progress bar's animation on every update.
  */
-function updateBackupProgress(progress) {
-  const line = document.getElementById(`backup-progress-${progress.set}`);
-  if (line) line.textContent = backupProgressText(progress);
+function updateBackupProgress(setId) {
+  const box = document.getElementById(`backup-progress-${setId}`);
+  const set = state.status?.sets.find((s) => s.id === setId);
+  if (box && set) box.replaceChildren(...backupProgressLines(set));
   else if (state.page === "backups") renderBackups();
 }
 
@@ -1431,7 +1661,8 @@ function go(page) {
   if (page === "mine" || page === "friends" || page === "backups") refreshPeers();
   if (page === "mine") refreshNearby();
   // Load the chosen backup's versions unless they're already shown (e.g. a card's Restore… chose another).
-  if (page === "restore" && state.restoreSet && (state.snapshotsError || state.snapshotsSet !== state.restoreSet)) {
+  if (page === "restore" && state.restoreSet
+    && (state.snapshotsError || state.snapshotsSet !== state.restoreSet || state.snapshotsFrom !== state.restoreFrom)) {
     loadSnapshots(state.restoreSet);
   }
   if (page === "settings") refreshNetwork();
@@ -1450,6 +1681,8 @@ async function setConnected(connected) {
     state.network = null;
     state.nearby = { until_unix: null, devices: [] };
     state.progress = {};
+    state.rates = {};
+    state.copying = {};
     state.maintenance = {};
   }
   render();
@@ -1460,21 +1693,26 @@ listen("daemon-event", (e) => {
   const ev = e.payload;
   switch (ev.event) {
     case "progress":
-      state.progress[ev.set] = ev;
-      updateBackupProgress(ev);
+      noteProgress(ev);
+      updateBackupProgress(ev.set);
       break;
     case "maintenance_progress":
       noteMaintenance(ev);
       updateMaintenance(ev.set);
       break;
+    case "copy_progress":
+      state.copying[ev.set] = ev;
+      updateCopyProgress(ev.set);
+      break;
     case "backup_finished":
-      delete state.progress[ev.set];
+      forgetProgress(ev.set);
       refreshSoon();
       break;
     case "set_state": {
       const set = state.status?.sets.find((s) => s.id === ev.set);
       if (set) set.state = ev.state;
-      if (ev.state !== "running") delete state.progress[ev.set];
+      if (ev.state !== "running") forgetProgress(ev.set);
+      if (ev.state !== "copying") delete state.copying[ev.set];
       if (ev.state !== "pruning" && ev.state !== "verifying") delete state.maintenance[ev.set];
       render();
       refreshSoon();
@@ -1539,6 +1777,11 @@ for (const ev of ["scroll", "resize"]) {
     for (const tip of document.querySelectorAll(".info-tip")) if (tip.offsetParent || tip.offsetHeight) tip.place?.();
   }, true);
 }
+
+// A backup sending a pack says for how long, even with no new progress.
+setInterval(() => {
+  for (const [id, p] of Object.entries(state.progress)) if (p.step === "sending") updateBackupProgress(id);
+}, 1000);
 
 // Relative times ("5 min ago") stay fresh.
 setInterval(() => { if (state.page === "backups") renderBackups(); }, 30_000);
