@@ -5,7 +5,7 @@
 //! encrypted; this host can't read it.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,6 +31,8 @@ const FIRST_RETRY: Duration = Duration::from_secs(5 * 60);
 const MAX_RETRY: Duration = Duration::from_secs(60 * 60);
 /// Looks at the queue at least this often, e.g. for windows that opened.
 const IDLE_CHECK: Duration = Duration::from_secs(5 * 60);
+/// When to try again after an order's outcome couldn't be saved.
+const SAVE_RETRY: Duration = Duration::from_secs(5);
 
 /// Forwarding orders waiting or done, one file each.
 #[derive(Debug)]
@@ -101,7 +103,7 @@ impl ForwardQueue {
         blocking_io(move || {
             std::fs::create_dir_all(&dir)?;
             std::fs::write(&tmp, data)?;
-            std::fs::rename(&tmp, &path)
+            replace(&tmp, &path)
         })
         .await
     }
@@ -169,6 +171,9 @@ impl ForwardQueue {
         owner: &EndpointId,
         place: &str,
     ) -> io::Result<Vec<ForwardInfo>> {
+        // Not while a file is being replaced, which Windows refuses while
+        // the file is open.
+        let _guard = self.lock.lock().await;
         Ok(self
             .jobs()
             .await?
@@ -399,8 +404,31 @@ async fn finish(
     job.info.state = state;
     job.info.error = error;
     job.info.updated_unix = unix_now();
-    if let Err(e) = queue.update(job).await {
-        tracing::warn!("couldn't save a forwarding order: {e}");
+    match queue.update(job).await {
+        Ok(()) => None,
+        // It's still pending on disk; look again soon rather than at the
+        // next idle check. Delivering it again is harmless.
+        Err(e) => {
+            tracing::warn!("couldn't save a forwarding order: {e}");
+            Some(SAVE_RETRY)
+        }
     }
-    None
+}
+
+/// Moves `from` over `to`. Windows refuses while another handle has `to`
+/// open (a status read, or a virus scanner), so it tries a few times.
+fn replace(from: &Path, to: &Path) -> io::Result<()> {
+    const TRIES: u32 = 20;
+    for _ in 1..TRIES {
+        match std::fs::rename(from, to) {
+            Err(e) if in_use(&e) => std::thread::sleep(Duration::from_millis(25)),
+            done => return done,
+        }
+    }
+    std::fs::rename(from, to)
+}
+
+/// ERROR_ACCESS_DENIED or ERROR_SHARING_VIOLATION on Windows.
+fn in_use(e: &io::Error) -> bool {
+    cfg!(windows) && matches!(e.raw_os_error(), Some(5 | 32))
 }
