@@ -21,3 +21,9 @@ version uses 4 cores at low priority, so the machine stays usable:
 
 Crashing inputs are saved to `artifacts/<target>/`; replay one with
 `cargo fuzz run -O -a <target> <file>`.
+
+`Cargo.lock` is a copy of the workspace lockfile (plus the fuzzing crates),
+so targets build against the same dependency versions as the shipped
+binaries. After changing dependencies in the main workspace, refresh it:
+
+    cp ../Cargo.lock Cargo.lock && cargo fuzz build
