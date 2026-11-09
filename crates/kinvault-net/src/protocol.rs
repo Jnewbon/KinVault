@@ -386,6 +386,24 @@ pub enum ErrorCode {
     OutsideWindow,
 }
 
+/// Longest name a peer may give itself (as for nearby beacons).
+pub const MAX_PEER_NAME_LEN: usize = 256;
+/// Most host addresses a peer may give, and the longest each may be.
+pub const MAX_PEER_HOSTS: usize = 32;
+pub const MAX_HOST_LEN: usize = 300;
+
+/// Whether a name and host list a peer sent about itself are small enough
+/// to store in the config. Says why not otherwise.
+pub fn check_peer_info(name: Option<&str>, hosts: &[String]) -> Result<(), String> {
+    if name.is_some_and(|n| n.len() > MAX_PEER_NAME_LEN || n.chars().any(char::is_control)) {
+        return Err("the name is too long or has control characters".into());
+    }
+    if hosts.len() > MAX_PEER_HOSTS || hosts.iter().any(|h| h.len() > MAX_HOST_LEN) {
+        return Err("too many or too long host addresses".into());
+    }
+    Ok(())
+}
+
 /// Repository names become directory names on the host.
 pub fn valid_repo_name(name: &str) -> bool {
     (1..=64).contains(&name.len())
@@ -471,4 +489,20 @@ pub(crate) async fn write_payload(
         send.write_all(piece).await.map_err(transport)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_info_limits() {
+        let hosts = vec!["nas.example.org:4433".to_string()];
+        assert!(check_peer_info(Some("Laptop"), &hosts).is_ok());
+        assert!(check_peer_info(None, &[]).is_ok());
+        assert!(check_peer_info(Some(&"x".repeat(MAX_PEER_NAME_LEN + 1)), &[]).is_err());
+        assert!(check_peer_info(Some("bad\nname"), &[]).is_err());
+        assert!(check_peer_info(None, &vec!["h".to_string(); MAX_PEER_HOSTS + 1]).is_err());
+        assert!(check_peer_info(None, &["h".repeat(MAX_HOST_LEN + 1)]).is_err());
+    }
 }

@@ -16,8 +16,8 @@ use crate::error::NetError;
 use crate::limits::{RateLimiter, TimeWindow};
 use crate::protocol::{
     Delegation, Delivery, ErrorCode, ForwardOrder, MAX_HAVE, MAX_OBJECT_LEN, MAX_ORDER_LEN,
-    MAX_REQUEST_LEN, Offer, Op, Request, Response, read_msg, read_payload, valid_repo_name,
-    write_msg,
+    MAX_REQUEST_LEN, Offer, Op, Request, Response, check_peer_info, read_msg, read_payload,
+    valid_repo_name, write_msg,
 };
 
 mod forward;
@@ -408,6 +408,8 @@ impl Receiver {
             hosts,
         } = req.op
         {
+            // From a peer we don't know yet, and kept in the config.
+            check_peer_info(name.as_deref(), &hosts).map_err(|e| (ErrorCode::BadRequest, e))?;
             return self
                 .redeem(InviteRedemption {
                     peer,
@@ -419,6 +421,7 @@ impl Receiver {
                 .await;
         }
         if let Op::Pair { name, hosts } = req.op {
+            check_peer_info(Some(&name), &hosts).map_err(|e| (ErrorCode::BadRequest, e))?;
             return self.pair(PairRequest { peer, name, hosts }).await;
         }
         // From a relay, which may not be a peer itself: allowed if the owner
