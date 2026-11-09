@@ -157,8 +157,13 @@ pub fn read_header_tail(keys: &Keys, pack_len: u64, tail: &[u8]) -> Result<Vec<B
     let header_start_in_tail = tail.len() - needed as usize;
     let header = keys.open_meta(HEADER_AAD, &tail[header_start_in_tail..len_at])?;
     let entries: Vec<BlobEntry> = postcard::from_bytes(&header)?;
-    let blob_area = pack_len - needed;
-    for e in &entries {
+    check_entries(&entries, pack_len - needed)?;
+    Ok(entries)
+}
+
+/// Checks every entry lies within the first `blob_area` bytes of a pack.
+pub fn check_entries(entries: &[BlobEntry], blob_area: u64) -> Result<()> {
+    for e in entries {
         if e.offset
             .checked_add(e.len as u64)
             .is_none_or(|end| end > blob_area)
@@ -166,7 +171,7 @@ pub fn read_header_tail(keys: &Keys, pack_len: u64, tail: &[u8]) -> Result<Vec<B
             return Err(Error::Corrupt("pack entry points outside blob area".into()));
         }
     }
-    Ok(entries)
+    Ok(())
 }
 
 pub fn read_header(keys: &Keys, pack: &[u8]) -> Result<Vec<BlobEntry>> {
@@ -194,6 +199,7 @@ mod tests {
             len: 2,
         };
         assert!(blob_bytes(&[0; 16], &entry).is_err());
+        assert!(check_entries(&[entry], u64::MAX).is_err());
     }
 
     #[test]
