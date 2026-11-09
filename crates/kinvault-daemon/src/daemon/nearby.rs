@@ -20,6 +20,9 @@ use crate::api::{Event, GrantSpec, HostOffer, NearbyDevice, NearbyState, NearbyS
 const NEARBY_SECS: i64 = 3 * 60;
 const ANNOUNCE_EVERY: Duration = Duration::from_secs(2);
 const PAIR_TIMEOUT: Duration = Duration::from_secs(20);
+/// Most devices listed at once. Anyone on the network can send beacons,
+/// so this keeps a flood of made-up ones from growing the list forever.
+const MAX_DEVICES: usize = 64;
 
 pub(super) struct Session {
     until_unix: i64,
@@ -261,6 +264,7 @@ impl Daemon {
             let Some(session) = session.as_mut() else {
                 return;
             };
+            let full = session.devices.len() >= MAX_DEVICES;
             match session
                 .devices
                 .iter_mut()
@@ -272,6 +276,7 @@ impl Daemon {
                     d.addr = beacon.addr;
                     changed
                 }
+                None if full => false,
                 None => {
                     session.devices.push(Found {
                         addr: beacon.addr,
