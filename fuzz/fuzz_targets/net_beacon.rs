@@ -1,6 +1,7 @@
 //! Nearby-device beacons: unauthenticated UDP from anyone on the LAN.
 #![no_main]
 use kinvault_net::nearby::Beacon;
+use kinvault_net::protocol::PeerName;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -8,7 +9,8 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
     if let Some(mut beacon) = Beacon::decode(data) {
-        assert!(beacon.name.len() <= 256);
+        // Decoding must only ever produce names that pass the check.
+        assert!(PeerName::new(beacon.name.as_str()).is_ok());
         // As NearbySocket::recv does with the sender's address.
         let from: std::net::IpAddr = [192, 168, 1, 2].into();
         let ports: Vec<u16> = beacon.addr.ip_addrs().map(|a| a.port()).collect();

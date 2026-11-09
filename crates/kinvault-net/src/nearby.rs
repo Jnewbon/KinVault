@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 
+use crate::protocol::PeerName;
+
 /// UDP port beacons are sent to and received on.
 pub const NEARBY_PORT: u16 = 47101;
 /// Administratively scoped multicast group, for networks that drop broadcasts.
@@ -43,7 +45,7 @@ impl Default for NearbyOptions {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Beacon {
     pub addr: EndpointAddr,
-    pub name: String,
+    pub name: PeerName,
 }
 
 impl Beacon {
@@ -55,8 +57,8 @@ impl Beacon {
 
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let body = bytes.strip_prefix(MAGIC)?;
-        let beacon: Self = postcard::from_bytes(body).ok()?;
-        (beacon.name.len() <= 256).then_some(beacon)
+        // The name is checked while decoding (see PeerName).
+        postcard::from_bytes(body).ok()
     }
 }
 
@@ -139,11 +141,22 @@ mod tests {
             .with_ip_addr("192.0.2.1:4433".parse().unwrap());
         let beacon = Beacon {
             addr,
-            name: "laptop".into(),
+            name: PeerName::lossy("laptop"),
         };
         assert_eq!(Beacon::decode(&beacon.encode()), Some(beacon));
         assert_eq!(Beacon::decode(b"hello"), None);
         assert_eq!(Beacon::decode(b"KVNEAR1garbage"), None);
+    }
+
+    #[test]
+    fn beacons_with_bad_names_are_ignored() {
+        // Built by hand: PeerName can't hold these, so encode the raw fields.
+        let addr = EndpointAddr::new(iroh::SecretKey::generate().public());
+        for name in ["evil\n\u{1b}[2J".to_string(), "x".repeat(257)] {
+            let mut bytes = MAGIC.to_vec();
+            bytes.extend(postcard::to_allocvec(&(&addr, &name)).unwrap());
+            assert_eq!(Beacon::decode(&bytes), None, "{name:?}");
+        }
     }
 
     #[test]
@@ -187,14 +200,14 @@ mod tests {
         let id = iroh::SecretKey::generate().public();
         let beacon = Beacon {
             addr: EndpointAddr::new(id).with_ip_addr("192.0.2.1:4433".parse().unwrap()),
-            name: "nas".into(),
+            name: PeerName::lossy("nas"),
         };
         socket.announce(&beacon).await;
         let got = tokio::time::timeout(std::time::Duration::from_secs(5), socket.recv())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(got.name, "nas");
+        assert_eq!(got.name.as_str(), "nas");
         let addrs: Vec<_> = got.addr.ip_addrs().copied().collect();
         assert!(addrs.contains(&"192.0.2.1:4433".parse().unwrap()));
         assert!(addrs.contains(&"127.0.0.1:4433".parse().unwrap()));

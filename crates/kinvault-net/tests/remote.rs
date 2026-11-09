@@ -285,8 +285,8 @@ async fn invites_grant_access_once() {
     let port = host.router.endpoint().bound_sockets()[0].port();
     let mut ticket = InviteTicket {
         host: EndpointAddr::new(host.router.endpoint().id()),
-        hosts: vec![format!("localhost:{port}")],
-        host_name: "alice".into(),
+        hosts: kinvault_net::protocol::PeerHosts::lossy(vec![format!("localhost:{port}")]),
+        host_name: kinvault_net::protocol::PeerName::lossy("alice"),
         token: [0; 16],
         quota_bytes: Some(1 << 20),
         ask_reciprocal: true,

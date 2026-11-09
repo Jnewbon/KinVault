@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use kinvault_core::{LocalDirBackend, MasterKey};
-use kinvault_net::protocol::{MAX_PEER_HOSTS, MAX_PEER_NAME_LEN};
+use kinvault_net::protocol::{MAX_PEER_HOSTS, MAX_PEER_NAME_LEN, PeerHosts, PeerName};
 use kinvault_net::{
     Endpoint, EndpointId, HostAddr, InviteAccepted, InviteRedemption, InviteTicket, Offer,
     Receiver, RemoteBackend,
@@ -1271,8 +1271,8 @@ impl Daemon {
         let mut config = self.inner.config.lock().await;
         let ticket = InviteTicket {
             host: self.inner.endpoint.addr(),
-            hosts: self.public_hosts(&config),
-            host_name: Self::instance_name(&config),
+            hosts: PeerHosts::lossy(self.public_hosts(&config)),
+            host_name: PeerName::lossy(&Self::instance_name(&config)),
             token,
             quota_bytes: req.grant.quota_bytes,
             ask_reciprocal: req.ask_reciprocal,
@@ -1372,7 +1372,7 @@ impl Daemon {
         entry.name = name.or(Some(accepted.host_name.clone()));
         entry.mine |= mine;
         entry.addrs = ticket.host.ip_addrs().copied().collect();
-        entry.hosts = ticket.hosts.clone();
+        entry.hosts = ticket.hosts.to_vec();
         entry.hosts_us = Some(HostOffer {
             quota_bytes: accepted.quota_bytes,
         });

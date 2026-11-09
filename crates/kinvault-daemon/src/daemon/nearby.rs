@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use kinvault_net::nearby::{Beacon, NearbySocket, pairing_code};
-use kinvault_net::protocol::clamp_peer_name;
+use kinvault_net::protocol::PeerName;
 use kinvault_net::{EndpointAddr, EndpointId, NetError, PairRequest};
 
 use super::{Daemon, Inner, unix_now};
@@ -240,7 +240,7 @@ async fn run(inner: std::sync::Weak<Inner>, socket: NearbySocket) {
                 let name = Daemon::instance_name(&*daemon.inner.config.lock().await);
                 let beacon = Beacon {
                     addr: daemon.inner.endpoint.addr(),
-                    name: clamp_peer_name(&name),
+                    name: PeerName::lossy(&name),
                 };
                 socket.announce(&beacon).await;
             }
@@ -275,8 +275,8 @@ impl Daemon {
                 .find(|d| d.addr.id == beacon.addr.id)
             {
                 Some(d) => {
-                    let changed = d.name != beacon.name;
-                    d.name = beacon.name;
+                    let changed = d.name != beacon.name.as_str();
+                    d.name = beacon.name.into_string();
                     d.addr = beacon.addr;
                     changed
                 }
@@ -284,7 +284,7 @@ impl Daemon {
                 None => {
                     session.devices.push(Found {
                         addr: beacon.addr,
-                        name: beacon.name,
+                        name: beacon.name.into_string(),
                         confirmed: false,
                         paired: false,
                     });

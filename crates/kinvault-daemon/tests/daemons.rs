@@ -1010,7 +1010,7 @@ async fn configured_addresses_travel_in_invites() {
     };
     let decoded = kinvault_net::InviteTicket::decode(&ticket).unwrap();
     let alice_hosts = vec![format!("localhost:{port}"), "198.51.100.4:7000".to_string()];
-    assert_eq!(decoded.hosts, alice_hosts);
+    assert_eq!(decoded.hosts.to_vec(), alice_hosts);
 
     call(
         &bob,
