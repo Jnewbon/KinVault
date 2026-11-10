@@ -67,21 +67,21 @@ pub enum Op {
     RedeemInvite {
         token: [u8; 16],
         /// What the host should call the redeeming peer.
-        name: Option<String>,
+        name: Option<PeerName>,
         /// Storage the redeeming peer offers the host in return.
         offer: Option<Offer>,
         /// Addresses the redeeming peer's owner configured, so the host can
         /// reach it for reciprocal backups.
-        hosts: Vec<String>,
+        hosts: PeerHosts,
     },
     /// Asks to be paired as one of the host owner's own devices, after both
     /// owners confirmed it while finding nearby devices. Allowed from peers
     /// the host doesn't know yet; `repo` is ignored.
     Pair {
         /// The requesting instance's name.
-        name: String,
+        name: PeerName,
         /// Addresses the requesting peer's owner configured.
-        hosts: Vec<String>,
+        hosts: PeerHosts,
     },
     /// Erases the whole repository. The host hides it at once and deletes
     /// it after [`REPO_DELETE_DELAY`](crate::REPO_DELETE_DELAY), so a
@@ -359,11 +359,11 @@ pub enum Response {
         message: String,
     },
     Redeemed {
-        host_name: String,
+        host_name: PeerName,
         quota_bytes: Option<u64>,
     },
     Paired {
-        host_name: String,
+        host_name: PeerName,
     },
     DeleteScheduled {
         /// When the host erases the repository (Unix seconds).
@@ -384,6 +384,136 @@ pub enum ErrorCode {
     Internal,
     /// Uploads are only accepted during the host's time window.
     OutsideWindow,
+}
+
+/// Longest name a peer may give itself.
+pub const MAX_PEER_NAME_LEN: usize = 256;
+/// Most host addresses a peer may give.
+pub const MAX_PEER_HOSTS: usize = 32;
+
+/// A name a peer gives itself (or this instance gives itself to peers):
+/// at most [`MAX_PEER_NAME_LEN`] bytes, without control characters. It is
+/// checked while decoding, so a message carrying a bad one fails to decode
+/// wherever it arrives.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[serde(try_from = "String", into = "String")]
+pub struct PeerName(String);
+
+impl PeerName {
+    pub fn new(name: impl Into<String>) -> Result<Self, String> {
+        let name = name.into();
+        if name.len() > MAX_PEER_NAME_LEN || name.chars().any(char::is_control) {
+            return Err(format!(
+                "a name must be at most {MAX_PEER_NAME_LEN} bytes, without control characters"
+            ));
+        }
+        Ok(Self(name))
+    }
+
+    /// Makes any name fit: drops control characters and cuts it to
+    /// [`MAX_PEER_NAME_LEN`] bytes. For names this instance sends, so a
+    /// long configured name doesn't make peers refuse it.
+    pub fn lossy(name: &str) -> Self {
+        let mut out = String::new();
+        for c in name.chars().filter(|c| !c.is_control()) {
+            if out.len() + c.len_utf8() > MAX_PEER_NAME_LEN {
+                break;
+            }
+            out.push(c);
+        }
+        Self(out)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl TryFrom<String> for PeerName {
+    type Error = String;
+    fn try_from(name: String) -> Result<Self, String> {
+        Self::new(name)
+    }
+}
+
+impl From<PeerName> for String {
+    fn from(name: PeerName) -> String {
+        name.0
+    }
+}
+
+impl std::ops::Deref for PeerName {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for PeerName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Addresses a peer says it can be reached at: at most
+/// [`MAX_PEER_HOSTS`], each a valid [`HostAddr`](crate::HostAddr). Checked
+/// while decoding, like [`PeerName`].
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(try_from = "Vec<String>", into = "Vec<String>")]
+pub struct PeerHosts(Vec<String>);
+
+impl PeerHosts {
+    pub fn new(hosts: Vec<String>) -> Result<Self, String> {
+        if hosts.len() > MAX_PEER_HOSTS {
+            return Err(format!(
+                "at most {MAX_PEER_HOSTS} host addresses are allowed"
+            ));
+        }
+        if let Some(bad) = hosts.iter().find(|h| h.parse::<crate::HostAddr>().is_err()) {
+            return Err(format!("{bad:?} is not a valid host address"));
+        }
+        Ok(Self(hosts))
+    }
+
+    /// Makes any list fit: drops entries that aren't valid addresses and
+    /// keeps the first [`MAX_PEER_HOSTS`]. For lists this instance sends.
+    pub fn lossy(hosts: Vec<String>) -> Self {
+        Self(
+            hosts
+                .into_iter()
+                .filter(|h| h.parse::<crate::HostAddr>().is_ok())
+                .take(MAX_PEER_HOSTS)
+                .collect(),
+        )
+    }
+
+    pub fn into_vec(self) -> Vec<String> {
+        self.0
+    }
+}
+
+impl TryFrom<Vec<String>> for PeerHosts {
+    type Error = String;
+    fn try_from(hosts: Vec<String>) -> Result<Self, String> {
+        Self::new(hosts)
+    }
+}
+
+impl From<PeerHosts> for Vec<String> {
+    fn from(hosts: PeerHosts) -> Vec<String> {
+        hosts.0
+    }
+}
+
+impl std::ops::Deref for PeerHosts {
+    type Target = [String];
+    fn deref(&self) -> &[String] {
+        &self.0
+    }
 }
 
 /// Repository names become directory names on the host.
@@ -471,4 +601,49 @@ pub(crate) async fn write_payload(
         send.write_all(piece).await.map_err(transport)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_names_are_checked() {
+        assert!(PeerName::new("Laptop").is_ok());
+        assert!(PeerName::new("é".repeat(128)).is_ok());
+        assert!(PeerName::new("x".repeat(MAX_PEER_NAME_LEN + 1)).is_err());
+        assert!(PeerName::new("bad\nname").is_err());
+        // Decoding checks too, so a bad name can't arrive in any message.
+        let bad = postcard::to_allocvec(&"bad\u{1b}name").unwrap();
+        assert!(postcard::from_bytes::<PeerName>(&bad).is_err());
+        let good = postcard::to_allocvec(&"Laptop").unwrap();
+        assert_eq!(
+            postcard::from_bytes::<PeerName>(&good).unwrap().as_str(),
+            "Laptop"
+        );
+    }
+
+    #[test]
+    fn peer_hosts_are_checked() {
+        let ok = vec!["nas.example.org:4433".to_string(), "192.0.2.1".into()];
+        assert!(PeerHosts::new(ok).is_ok());
+        assert!(PeerHosts::new(vec!["not a host\n".into()]).is_err());
+        assert!(PeerHosts::new(vec!["192.0.2.1".into(); MAX_PEER_HOSTS + 1]).is_err());
+        let bad = postcard::to_allocvec(&vec!["\0\0"]).unwrap();
+        assert!(postcard::from_bytes::<PeerHosts>(&bad).is_err());
+    }
+
+    #[test]
+    fn lossy_values_are_always_valid() {
+        // Multi-byte characters straddling the limit must not be split.
+        let name = PeerName::lossy(&format!("a\n{}", "é".repeat(200)));
+        assert!(PeerName::new(name.as_str()).is_ok());
+        assert!(name.starts_with("aé"));
+        let mut hosts = vec!["not a host".to_string()];
+        hosts.extend((0..40).map(|i| format!("host{i}.example:1")));
+        let hosts = PeerHosts::lossy(hosts);
+        assert_eq!(hosts.len(), MAX_PEER_HOSTS);
+        assert_eq!(hosts[0], "host0.example:1");
+        assert!(PeerHosts::new(hosts.into_vec()).is_ok());
+    }
 }

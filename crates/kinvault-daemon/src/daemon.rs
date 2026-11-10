@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use kinvault_core::{LocalDirBackend, MasterKey};
+use kinvault_net::protocol::{MAX_PEER_HOSTS, MAX_PEER_NAME_LEN, PeerHosts, PeerName};
 use kinvault_net::{
     Endpoint, EndpointId, HostAddr, InviteAccepted, InviteRedemption, InviteTicket, Offer,
     Receiver, RemoteBackend,
@@ -385,6 +386,16 @@ impl Daemon {
             Request::SetInstanceName { name } => {
                 let name = name.trim().to_string();
                 ensure!(!name.is_empty(), "name must not be empty");
+                // Peers refuse names that break these limits when pairing
+                // or redeeming invites.
+                ensure!(
+                    name.len() <= MAX_PEER_NAME_LEN,
+                    "name must be at most {MAX_PEER_NAME_LEN} bytes"
+                );
+                ensure!(
+                    !name.chars().any(char::is_control),
+                    "name must not contain control characters"
+                );
                 let mut config = self.inner.config.lock().await;
                 config.name = Some(name);
                 config.save(&self.config_path())?;
@@ -793,6 +804,11 @@ impl Daemon {
                         hosts.push(host);
                     }
                 }
+                // Peers only accept this many from an instance.
+                ensure!(
+                    hosts.len() <= MAX_PEER_HOSTS,
+                    "at most {MAX_PEER_HOSTS} public addresses can be given"
+                );
                 settings.public_hosts = hosts;
                 let mut config = self.inner.config.lock().await;
                 config.listen_port = settings.listen_port;
@@ -1255,8 +1271,8 @@ impl Daemon {
         let mut config = self.inner.config.lock().await;
         let ticket = InviteTicket {
             host: self.inner.endpoint.addr(),
-            hosts: self.public_hosts(&config),
-            host_name: Self::instance_name(&config),
+            hosts: PeerHosts::lossy(self.public_hosts(&config)),
+            host_name: PeerName::lossy(&Self::instance_name(&config)),
             token,
             quota_bytes: req.grant.quota_bytes,
             ask_reciprocal: req.ask_reciprocal,
@@ -1356,7 +1372,7 @@ impl Daemon {
         entry.name = name.or(Some(accepted.host_name.clone()));
         entry.mine |= mine;
         entry.addrs = ticket.host.ip_addrs().copied().collect();
-        entry.hosts = ticket.hosts.clone();
+        entry.hosts = ticket.hosts.to_vec();
         entry.hosts_us = Some(HostOffer {
             quota_bytes: accepted.quota_bytes,
         });

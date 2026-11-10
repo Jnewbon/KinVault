@@ -16,8 +16,8 @@ use crate::error::NetError;
 use crate::limits::{RateLimiter, TimeWindow};
 use crate::protocol::{
     Delegation, Delivery, ErrorCode, ForwardOrder, MAX_HAVE, MAX_OBJECT_LEN, MAX_ORDER_LEN,
-    MAX_REQUEST_LEN, Offer, Op, Request, Response, read_msg, read_payload, valid_repo_name,
-    write_msg,
+    MAX_REQUEST_LEN, Offer, Op, PeerName, Request, Response, read_msg, read_payload,
+    valid_repo_name, write_msg,
 };
 
 mod forward;
@@ -340,7 +340,8 @@ impl Receiver {
             .map_err(|e| (ErrorCode::Denied, e))?;
         Ok((
             Response::Redeemed {
-                host_name: accepted.host_name,
+                // Peers check the name, so send it trimmed to what they accept.
+                host_name: PeerName::lossy(&accepted.host_name),
                 quota_bytes: accepted.quota_bytes,
             },
             None,
@@ -353,7 +354,12 @@ impl Receiver {
             return Err((ErrorCode::Denied, "this host does not pair".into()));
         };
         let host_name = handler(request).await.map_err(|e| (ErrorCode::Denied, e))?;
-        Ok((Response::Paired { host_name }, None))
+        Ok((
+            Response::Paired {
+                host_name: PeerName::lossy(&host_name),
+            },
+            None,
+        ))
     }
 
     /// Hides a peer's repository; [`Self::purge_trash`] erases it later.
@@ -409,17 +415,24 @@ impl Receiver {
         } = req.op
         {
             return self
+                // `name` and `hosts` were checked while decoding.
                 .redeem(InviteRedemption {
                     peer,
                     token,
-                    name,
+                    name: name.map(PeerName::into_string),
                     offer,
-                    hosts,
+                    hosts: hosts.into_vec(),
                 })
                 .await;
         }
         if let Op::Pair { name, hosts } = req.op {
-            return self.pair(PairRequest { peer, name, hosts }).await;
+            return self
+                .pair(PairRequest {
+                    peer,
+                    name: name.into_string(),
+                    hosts: hosts.into_vec(),
+                })
+                .await;
         }
         // From a relay, which may not be a peer itself: allowed if the owner
         // it delivers for signed a permission for it.
@@ -1262,8 +1275,8 @@ mod tests {
         let s = setup(Grant::default()).await;
         let ticket = InviteTicket {
             host: s.addr(),
-            hosts: Vec::new(),
-            host_name: "host".into(),
+            hosts: Default::default(),
+            host_name: crate::protocol::PeerName::lossy("host"),
             token: [0; 16],
             quota_bytes: None,
             ask_reciprocal: false,

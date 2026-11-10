@@ -7,10 +7,11 @@
 
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use kinvault_net::nearby::{Beacon, NearbySocket, pairing_code};
+use kinvault_net::protocol::PeerName;
 use kinvault_net::{EndpointAddr, EndpointId, NetError, PairRequest};
 
 use super::{Daemon, Inner, unix_now};
@@ -20,6 +21,15 @@ use crate::api::{Event, GrantSpec, HostOffer, NearbyDevice, NearbyState, NearbyS
 const NEARBY_SECS: i64 = 3 * 60;
 const ANNOUNCE_EVERY: Duration = Duration::from_secs(2);
 const PAIR_TIMEOUT: Duration = Duration::from_secs(20);
+/// Most devices listed at once. Anyone on the network can send beacons,
+/// so this keeps a flood of made-up ones from growing the list forever.
+const MAX_DEVICES: usize = 64;
+/// Most devices listed from one sender address, so one machine can't fill
+/// the list on its own.
+const MAX_PER_SENDER: usize = 4;
+/// A device not heard from for this long has gone (they announce every
+/// [`ANNOUNCE_EVERY`]), and makes way for new ones.
+const STALE_AFTER: Duration = Duration::from_secs(10);
 
 pub(super) struct Session {
     until_unix: i64,
@@ -33,6 +43,71 @@ struct Found {
     name: String,
     confirmed: bool,
     paired: bool,
+    last_seen: Instant,
+    /// When the newest beacon accepted from it was sent (its clock).
+    sent_unix: i64,
+}
+
+impl Found {
+    /// Confirmed and paired devices stay listed until the session ends.
+    fn evictable(&self) -> bool {
+        !self.confirmed && !self.paired
+    }
+}
+
+/// Adds or updates the device a beacon is from. Returns whether the list
+/// changed. When it is full, gone devices make way first, then the one
+/// heard from least recently, so made-up beacons can't keep a real device
+/// out for the whole session.
+fn record(devices: &mut Vec<Found>, beacon: Beacon, now: Instant) -> bool {
+    if let Some(d) = devices.iter_mut().find(|d| d.addr.id == beacon.addr.id) {
+        // Beacons are signed, but an old one could be replayed to bring
+        // back a name or ports the device no longer uses.
+        if beacon.sent_unix < d.sent_unix {
+            return false;
+        }
+        d.sent_unix = beacon.sent_unix;
+        let changed = d.name != beacon.name.as_str();
+        d.name = beacon.name.into_string();
+        d.addr = beacon.addr;
+        d.last_seen = now;
+        return changed;
+    }
+    let before = devices.len();
+    devices.retain(|d| !d.evictable() || now.duration_since(d.last_seen) < STALE_AFTER);
+    let changed = devices.len() != before;
+    // NearbySocket::recv sets the beacon's addresses to where it came from.
+    let sender: Vec<_> = beacon.addr.ip_addrs().map(|a| a.ip()).collect();
+    let from_sender = devices
+        .iter()
+        .filter(|d| d.addr.ip_addrs().any(|a| sender.contains(&a.ip())))
+        .count();
+    if from_sender >= MAX_PER_SENDER {
+        return changed;
+    }
+    if devices.len() >= MAX_DEVICES {
+        let oldest = devices
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.evictable())
+            .min_by_key(|(_, d)| d.last_seen)
+            .map(|(i, _)| i);
+        match oldest {
+            Some(i) => {
+                devices.remove(i);
+            }
+            None => return changed, // all confirmed or paired
+        }
+    }
+    devices.push(Found {
+        addr: beacon.addr,
+        name: beacon.name.into_string(),
+        confirmed: false,
+        paired: false,
+        last_seen: now,
+        sent_unix: beacon.sent_unix,
+    });
+    true
 }
 
 impl Drop for Session {
@@ -234,8 +309,8 @@ async fn run(inner: std::sync::Weak<Inner>, socket: NearbySocket) {
                     return;
                 }
                 let name = Daemon::instance_name(&*daemon.inner.config.lock().await);
-                let beacon = Beacon { addr: daemon.inner.endpoint.addr(), name };
-                socket.announce(&beacon).await;
+                let beacon = Beacon::new(daemon.inner.endpoint.addr(), PeerName::lossy(&name));
+                socket.announce(&beacon, daemon.inner.endpoint.secret_key()).await;
             }
             received = socket.recv() => match received {
                 Ok(beacon) => {
@@ -261,30 +336,126 @@ impl Daemon {
             let Some(session) = session.as_mut() else {
                 return;
             };
-            match session
-                .devices
-                .iter_mut()
-                .find(|d| d.addr.id == beacon.addr.id)
-            {
-                Some(d) => {
-                    let changed = d.name != beacon.name;
-                    d.name = beacon.name;
-                    d.addr = beacon.addr;
-                    changed
-                }
-                None => {
-                    session.devices.push(Found {
-                        addr: beacon.addr,
-                        name: beacon.name,
-                        confirmed: false,
-                        paired: false,
-                    });
-                    true
-                }
-            }
+            record(&mut session.devices, beacon, Instant::now())
         };
         if changed {
             self.notify(Event::NearbyChanged);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, SocketAddr};
+
+    use kinvault_net::SecretKey;
+
+    use super::*;
+
+    /// A beacon from a new device, as received from `ip`.
+    fn beacon(ip: [u8; 4]) -> Beacon {
+        let addr = EndpointAddr::new(SecretKey::generate().public())
+            .with_ip_addr(SocketAddr::new(IpAddr::from(ip), 4433));
+        Beacon::new(addr, PeerName::lossy("device"))
+    }
+
+    /// Fills the list from distinct senders, all seen at `at`.
+    fn fill(devices: &mut Vec<Found>, at: Instant) {
+        for i in 0..MAX_DEVICES {
+            assert!(record(
+                devices,
+                beacon([10, 0, (i / 250) as u8, (i % 250) as u8]),
+                at
+            ));
+        }
+        assert_eq!(devices.len(), MAX_DEVICES);
+    }
+
+    #[test]
+    fn a_flood_cant_keep_a_real_device_out() {
+        let start = Instant::now();
+        let mut devices = Vec::new();
+        fill(&mut devices, start);
+        // Made-up devices that stop sending go stale and make way.
+        let real = beacon([192, 168, 1, 20]);
+        let id = real.addr.id;
+        assert!(record(&mut devices, real, start + STALE_AFTER));
+        assert!(devices.iter().any(|d| d.addr.id == id));
+        assert_eq!(devices.len(), 1);
+    }
+
+    #[test]
+    fn a_full_list_replaces_the_least_recently_seen() {
+        let start = Instant::now();
+        let mut devices = Vec::new();
+        fill(&mut devices, start);
+        let oldest = devices[0].addr.id;
+        // Everyone but the first device sends again, a little later.
+        let later = start + Duration::from_secs(1);
+        for d in devices.iter_mut().skip(1) {
+            d.last_seen = later;
+        }
+        let real = beacon([192, 168, 1, 20]);
+        let id = real.addr.id;
+        assert!(record(&mut devices, real, later));
+        assert_eq!(devices.len(), MAX_DEVICES);
+        assert!(devices.iter().any(|d| d.addr.id == id));
+        assert!(!devices.iter().any(|d| d.addr.id == oldest));
+    }
+
+    #[test]
+    fn confirmed_and_paired_devices_are_kept() {
+        let start = Instant::now();
+        let mut devices = Vec::new();
+        fill(&mut devices, start);
+        for d in &mut devices {
+            d.confirmed = true;
+        }
+        let much_later = start + STALE_AFTER * 10;
+        assert!(!record(&mut devices, beacon([192, 168, 1, 20]), much_later));
+        assert_eq!(devices.len(), MAX_DEVICES);
+        assert!(devices.iter().all(|d| d.confirmed));
+    }
+
+    #[test]
+    fn one_sender_lists_only_a_few_devices() {
+        let now = Instant::now();
+        let mut devices = Vec::new();
+        for _ in 0..MAX_PER_SENDER {
+            assert!(record(&mut devices, beacon([10, 0, 0, 1]), now));
+        }
+        assert!(!record(&mut devices, beacon([10, 0, 0, 1]), now));
+        assert_eq!(devices.len(), MAX_PER_SENDER);
+        assert!(record(&mut devices, beacon([10, 0, 0, 2]), now));
+    }
+
+    #[test]
+    fn known_devices_are_updated_not_added() {
+        let now = Instant::now();
+        let mut devices = Vec::new();
+        let mut b = beacon([10, 0, 0, 1]);
+        assert!(record(&mut devices, b.clone(), now));
+        b.name = PeerName::lossy("renamed");
+        b.sent_unix += 2;
+        let later = now + Duration::from_secs(2);
+        assert!(record(&mut devices, b.clone(), later));
+        assert!(!record(&mut devices, b, later));
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].name, "renamed");
+        assert_eq!(devices[0].last_seen, later);
+    }
+
+    #[test]
+    fn older_beacons_dont_undo_newer_ones() {
+        let now = Instant::now();
+        let mut devices = Vec::new();
+        let old = beacon([10, 0, 0, 1]);
+        let mut new = old.clone();
+        new.name = PeerName::lossy("renamed");
+        new.sent_unix += 60;
+        assert!(record(&mut devices, new, now));
+        // A replay of the earlier beacon (still validly signed) is ignored.
+        assert!(!record(&mut devices, old, now));
+        assert_eq!(devices[0].name, "renamed");
     }
 }

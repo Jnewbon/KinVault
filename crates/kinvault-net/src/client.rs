@@ -13,8 +13,8 @@ use crate::hosts::with_hosts;
 use crate::limits::RateLimiter;
 use crate::protocol::{
     ALPN, Delegation, Deletion, Delivery, ForwardInfo, ForwardOrder, MAX_OBJECT_LEN,
-    MAX_RESPONSE_LEN, Offer, Op, Request, Response, read_msg, read_payload, valid_repo_name,
-    write_msg, write_payload,
+    MAX_RESPONSE_LEN, Offer, Op, PeerHosts, PeerName, Request, Response, read_msg, read_payload,
+    valid_repo_name, write_msg, write_payload,
 };
 use crate::receiver::InviteAccepted;
 use crate::ticket::InviteTicket;
@@ -307,11 +307,13 @@ pub async fn redeem_invite(
         .map_err(transport)?;
     let req = Request {
         repo: "invite".into(),
+        // Trimmed to what hosts accept, so an over-long configured name or
+        // host list doesn't get every request refused.
         op: Op::RedeemInvite {
             token: ticket.token,
-            name,
+            name: name.as_deref().map(PeerName::lossy),
             offer,
-            hosts,
+            hosts: PeerHosts::lossy(hosts),
         },
     };
     let result = call_once(&conn, &req, None, None).await;
@@ -321,7 +323,7 @@ pub async fn redeem_invite(
             host_name,
             quota_bytes,
         } => Ok(InviteAccepted {
-            host_name,
+            host_name: host_name.into_string(),
             quota_bytes,
         }),
         Response::Error { code, message } => Err(NetError::from_code(code, message)),
@@ -341,12 +343,15 @@ pub async fn pair(
     let conn = endpoint.connect(addr, ALPN).await.map_err(transport)?;
     let req = Request {
         repo: "pair".into(),
-        op: Op::Pair { name, hosts },
+        op: Op::Pair {
+            name: PeerName::lossy(&name),
+            hosts: PeerHosts::lossy(hosts),
+        },
     };
     let result = call_once(&conn, &req, None, None).await;
     conn.close(0u32.into(), b"done");
     match result?.0 {
-        Response::Paired { host_name } => Ok(host_name),
+        Response::Paired { host_name } => Ok(host_name.into_string()),
         Response::Error { code, message } => Err(NetError::from_code(code, message)),
         other => Err(unexpected(&other)),
     }
@@ -600,8 +605,8 @@ mod tests {
     fn ticket(router: &iroh::protocol::Router) -> InviteTicket {
         InviteTicket {
             host: addr_of(router),
-            hosts: Vec::new(),
-            host_name: "host".into(),
+            hosts: Default::default(),
+            host_name: crate::protocol::PeerName::lossy("host"),
             token: [0; 16],
             quota_bytes: None,
             ask_reciprocal: false,

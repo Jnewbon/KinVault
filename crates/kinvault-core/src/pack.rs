@@ -157,13 +157,21 @@ pub fn read_header_tail(keys: &Keys, pack_len: u64, tail: &[u8]) -> Result<Vec<B
     let header_start_in_tail = tail.len() - needed as usize;
     let header = keys.open_meta(HEADER_AAD, &tail[header_start_in_tail..len_at])?;
     let entries: Vec<BlobEntry> = postcard::from_bytes(&header)?;
-    let blob_area = pack_len - needed;
-    for e in &entries {
-        if e.offset + e.len as u64 > blob_area {
+    check_entries(&entries, pack_len - needed)?;
+    Ok(entries)
+}
+
+/// Checks every entry lies within the first `blob_area` bytes of a pack.
+pub fn check_entries(entries: &[BlobEntry], blob_area: u64) -> Result<()> {
+    for e in entries {
+        if e.offset
+            .checked_add(e.len as u64)
+            .is_none_or(|end| end > blob_area)
+        {
             return Err(Error::Corrupt("pack entry points outside blob area".into()));
         }
     }
-    Ok(entries)
+    Ok(())
 }
 
 pub fn read_header(keys: &Keys, pack: &[u8]) -> Result<Vec<BlobEntry>> {
@@ -171,8 +179,9 @@ pub fn read_header(keys: &Keys, pack: &[u8]) -> Result<Vec<BlobEntry>> {
 }
 
 pub fn blob_bytes<'a>(pack: &'a [u8], entry: &BlobEntry) -> Result<&'a [u8]> {
-    let start = entry.offset as usize;
-    pack.get(start..start + entry.len as usize)
+    usize::try_from(entry.offset)
+        .ok()
+        .and_then(|start| pack.get(start..start.checked_add(entry.len as usize)?))
         .ok_or_else(|| Error::Corrupt(format!("blob {:?} outside pack bounds", entry.id)))
 }
 
@@ -180,6 +189,18 @@ pub fn blob_bytes<'a>(pack: &'a [u8], entry: &BlobEntry) -> Result<&'a [u8]> {
 mod tests {
     use super::*;
     use crate::crypto::MasterKey;
+
+    #[test]
+    fn blob_bytes_rejects_overflowing_entries() {
+        let entry = BlobEntry {
+            id: ChunkId([0; 32]),
+            kind: BlobKind::Data,
+            offset: u64::MAX,
+            len: 2,
+        };
+        assert!(blob_bytes(&[0; 16], &entry).is_err());
+        assert!(check_entries(&[entry], u64::MAX).is_err());
+    }
 
     #[test]
     fn pack_roundtrip() {

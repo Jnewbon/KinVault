@@ -30,7 +30,9 @@ impl TimeWindow {
         let parse_hm = |t: &str| -> Option<u16> {
             let (h, m) = t.trim().split_once(':')?;
             let (h, m): (u16, u16) = (h.parse().ok()?, m.parse().ok()?);
-            (h < 24 && m < 60).then_some(h * 60 + m)
+            // `then`, not `then_some`: the sum would be computed (and could
+            // overflow) before the range check.
+            (h < 24 && m < 60).then(|| h * 60 + m)
         };
         Self::new(parse_hm(a).ok_or_else(bad)?, parse_hm(b).ok_or_else(bad)?).ok_or_else(bad)
     }
@@ -132,6 +134,13 @@ impl RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn huge_hours_are_rejected_not_overflowed() {
+        // Found by fuzzing: this used to overflow computing 2222 * 60.
+        assert!(TimeWindow::parse("2222:2222-01:00").is_err());
+        assert!(TimeWindow::parse("01:00-65535:65535").is_err());
+    }
 
     #[test]
     fn windows() {

@@ -1,0 +1,69 @@
+[package]
+name = "kinvault-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+kinvault-core = { path = "../crates/kinvault-core" }
+kinvault-net = { path = "../crates/kinvault-net" }
+kinvault-daemon = { path = "../crates/kinvault-daemon" }
+postcard = { version = "1.1", features = ["use-std"] }
+serde_json = "1"
+iroh = "1.3"
+
+# Kept out of the main workspace so normal builds don't need nightly.
+[workspace]
+
+[[bin]]
+name = "net_request"
+path = "fuzz_targets/net_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "net_response"
+path = "fuzz_targets/net_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "net_beacon"
+path = "fuzz_targets/net_beacon.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "net_ticket"
+path = "fuzz_targets/net_ticket.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "host_addr"
+path = "fuzz_targets/host_addr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "core_pack"
+path = "fuzz_targets/core_pack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "daemon_api"
+path = "fuzz_targets/daemon_api.rs"
+test = false
+doc = false
+bench = false
