@@ -1221,7 +1221,7 @@ function updateRestoreNav() {
 function renderFriends() {
   const page = document.getElementById("page-friends");
   const invite = el("button", { class: "btn primary", disabled: !state.connected, onclick: inviteDialog }, "Invite a friend");
-  const join = el("button", { class: "btn", disabled: !state.connected, onclick: joinDialog }, "Join with a code");
+  const join = el("button", { class: "btn", disabled: !state.connected, onclick: () => joinDialog() }, "Join with a code");
   page.replaceChildren(el("div", { class: "page-head" }, el("h1", {}, "Friends"), el("div", { class: "row" }, join, invite)));
   page.append(el("p", { class: "muted" },
     "Friends can keep encrypted backups on each other's computers. They can't read what you store, and you can't read theirs."));
