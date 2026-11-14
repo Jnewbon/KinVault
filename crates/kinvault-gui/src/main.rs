@@ -50,6 +50,12 @@ async fn daemon_call(state: State<'_, AppState>, request: Value) -> CmdResult<Va
     serde_json::to_value(reply).map_err(err)
 }
 
+/// The desktop app's own version, shown next to the daemon's.
+#[tauri::command]
+fn gui_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
 #[tauri::command]
 fn daemon_running(state: State<'_, AppState>) -> bool {
     ipc::daemon_running(&state.state_dir)
@@ -238,6 +244,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             daemon_call,
+            gui_version,
             daemon_running,
             start_daemon,
             autostart_enabled,

@@ -103,6 +103,8 @@
 
   const commands = {
     daemon_call: ({ request }) => api("/api/call", request),
+    // The web UI is served by the daemon itself, so it has no separate version.
+    gui_version: () => null,
     daemon_running: () => true,
     start_daemon: () => Promise.reject("The service runs inside the server; restart the container instead."),
     autostart_enabled: () => false,

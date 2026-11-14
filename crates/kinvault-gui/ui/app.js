@@ -14,6 +14,7 @@ const state = {
   page: "backups",
   connected: false,
   status: null, // DaemonStatus
+  guiVersion: null, // null in the web interface, where the daemon serves the UI
   peers: [],
   invites: [],
   network: null, // NetworkInfo
@@ -445,12 +446,23 @@ function render() {
   document.getElementById("conn-text").textContent = state.connected
     ? (state.status ? state.status.name : "Connected")
     : "Service not running";
+  renderVersion();
   const renderers = { backups: renderBackups, restore: renderRestore, mine: renderMine, friends: renderFriends, settings: renderSettings };
   for (const name of Object.keys(renderers)) {
     document.getElementById(`page-${name}`).hidden = name !== state.page;
   }
   renderers[state.page]();
   updateRestoreNav();
+}
+
+function renderVersion() {
+  const daemon = state.connected && state.status ? state.status.version : null;
+  const parts = [];
+  if (state.guiVersion) parts.push(`GUI v${state.guiVersion}`);
+  if (daemon) parts.push(state.guiVersion ? `Daemon v${daemon}` : `v${daemon}`);
+  const text = document.getElementById("version-text");
+  text.textContent = parts.join(" · ");
+  text.title = parts.join("\n");
 }
 
 function renderBanner() {
@@ -1787,6 +1799,7 @@ setInterval(() => {
 setInterval(() => { if (state.page === "backups") renderBackups(); }, 30_000);
 
 (async () => {
+  state.guiVersion = await invoke("gui_version").catch(() => null);
   state.autostart = await invoke("autostart_enabled").catch(() => false);
   await setConnected(await invoke("daemon_running").catch(() => false));
 })();

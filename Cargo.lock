@@ -2762,7 +2762,7 @@ dependencies = [
 
 [[package]]
 name = "kinvault-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2773,7 +2773,7 @@ dependencies = [
 
 [[package]]
 name = "kinvault-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "argon2",
  "blake3",
@@ -2793,7 +2793,7 @@ dependencies = [
 
 [[package]]
 name = "kinvault-daemon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2820,7 +2820,7 @@ dependencies = [
 
 [[package]]
 name = "kinvault-gui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "kinvault-daemon",
@@ -2834,7 +2834,7 @@ dependencies = [
 
 [[package]]
 name = "kinvault-net"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "data-encoding",
