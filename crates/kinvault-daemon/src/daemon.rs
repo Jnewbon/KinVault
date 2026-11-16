@@ -33,6 +33,8 @@ pub(crate) const DEFAULT_DEBOUNCE_SECS: u64 = 30;
 pub(crate) const DEFAULT_RESCAN_SECS: u64 = 6 * 60 * 60;
 const DEFAULT_INVITE_SECS: u64 = 7 * 24 * 60 * 60;
 const TRASH_PURGE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+/// How long removing a peer waits to tell it before removing it anyway.
+const UNFRIEND_TIMEOUT: Duration = Duration::from_secs(15);
 /// Longest `keep_deleted_days` allowed: ten years.
 const MAX_GRACE_DAYS: u64 = 3650;
 
@@ -171,6 +173,18 @@ impl Daemon {
                 Daemon { inner }.accept_pair(r).await
             })
         }));
+        let weak = Arc::downgrade(&daemon.inner);
+        daemon
+            .inner
+            .receiver
+            .set_unfriend_handler(Arc::new(move |peer| {
+                let weak = weak.clone();
+                Box::pin(async move {
+                    if let Some(inner) = weak.upgrade() {
+                        Daemon { inner }.removed_by(peer).await;
+                    }
+                })
+            }));
 
         let weak = Arc::downgrade(&daemon.inner);
         let wake = daemon.inner.wake_purge.clone();
@@ -712,7 +726,7 @@ impl Daemon {
                 Ok(Reply::Peers(out))
             }
             Request::PeerRemove { id } => {
-                let mut config = self.inner.config.lock().await;
+                let config = self.inner.config.lock().await;
                 let id = resolve_peer(&config, &id)?.0;
                 let peer = self.parse_peer_id(&id)?;
                 let name = entry_name(&config, &id).unwrap_or_else(|| id.clone());
@@ -735,12 +749,42 @@ impl Daemon {
                     "{name} still keeps these backups: {}. Delete them first.",
                     using.join(", ")
                 );
+                let entry = config
+                    .peers
+                    .iter()
+                    .find(|p| p.id == id)
+                    .expect("checked above");
+                let addr = peer_addr(&id, &entry.addrs)?;
+                let hosts = entry.hosts.clone();
+                drop(config);
+
+                // Ask it to forget us too, if it can be reached quickly.
+                let notify = async {
+                    let addr = kinvault_net::with_hosts(addr, &hosts).await;
+                    kinvault_net::unfriend(&self.inner.endpoint, addr).await
+                };
+                let notified = match tokio::time::timeout(UNFRIEND_TIMEOUT, notify).await {
+                    Ok(Ok(())) => true,
+                    Ok(Err(e)) => {
+                        tracing::info!(peer = %id, "couldn't tell the peer it was removed: {e}");
+                        false
+                    }
+                    Err(_) => {
+                        tracing::info!(peer = %id, "couldn't reach the peer to tell it it was removed");
+                        false
+                    }
+                };
+
+                let mut config = self.inner.config.lock().await;
                 config.peers.retain(|p| p.id != id);
                 config.save(&self.config_path())?;
                 drop(config);
-                self.inner.receiver.remove_peer(&peer).await?;
-                tracing::info!(peer = %id, name, "removed peer");
-                Ok(Reply::Done)
+                let erase_after_unix = self.inner.receiver.remove_peer(&peer).await?;
+                tracing::info!(peer = %id, name, notified, "removed peer");
+                Ok(Reply::PeerRemoved {
+                    notified,
+                    erase_after_unix,
+                })
             }
             Request::PeerSetMine { id, mine } => {
                 let mut config = self.inner.config.lock().await;
@@ -1332,6 +1376,40 @@ impl Daemon {
             host_name: Self::instance_name(&config),
             quota_bytes: invite.grant.quota_bytes,
         })
+    }
+
+    /// A peer removed this instance's owner. The receiver already stopped
+    /// accepting its backups and scheduled them for erasing; forget it here,
+    /// keeping the entry only while one of our sets still backs up to it so
+    /// those sets can say why they fail.
+    async fn removed_by(&self, peer: EndpointId) {
+        let id = peer.to_string();
+        let mut config = self.inner.config.lock().await;
+        if !config.peers.iter().any(|p| p.id == id) {
+            return;
+        }
+        let used = config
+            .sets
+            .iter()
+            .chain(config.stopped_sets.iter().map(|s| &s.set))
+            .any(|s| {
+                s.all_targets()
+                    .any(|(_, t)| matches!(t, StoredTarget::Peer { id: p, .. } if *p == id))
+            });
+        if used {
+            let entry = config.peer_mut(&id);
+            entry.grant = None;
+            entry.hosts_us = None;
+        } else {
+            config.peers.retain(|p| p.id != id);
+        }
+        if let Err(e) = config.save(&self.config_path()) {
+            tracing::warn!(peer = %id, "couldn't save after the peer removed us: {e:#}");
+        }
+        drop(config);
+        tracing::info!(peer = %id, "peer removed us");
+        self.inner.wake_hosts.notify_one();
+        self.notify(Event::PeersChanged);
     }
 
     /// Friend side: claim a host's invite, optionally offering storage back.

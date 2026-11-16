@@ -108,6 +108,12 @@ pub enum Op {
         delegation: Delegation,
         item: Delivery,
     },
+    /// The sender removed this host's owner as a friend or device: forget
+    /// it, and erase what it stores here after
+    /// [`REPO_DELETE_DELAY`](crate::REPO_DELETE_DELAY). Allowed from peers
+    /// that may no longer store data here, since it only affects the
+    /// sender's own data; `repo` is ignored.
+    Unfriend,
 }
 
 /// What a relay delivers, or asks about, for an owner.

@@ -357,6 +357,24 @@ pub async fn pair(
     }
 }
 
+/// Tells a peer this instance removed its owner, so it forgets this
+/// instance and erases what this instance stored there after
+/// [`REPO_DELETE_DELAY`](crate::REPO_DELETE_DELAY).
+pub async fn unfriend(endpoint: &Endpoint, addr: EndpointAddr) -> Result<(), NetError> {
+    let conn = endpoint.connect(addr, ALPN).await.map_err(transport)?;
+    let req = Request {
+        repo: "unfriend".into(),
+        op: Op::Unfriend,
+    };
+    let result = call_once(&conn, &req, None, None).await;
+    conn.close(0u32.into(), b"done");
+    match result?.0 {
+        Response::Ok => Ok(()),
+        Response::Error { code, message } => Err(NetError::from_code(code, message)),
+        other => Err(unexpected(&other)),
+    }
+}
+
 /// A request, for logs. Leaves out secrets such as invite tokens.
 fn describe(op: &Op) -> String {
     let short = |id: &dyn std::fmt::Display| {
@@ -380,6 +398,7 @@ fn describe(op: &Op) -> String {
         Op::RedeemInvite { .. } => "redeem invite".into(),
         Op::Pair { .. } => "pair".into(),
         Op::DeleteRepo => "delete repository".into(),
+        Op::Unfriend => "unfriend".into(),
         Op::Forward { len } => format!("forwarding order ({len} bytes)"),
         Op::ForwardStatus { place } => format!("forwarding status for {place}"),
         Op::ForwardCancel { place } => format!("cancel forwarding to {place}"),

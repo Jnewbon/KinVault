@@ -16,7 +16,7 @@ mod receiver;
 mod testutil;
 mod ticket;
 
-pub use client::{RemoteBackend, RemoteStatus, pair, ping, redeem_invite};
+pub use client::{RemoteBackend, RemoteStatus, pair, ping, redeem_invite, unfriend};
 pub use error::NetError;
 pub use hosts::{HostAddr, InvalidHostAddr, with_hosts};
 pub use identity::load_or_create_secret;
@@ -26,7 +26,7 @@ pub use limits::{RateLimiter, TimeWindow};
 pub use protocol::Offer;
 pub use receiver::{
     ForwardQueue, Grant, InviteAccepted, InviteHandler, InviteRedemption, PairHandler, PairRequest,
-    PeerUsage, REPO_DELETE_DELAY, Receiver,
+    PeerUsage, REPO_DELETE_DELAY, Receiver, UnfriendHandler,
 };
 pub use ticket::InviteTicket;
 

@@ -1497,8 +1497,19 @@ async fn main() -> Result<()> {
             println!("Moved to your friends. Its storage limits are unchanged.");
         }
         Command::Peer(PeerCommand::Remove { peer }) => {
-            client.call(&Request::PeerRemove { id: peer }).await?;
+            let Reply::PeerRemoved { notified, .. } =
+                client.call(&Request::PeerRemove { id: peer }).await?
+            else {
+                bail!("unexpected reply")
+            };
             println!("Removed. Anything it stored here is erased in a week.");
+            if notified {
+                println!("It was told too, and will erase what you stored there in a week.");
+            } else {
+                println!(
+                    "It couldn't be reached, so it still lists you; anything you stored there stays until its owner removes you."
+                );
+            }
         }
         Command::Peer(PeerCommand::List) => {
             let Reply::Peers(peers) = client.call(&Request::PeerList).await? else {

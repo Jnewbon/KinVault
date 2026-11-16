@@ -1682,6 +1682,91 @@ async fn devices_can_be_removed_once_no_backup_uses_them() {
     assert!(err.contains("no peer"), "{err}");
 }
 
+/// `host` invites `guest`, who joins as a friend calling it `name`; each
+/// offers the other storage.
+async fn befriend(host: &Daemon, guest: &Daemon, name: &str) {
+    let Reply::Invite { ticket, .. } = call(
+        host,
+        Request::CreateInvite(CreateInvite {
+            ..Default::default()
+        }),
+    )
+    .await
+    else {
+        panic!()
+    };
+    call(
+        guest,
+        Request::RedeemInvite {
+            ticket,
+            name: Some(name.into()),
+            offer: Some(GrantSpec::default()),
+            mine: false,
+        },
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_a_friend_tells_it_when_it_can_be_reached() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("documents");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("notes.md"), b"# notes").unwrap();
+    let alice_state = tmp.path().join("alice");
+    let alice = start(&alice_state, SecretKey::generate()).await;
+    let bob = start(&tmp.path().join("bob"), SecretKey::generate()).await;
+    befriend(&alice, &bob, "alice").await;
+    assert_eq!(peers(&alice).await.len(), 1);
+
+    // Bob backs up to Alice, then deletes that backup and removes her.
+    call(
+        &bob,
+        create_set(
+            "docs",
+            &src,
+            Target::Peer {
+                id: alice.id().to_string(),
+                addrs: vec![alice.endpoint().bound_sockets()[0]],
+            },
+        ),
+    )
+    .await;
+    wait_for_backup(&bob, None).await;
+    call(&bob, Request::DeleteSet { set: "docs".into() }).await;
+    let Reply::PeerRemoved { notified, .. } =
+        call(&bob, Request::PeerRemove { id: "alice".into() }).await
+    else {
+        panic!()
+    };
+    assert!(notified);
+    assert!(peers(&bob).await.is_empty());
+
+    // Alice was told: she forgot Bob, no longer accepts his backups, and
+    // erases what he stored with her in a week.
+    assert!(peers(&alice).await.is_empty());
+    let hosted = alice_state.join("hosted").join(bob.id().to_string());
+    let left: Vec<_> = fs::read_dir(&hosted)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(left, vec![".deleted".to_string()]);
+
+    // A friend that can't be reached is removed here anyway.
+    let carol = start(&tmp.path().join("carol"), SecretKey::generate()).await;
+    befriend(&carol, &bob, "carol").await;
+    carol.shutdown().await;
+    let Reply::PeerRemoved { notified, .. } =
+        call(&bob, Request::PeerRemove { id: "carol".into() }).await
+    else {
+        panic!()
+    };
+    assert!(!notified);
+    assert!(peers(&bob).await.is_empty());
+    alice.shutdown().await;
+    bob.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn restores_run_in_the_background_with_progress() {
     use kinvault_daemon::api::Event;

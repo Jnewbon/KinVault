@@ -15,6 +15,7 @@ const state = {
   connected: false,
   status: null, // DaemonStatus
   guiVersion: null, // null in the web interface, where the daemon serves the UI
+  remoteUsage: {}, // peer id -> { used_bytes, quota_bytes }: what our backups take up on that host
   peers: [],
   invites: [],
   network: null, // NetworkInfo
@@ -410,6 +411,56 @@ async function refreshPeers() {
     return;
   }
   render();
+  // Asking means connecting to each host, so only every few minutes from here;
+  // backups ending and hosts coming online ask straight away.
+  if ((state.page === "mine" || state.page === "friends") && Date.now() - remoteUsageAt > 180_000) {
+    refreshRemoteUsageSoon();
+  }
+}
+
+/** A place that keeps our backups on this peer, to ask the host about: `{ set, from }`. */
+function placeOn(id) {
+  for (const s of restorableSets()) {
+    if (s.target.kind === "peer" && s.target.id === id) return { set: s.id, from: null };
+    const extra = (s.extra_targets || []).find((t) => t.target.kind === "peer" && t.target.id === id);
+    if (extra) return { set: s.id, from: extra.id };
+  }
+  return null;
+}
+
+/** Asks each host that keeps our backups how much they take up there. */
+let remoteUsageAt = 0;
+async function refreshRemoteUsage() {
+  if (!state.connected) return;
+  remoteUsageAt = Date.now();
+  const asks = state.peers.filter((p) => p.hosts_us && p.online !== false).map(async (p) => {
+    const place = placeOn(p.id);
+    if (!place) {
+      delete state.remoteUsage[p.id];
+      return;
+    }
+    try {
+      state.remoteUsage[p.id] = await call("remote_usage", place);
+    } catch (e) {
+      // Unreachable for now: keep showing the last count.
+    }
+  });
+  if (!asks.length) return;
+  await Promise.all(asks);
+  if (state.page === "mine" || state.page === "friends") render();
+}
+
+let remoteUsageTimer = null;
+function refreshRemoteUsageSoon() {
+  clearTimeout(remoteUsageTimer);
+  remoteUsageTimer = setTimeout(refreshRemoteUsage, 500);
+}
+
+/** "12.3 GB stored there", or null before the host has been asked. */
+function storedThere(p) {
+  const u = state.remoteUsage[p.id];
+  if (u) return `${bytes(u.used_bytes)} stored there`;
+  return placeOn(p.id) ? null : "nothing stored there yet";
 }
 
 async function refreshNetwork() {
@@ -1239,17 +1290,31 @@ function renderFriends() {
     } else {
       lines.append(el("div", { class: "muted" }, notAllowed(p)));
     }
-    lines.append(el("div", {}, p.hosts_us
-      ? `Keeps your backups: up to ${bytes(p.hosts_us.quota_bytes)}`
-      : el("span", { class: "muted" }, "Doesn't keep your backups")));
+    if (p.hosts_us) {
+      const usage = state.remoteUsage[p.id];
+      const quota = usage ? usage.quota_bytes : p.hosts_us.quota_bytes;
+      const limit = quota ? bytes(quota) : "unlimited storage";
+      const stored = storedThere(p);
+      lines.append(el("div", {}, usage
+        ? `Keeps your backups: ${bytes(usage.used_bytes)} used of ${limit}`
+        : `Keeps your backups: up to ${limit}${stored ? ` · ${stored}` : ""}`));
+      if (usage && quota) lines.append(el("div", { class: "progress" }, el("div", { style: `width:${Math.min(100, (100 * usage.used_bytes) / quota).toFixed(1)}%` })));
+    } else {
+      lines.append(el("div", {}, el("span", { class: "muted" }, "Doesn't keep your backups")));
+    }
     const edit = el("button", { class: "btn small", onclick: () => limitsDialog(p) }, p.grant ? "Change limits…" : "Allow to store here…");
     const revoke = p.grant ? el("button", { class: "btn small danger", onclick: () => revokeDialog(p) }, "Stop hosting…") : null;
     const toMine = el("button", { class: "btn small", onclick: () => moveToMineDialog(p) }, "Move to Mine…");
+    const using = setsOn(p.id);
+    const remove = el("button", {
+      class: "btn small danger", disabled: using.length > 0, onclick: () => removePeerDialog(p),
+      title: using.length ? `Delete the backups it keeps first: ${using.map((s) => s.name).join(", ")}` : null,
+    }, "Remove…");
     page.append(el("div", { class: "card" },
       el("div", { class: "card-head" }, el("span", { class: "card-title" }, p.name || "Unnamed friend"), peerPresence(p),
         el("span", { class: "spacer" }),
         el("span", { class: "mono muted", title: p.id }, shortId(p.id))),
-      lines, el("div", { class: "actions" }, edit, toMine, revoke)));
+      lines, el("div", { class: "actions" }, edit, toMine, revoke, remove)));
   }
   renderInvites(page, state.invites.filter((i) => !i.mine));
 }
@@ -1294,13 +1359,16 @@ function renderMine() {
       ? el("div", {}, `Stores backups here: ${bytes(p.used_bytes)}${deletingNote(p)}`)
       : el("div", { class: "muted" }, notAllowed(p)));
     const using = setsOn(p.id);
+    const stored = p.hosts_us ? storedThere(p) : null;
     lines.append(using.length
-      ? el("div", {}, `Keeps your backups: ${using.map((s) => s.name).join(", ")}`)
+      ? el("div", {}, `Keeps your backups: ${using.map((s) => s.name).join(", ")}${stored ? ` · ${stored}` : ""}`)
+      : p.hosts_us && state.remoteUsage[p.id]
+        ? el("div", {}, `Keeps your backups: ${stored}`)
       : p.hosts_us
         ? el("div", {}, "Can keep your backups")
         : el("div", { class: "muted" }, "Doesn't keep your backups"));
     const remove = el("button", {
-      class: "btn small danger", disabled: using.length > 0, onclick: () => removeDeviceDialog(p),
+      class: "btn small danger", disabled: using.length > 0, onclick: () => removePeerDialog(p),
       title: using.length ? "Delete the backups it keeps first" : null,
     }, "Remove…");
     const toFriends = el("button", { class: "btn small" }, "Move to Friends");
@@ -1321,18 +1389,27 @@ function renderMine() {
   renderInvites(page, state.invites.filter((i) => i.mine));
 }
 
-/** Backup sets stored on this peer. */
+/** Backup sets stored on this peer, as their main place or an extra one. */
 function setsOn(id) {
-  return restorableSets().filter((s) => s.target.kind === "peer" && s.target.id === id);
+  const onPeer = (t) => t.kind === "peer" && t.id === id;
+  return restorableSets().filter((s) => onPeer(s.target) || (s.extra_targets || []).some((t) => onPeer(t.target)));
 }
 
-async function removeDeviceDialog(peer) {
-  const name = peer.name || "this device";
+/** Removes a friend or device. It's told to forget us too if it can be reached. */
+async function removePeerDialog(peer) {
+  const name = peer.name || (peer.mine ? "this device" : "this friend");
   const stored = peer.used_bytes ? ` What it stored here (${bytes(peer.used_bytes)}) is erased in a week.` : "";
+  const again = peer.mine ? "To use it again later, pair it again." : "To use it again later, send a new invite.";
   if (!await confirmDialog(`Remove ${name}?`,
-    `It will no longer be able to store backups here.${stored} To use it again later, pair it again.`,
+    `It will no longer be able to store backups here.${stored} If it's online it's told too, and erases what you ` +
+    `stored there in a week; otherwise it's removed from this list only. ${again}`,
     "Remove")) return;
-  if (await attempt(() => call("peer_remove", { id: peer.id }))) toast(`${name} removed.`);
+  toast(`Removing ${name}…`);
+  const result = await attempt(() => call("peer_remove", { id: peer.id }));
+  if (!result) return;
+  toast(result.notified
+    ? `${name} removed. It was told, and erases what you stored there in a week.`
+    : `${name} removed here. It couldn't be reached, so it still lists you until its owner removes you.`);
 }
 
 function secondsLeft() {
@@ -1728,6 +1805,7 @@ listen("daemon-event", (e) => {
       if (ev.state !== "pruning" && ev.state !== "verifying") delete state.maintenance[ev.set];
       render();
       refreshSoon();
+      if (ev.state === "idle") refreshRemoteUsageSoon();
       break;
     }
     case "backup_failed": {
@@ -1745,6 +1823,7 @@ listen("daemon-event", (e) => {
         peer.online = ev.online;
         if (ev.online) peer.last_seen_unix = Math.floor(Date.now() / 1000);
       }
+      if (ev.online) refreshRemoteUsageSoon();
       for (const set of state.status?.sets || []) {
         if (set.target.kind === "peer" && set.target.id === ev.id) set.target_online = ev.online;
       }
@@ -1794,6 +1873,11 @@ for (const ev of ["scroll", "resize"]) {
 setInterval(() => {
   for (const [id, p] of Object.entries(state.progress)) if (p.step === "sending") updateBackupProgress(id);
 }, 1000);
+
+// What friends and devices store here changes as their backups arrive, which
+// sends no event, so keep those cards fresh while they're shown. Counting is
+// cached by the daemon until something changes, so this is cheap.
+setInterval(() => { if (state.page === "mine" || state.page === "friends") refreshPeers(); }, 30_000);
 
 // Relative times ("5 min ago") stay fresh.
 setInterval(() => { if (state.page === "backups") renderBackups(); }, 30_000);

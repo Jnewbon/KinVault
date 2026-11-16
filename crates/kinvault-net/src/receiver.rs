@@ -87,6 +87,11 @@ pub type PairHandler = Arc<
         + Sync,
 >;
 
+/// Told that a peer removed this host's owner (see [`Op::Unfriend`]), after
+/// the receiver stopped accepting its backups and scheduled them for erasing.
+pub type UnfriendHandler =
+    Arc<dyn Fn(EndpointId) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 /// Decides whether an invite is valid; on success it is expected to have
 /// granted the peer access (via [`Receiver::allow`]) and consumed the invite.
 pub type InviteHandler = Arc<
@@ -123,6 +128,7 @@ struct Inner {
     uploads: Mutex<HashMap<EndpointId, Arc<PeerUploads>>>,
     invites: RwLock<Option<InviteHandler>>,
     pairing: RwLock<Option<PairHandler>>,
+    unfriending: RwLock<Option<UnfriendHandler>>,
     /// This host's own id, which deliveries must be addressed to.
     identity: RwLock<Option<EndpointId>>,
     forwarding: RwLock<Option<Arc<ForwardQueue>>>,
@@ -141,6 +147,7 @@ impl Receiver {
                 uploads: Mutex::default(),
                 invites: RwLock::default(),
                 pairing: RwLock::default(),
+                unfriending: RwLock::default(),
                 identity: RwLock::default(),
                 forwarding: RwLock::default(),
             }),
@@ -183,6 +190,10 @@ impl Receiver {
 
     pub fn set_pair_handler(&self, handler: PairHandler) {
         *self.inner.pairing.write().unwrap() = Some(handler);
+    }
+
+    pub fn set_unfriend_handler(&self, handler: UnfriendHandler) {
+        *self.inner.unfriending.write().unwrap() = Some(handler);
     }
 
     fn access(&self, peer: &EndpointId) -> Option<(Grant, Option<Arc<RateLimiter>>)> {
@@ -362,6 +373,18 @@ impl Receiver {
         ))
     }
 
+    /// A peer removed this host's owner: stop accepting its backups, schedule
+    /// what it stored for erasing, then let the owner's handler forget it.
+    async fn unfriend(&self, peer: EndpointId) -> Result<Reply, Failure> {
+        let erase_after_unix = self.remove_peer(&peer).await.map_err(internal)?;
+        let handler = self.inner.unfriending.read().unwrap().clone();
+        if let Some(handler) = handler {
+            handler(peer).await;
+        }
+        tracing::info!(%peer, erase_after_unix, "peer removed us; erasing what it stored here");
+        Ok((Response::Ok, None))
+    }
+
     /// Hides a peer's repository; [`Self::purge_trash`] erases it later.
     async fn delete_repo(&self, peer: &EndpointId, repo: &str) -> Result<Reply, Failure> {
         let erase_after_unix = unix_now() + REPO_DELETE_DELAY.as_secs() as i64;
@@ -433,6 +456,9 @@ impl Receiver {
                     hosts: hosts.into_vec(),
                 })
                 .await;
+        }
+        if let Op::Unfriend = req.op {
+            return self.unfriend(peer).await;
         }
         // From a relay, which may not be a peer itself: allowed if the owner
         // it delivers for signed a permission for it.
@@ -573,7 +599,8 @@ impl Receiver {
             | Op::Deliver { .. }
             | Op::Forward { .. }
             | Op::ForwardStatus { .. }
-            | Op::ForwardCancel { .. } => {
+            | Op::ForwardCancel { .. }
+            | Op::Unfriend => {
                 unreachable!("handled above")
             }
         }

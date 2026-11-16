@@ -365,6 +365,12 @@ pub enum Reply {
     RestoreStarted {
         id: String,
     },
+    PeerRemoved {
+        /// The peer was reached and told to forget this instance.
+        notified: bool,
+        /// When what it stored here is erased (Unix seconds).
+        erase_after_unix: i64,
+    },
 }
 
 /// What happened to a deleted set's backups.
