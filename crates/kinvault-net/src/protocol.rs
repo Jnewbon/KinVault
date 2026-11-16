@@ -13,8 +13,20 @@ use crate::error::{NetError, transport};
 use crate::limits::{PACE_CHUNK, RateLimiter};
 
 pub const ALPN: &[u8] = b"kinvault/1";
-/// Largest pack or snapshot either side will accept.
-pub const MAX_OBJECT_LEN: u64 = 512 * 1024 * 1024;
+/// Largest pack or snapshot sent to be stored. Packs aim for 32 MiB, plus
+/// at most one chunk, so this leaves plenty of room.
+pub const MAX_OBJECT_LEN: u64 = 128 * 1024 * 1024;
+/// Largest object read back from a host. Older versions accepted objects up
+/// to this size, so they can still be restored.
+pub const MAX_STORED_OBJECT_LEN: u64 = 512 * 1024 * 1024;
+/// How long a payload may go without a byte arriving (or being taken)
+/// before the transfer is given up, so a stalled peer can't hold a slot.
+#[cfg(not(test))]
+pub(crate) const PAYLOAD_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+#[cfg(test)]
+pub(crate) const PAYLOAD_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+/// Bytes read or written at a time when streaming a payload.
+const STREAM_CHUNK: usize = 256 * 1024;
 /// Largest request a host reads. Requests are read before the host checks
 /// who is asking, so this stays small; the biggest (an invite or pairing
 /// request listing a few addresses) needs far less.
@@ -613,38 +625,89 @@ pub(crate) async fn read_msg<T: DeserializeOwned>(
     Ok(postcard::from_bytes(&buf)?)
 }
 
+/// Reads a payload of `len` bytes into memory (at most
+/// [`MAX_STORED_OBJECT_LEN`]). Memory grows as bytes arrive, so a peer
+/// announcing a huge payload has to actually send it.
 pub(crate) async fn read_payload(
     recv: &mut RecvStream,
     len: u64,
     limiter: Option<&RateLimiter>,
 ) -> Result<Vec<u8>, NetError> {
-    if len > MAX_OBJECT_LEN {
+    if len > MAX_STORED_OBJECT_LEN {
         return Err(NetError::Protocol(format!(
             "object of {len} bytes is too large"
         )));
     }
-    let mut buf = vec![0u8; len as usize];
-    let Some(limiter) = limiter else {
-        recv.read_exact(&mut buf).await.map_err(transport)?;
-        return Ok(buf);
-    };
-    // Reading slowly makes QUIC flow control slow the sender down.
-    let mut filled = 0;
-    while filled < buf.len() {
-        let end = (filled + PACE_CHUNK).min(buf.len());
-        match recv.read(&mut buf[filled..end]).await.map_err(transport)? {
-            Some(n) => {
-                limiter.consume(n).await;
-                filled += n;
-            }
-            None => {
-                return Err(NetError::Protocol(
-                    "stream ended before the object was complete".into(),
-                ));
-            }
-        }
-    }
+    let mut buf = Vec::with_capacity(len.min(4 * STREAM_CHUNK as u64) as usize);
+    read_payload_into(recv, len, limiter, &mut buf, None).await?;
     Ok(buf)
+}
+
+/// Reads a payload of `len` bytes into `out` as it arrives, feeding
+/// `hasher` too. Gives up if nothing arrives for [`PAYLOAD_IDLE_TIMEOUT`].
+pub(crate) async fn read_payload_into<W: tokio::io::AsyncWrite + Unpin>(
+    recv: &mut RecvStream,
+    len: u64,
+    limiter: Option<&RateLimiter>,
+    out: &mut W,
+    mut hasher: Option<&mut blake3::Hasher>,
+) -> Result<(), NetError> {
+    use tokio::io::AsyncWriteExt;
+    // Reading slowly makes QUIC flow control slow the sender down.
+    let chunk = if limiter.is_some() {
+        PACE_CHUNK
+    } else {
+        STREAM_CHUNK
+    };
+    let mut buf = vec![0u8; chunk.min(len as usize)];
+    let mut left = len;
+    while left > 0 {
+        let want = (chunk as u64).min(left) as usize;
+        let read = tokio::time::timeout(PAYLOAD_IDLE_TIMEOUT, recv.read(&mut buf[..want]))
+            .await
+            .map_err(|_| NetError::Protocol("the other side stopped sending".into()))?;
+        let Some(n) = read.map_err(transport)? else {
+            return Err(NetError::Protocol(
+                "stream ended before the object was complete".into(),
+            ));
+        };
+        if let Some(limiter) = limiter {
+            limiter.consume(n).await;
+        }
+        if let Some(h) = hasher.as_deref_mut() {
+            h.update(&buf[..n]);
+        }
+        out.write_all(&buf[..n]).await.map_err(NetError::Io)?;
+        left -= n as u64;
+    }
+    Ok(())
+}
+
+/// Sends `len` bytes read from `file`, giving up if the other side takes
+/// nothing for [`PAYLOAD_IDLE_TIMEOUT`].
+pub(crate) async fn write_payload_from<R: tokio::io::AsyncRead + Unpin>(
+    send: &mut SendStream,
+    file: &mut R,
+    len: u64,
+) -> Result<(), NetError> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = vec![0u8; STREAM_CHUNK.min(len as usize)];
+    let mut left = len;
+    while left > 0 {
+        let want = (STREAM_CHUNK as u64).min(left) as usize;
+        let n = file.read(&mut buf[..want]).await.map_err(NetError::Io)?;
+        if n == 0 {
+            return Err(NetError::Protocol(
+                "the object got shorter while sending".into(),
+            ));
+        }
+        tokio::time::timeout(PAYLOAD_IDLE_TIMEOUT, send.write_all(&buf[..n]))
+            .await
+            .map_err(|_| NetError::Protocol("the other side stopped reading".into()))?
+            .map_err(transport)?;
+        left -= n as u64;
+    }
+    Ok(())
 }
 
 pub(crate) async fn write_payload(

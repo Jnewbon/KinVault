@@ -18,7 +18,7 @@ use crate::nearby::PairNonce;
 use crate::protocol::{
     Delegation, Delivery, ErrorCode, ForwardOrder, MAX_HAVE, MAX_OBJECT_LEN, MAX_ORDER_LEN,
     MAX_REQUEST_LEN, Offer, Op, PeerName, Request, Response, read_msg, read_payload,
-    valid_repo_name, write_msg,
+    read_payload_into, valid_repo_name, write_msg, write_payload_from,
 };
 
 mod forward;
@@ -29,10 +29,18 @@ pub const REPO_DELETE_DELAY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Per-peer directory of deleted repositories, named `<erase unix>-<repo>`.
 /// Repository names can't start with a dot, so it never clashes with one.
 const DELETED_DIR: &str = ".deleted";
-/// Uploads one peer may have in progress; more wait their turn. Each is
-/// held in memory until stored, so this bounds what a peer can make the
-/// host buffer (at most this many times [`MAX_OBJECT_LEN`]).
+/// Uploads one peer may have in progress; more wait their turn. Uploads
+/// are written to disk as they arrive, so this bounds open files and the
+/// quota held in reservations rather than memory.
 const UPLOADS_PER_PEER: usize = 4;
+/// Uploads (and forwarding orders being read) in progress across all peers.
+const UPLOADS_TOTAL: usize = 16;
+/// Downloads one peer may have in progress, and across all peers.
+const DOWNLOADS_PER_PEER: usize = 4;
+const DOWNLOADS_TOTAL: usize = 32;
+/// Received files never stored (the upload broke off, or the host stopped)
+/// are removed after this long.
+const INCOMING_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// Repositories one peer may have here, counting deleted ones not yet
 /// erased. Empty directories aren't counted against the quota, so this
 /// keeps a peer from making any number of them.
@@ -153,9 +161,24 @@ struct Inner {
     /// This host's own id, which deliveries must be addressed to.
     identity: RwLock<Option<EndpointId>>,
     forwarding: RwLock<Option<Arc<ForwardQueue>>>,
+    /// Shared by all peers: see [`UPLOADS_TOTAL`] and [`DOWNLOADS_TOTAL`].
+    upload_slots: Arc<tokio::sync::Semaphore>,
+    download_slots: Arc<tokio::sync::Semaphore>,
 }
 
-type Reply = (Response, Option<Vec<u8>>);
+/// What follows a response: `len` bytes of a stored object from `offset`,
+/// sent from its file while holding download slots.
+struct Payload {
+    path: PathBuf,
+    offset: u64,
+    len: u64,
+    _slots: (
+        tokio::sync::OwnedSemaphorePermit,
+        tokio::sync::OwnedSemaphorePermit,
+    ),
+}
+
+type Reply = (Response, Option<Payload>);
 type Failure = (ErrorCode, String);
 
 impl Receiver {
@@ -172,6 +195,8 @@ impl Receiver {
                 unfriending: RwLock::default(),
                 identity: RwLock::default(),
                 forwarding: RwLock::default(),
+                upload_slots: Arc::new(tokio::sync::Semaphore::new(UPLOADS_TOTAL)),
+                download_slots: Arc::new(tokio::sync::Semaphore::new(DOWNLOADS_TOTAL)),
             }),
         }
     }
@@ -345,7 +370,12 @@ impl Receiver {
                         continue;
                     }
                     match LocalDirBackend::open(&repo) {
-                        Ok(b) => freed += b.purge_trash(grace).map_err(io::Error::other)?,
+                        Ok(b) => {
+                            freed += b.purge_trash(grace).map_err(io::Error::other)?;
+                            freed += b
+                                .purge_incoming(INCOMING_MAX_AGE)
+                                .map_err(io::Error::other)?;
+                        }
                         Err(_) => continue,
                     }
                 }
@@ -376,10 +406,14 @@ impl Receiver {
             }
         };
         write_msg(&mut send, &resp).await?;
-        if let Some(data) = payload {
-            send.write_all(&data)
-                .await
-                .map_err(crate::error::transport)?;
+        if let Some(Payload {
+            path, offset, len, ..
+        }) = payload
+        {
+            use tokio::io::AsyncSeekExt;
+            let mut file = tokio::fs::File::open(&path).await?;
+            file.seek(std::io::SeekFrom::Start(offset)).await?;
+            write_payload_from(&mut send, &mut file, len).await?;
         }
         send.finish().map_err(crate::error::transport)?;
         Ok(())
@@ -606,33 +640,28 @@ impl Receiver {
             }
             Op::GetPack { id } => {
                 let b = backend.ok_or_else(missing)?;
-                let data = blocking(move || b.get_pack(&id)).await?;
+                let slots = self.download_slots(&peer).await?;
+                let (path, len) = blocking(move || b.pack_file(&id)).await?;
                 Ok((
-                    Response::Data {
-                        len: data.len() as u64,
-                    },
-                    Some(data),
+                    Response::Data { len },
+                    Some(file_payload(path, 0, len, slots)),
                 ))
             }
             Op::GetPackTail { id, max_len } => {
                 let b = backend.ok_or_else(missing)?;
-                let (total_len, tail) = blocking(move || b.get_pack_tail(&id, max_len)).await?;
-                Ok((
-                    Response::Tail {
-                        total_len,
-                        len: tail.len() as u64,
-                    },
-                    Some(tail),
-                ))
+                let slots = self.download_slots(&peer).await?;
+                let (path, total_len) = blocking(move || b.pack_file(&id)).await?;
+                let len = total_len.min(max_len);
+                let payload = file_payload(path, total_len - len, len, slots);
+                Ok((Response::Tail { total_len, len }, Some(payload)))
             }
             Op::GetSnapshot { id } => {
                 let b = backend.ok_or_else(missing)?;
-                let data = blocking(move || b.get_snapshot(&id)).await?;
+                let slots = self.download_slots(&peer).await?;
+                let (path, len) = blocking(move || b.snapshot_file(&id)).await?;
                 Ok((
-                    Response::Data {
-                        len: data.len() as u64,
-                    },
-                    Some(data),
+                    Response::Data { len },
+                    Some(file_payload(path, 0, len, slots)),
                 ))
             }
             // Deletions go to the trash for a grace period, so a compromised
@@ -679,24 +708,38 @@ impl Receiver {
         len: u64,
         recv: &mut RecvStream,
     ) -> Result<Reply, Failure> {
-        let (data, reservation) = self
-            .receive_object(owner, grant, limiter, len, recv)
-            .await?;
-        let (what, id) = match object {
-            Object::Pack(id) => ("pack", id.0),
-            Object::Snapshot(id) => ("snapshot", id.0),
+        let reservation = self.reserve_upload(owner, grant, len).await?;
+        let backend = self.create_repo(owner, repo).await?;
+        let b = backend.clone();
+        let tmp = blocking(move || b.incoming_path()).await?;
+        let received = receive_to_file(&tmp, recv, len, limiter).await;
+        let stored = match received {
+            Ok(hash) => {
+                let (what, id) = match object {
+                    Object::Pack(id) => ("pack", id.0),
+                    Object::Snapshot(id) => ("snapshot", id.0),
+                };
+                if hash.as_bytes() != &id {
+                    Err((
+                        ErrorCode::BadRequest,
+                        format!("{what} {} content does not match its id", hex::encode(id)),
+                    ))
+                } else {
+                    let (b, file) = (backend.clone(), tmp.clone());
+                    match object {
+                        Object::Pack(id) => blocking(move || b.adopt_pack(&id, &file)).await,
+                        Object::Snapshot(id) => {
+                            blocking(move || b.adopt_snapshot(&id, &file)).await
+                        }
+                    }
+                }
+            }
+            Err(e) => Err((ErrorCode::BadRequest, e.to_string())),
         };
-        if blake3::hash(&data).as_bytes() != &id {
-            return Err((
-                ErrorCode::BadRequest,
-                format!("{what} {} content does not match its id", hex::encode(id)),
-            ));
+        if stored.is_err() {
+            let _ = tokio::fs::remove_file(&tmp).await;
         }
-        let b = self.create_repo(owner, repo).await?;
-        match object {
-            Object::Pack(id) => blocking(move || b.put_pack(&id, &data)).await?,
-            Object::Snapshot(id) => blocking(move || b.put_snapshot(&id, &data)).await?,
-        }
+        stored?;
         reservation.release().await;
         Ok((Response::Ok, None))
     }
@@ -774,6 +817,8 @@ impl Receiver {
                 format!("order of {len} bytes is too large"),
             ));
         }
+        // Read into memory, so it takes upload slots like an upload.
+        let _slots = self.upload_slots(&self.peer_uploads(&peer)).await?;
         let data = read_payload(recv, len, None)
             .await
             .map_err(|e| (ErrorCode::BadRequest, e.to_string()))?;
@@ -912,6 +957,40 @@ impl Receiver {
         }
     }
 
+    /// Waits for one of the peer's upload slots, then one of all peers'
+    /// (in that order, so one peer can't take them all).
+    async fn upload_slots(
+        &self,
+        uploads: &PeerUploads,
+    ) -> Result<
+        (
+            tokio::sync::OwnedSemaphorePermit,
+            tokio::sync::OwnedSemaphorePermit,
+        ),
+        Failure,
+    > {
+        let mine = uploads.slots.clone().acquire_owned().await;
+        let all = self.inner.upload_slots.clone().acquire_owned().await;
+        Ok((mine.map_err(internal)?, all.map_err(internal)?))
+    }
+
+    /// Like [`Self::upload_slots`], for downloads.
+    async fn download_slots(
+        &self,
+        peer: &EndpointId,
+    ) -> Result<
+        (
+            tokio::sync::OwnedSemaphorePermit,
+            tokio::sync::OwnedSemaphorePermit,
+        ),
+        Failure,
+    > {
+        let uploads = self.peer_uploads(peer);
+        let mine = uploads.downloads.clone().acquire_owned().await;
+        let all = self.inner.download_slots.clone().acquire_owned().await;
+        Ok((mine.map_err(internal)?, all.map_err(internal)?))
+    }
+
     fn peer_uploads(&self, peer: &EndpointId) -> Arc<PeerUploads> {
         self.inner
             .uploads
@@ -921,23 +1000,22 @@ impl Receiver {
             .or_insert_with(|| {
                 Arc::new(PeerUploads {
                     slots: Arc::new(tokio::sync::Semaphore::new(UPLOADS_PER_PEER)),
+                    downloads: Arc::new(tokio::sync::Semaphore::new(DOWNLOADS_PER_PEER)),
                     reserved: tokio::sync::Mutex::new(0),
                 })
             })
             .clone()
     }
 
-    /// Checks window, size limits and quota, then reads an uploaded object.
+    /// Checks window, size limits and quota for an upload of `len` bytes.
     /// The returned reservation counts the object against the quota until it
     /// is stored and released.
-    async fn receive_object(
+    async fn reserve_upload(
         &self,
         peer: &EndpointId,
         grant: &Grant,
-        limiter: Option<&RateLimiter>,
         len: u64,
-        recv: &mut RecvStream,
-    ) -> Result<(Vec<u8>, Reservation), Failure> {
+    ) -> Result<Reservation, Failure> {
         if let Some(window) = grant.window
             && !window.is_open_now()
         {
@@ -953,12 +1031,7 @@ impl Receiver {
             ));
         }
         let uploads = self.peer_uploads(peer);
-        let slot = uploads
-            .slots
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(internal)?;
+        let slots = self.upload_slots(&uploads).await?;
         {
             // Checking and reserving under one lock means uploads running
             // at the same time can't all pass against the same usage.
@@ -984,12 +1057,9 @@ impl Receiver {
             uploads,
             len,
             released: false,
-            _slot: slot,
+            _slots: slots,
         };
-        let data = read_payload(recv, len, limiter)
-            .await
-            .map_err(|e| (ErrorCode::BadRequest, e.to_string()))?;
-        Ok((data, reservation))
+        Ok(reservation)
     }
 }
 
@@ -1004,6 +1074,7 @@ struct CachedUsage {
 /// A peer's uploads in progress.
 struct PeerUploads {
     slots: Arc<tokio::sync::Semaphore>,
+    downloads: Arc<tokio::sync::Semaphore>,
     /// Bytes of uploads in progress, not yet in the usage figure.
     reserved: tokio::sync::Mutex<u64>,
 }
@@ -1016,7 +1087,10 @@ struct Reservation {
     uploads: Arc<PeerUploads>,
     len: u64,
     released: bool,
-    _slot: tokio::sync::OwnedSemaphorePermit,
+    _slots: (
+        tokio::sync::OwnedSemaphorePermit,
+        tokio::sync::OwnedSemaphorePermit,
+    ),
 }
 
 impl Reservation {
@@ -1072,6 +1146,41 @@ impl ProtocolHandler for Receiver {
             });
         }
         Ok(())
+    }
+}
+
+/// Streams an upload of `len` bytes into a new file at `path`, synced to
+/// disk, and returns its hash.
+async fn receive_to_file(
+    path: &Path,
+    recv: &mut RecvStream,
+    len: u64,
+    limiter: Option<&RateLimiter>,
+) -> Result<blake3::Hash, NetError> {
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::fs::File::create(path).await?;
+    let mut hasher = blake3::Hasher::new();
+    let mut out = tokio::io::BufWriter::new(&mut file);
+    read_payload_into(recv, len, limiter, &mut out, Some(&mut hasher)).await?;
+    out.flush().await?;
+    file.sync_all().await?;
+    Ok(hasher.finalize())
+}
+
+fn file_payload(
+    path: PathBuf,
+    offset: u64,
+    len: u64,
+    slots: (
+        tokio::sync::OwnedSemaphorePermit,
+        tokio::sync::OwnedSemaphorePermit,
+    ),
+) -> Payload {
+    Payload {
+        path,
+        offset,
+        len,
+        _slots: slots,
     }
 }
 
@@ -1480,6 +1589,101 @@ mod tests {
             self.codes.lock().unwrap().insert(peer, code);
             Ok(())
         }
+    }
+
+    /// Sends a request and `partial` of its payload, then neither finishes
+    /// nor reads. Returns the streams to keep them open.
+    async fn stall(
+        s: &Setup,
+        op: Op,
+        partial: &[u8],
+    ) -> (iroh::endpoint::Connection, SendStream, RecvStream) {
+        let conn = s.ep.connect(s.addr(), crate::protocol::ALPN).await.unwrap();
+        let (mut send, recv) = conn.open_bi().await.unwrap();
+        let mut bytes = encode(&Request {
+            repo: "repo".into(),
+            op,
+        });
+        bytes.extend_from_slice(partial);
+        send.write_all(&bytes).await.unwrap();
+        (conn, send, recv)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stalled_upload_gives_back_its_slot_and_reservation() {
+        let s = setup(Grant {
+            quota_bytes: Some(10_000),
+            ..Default::default()
+        })
+        .await;
+        let id = PackId([7; 32]);
+        let (_conn, _send, mut recv) = stall(&s, Op::PutPack { id, len: 5000 }, &[1; 10]).await;
+        let uploads = s.receiver.peer_uploads(&s.ep.id());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(*uploads.reserved.lock().await, 5000);
+        assert_eq!(uploads.slots.available_permits(), UPLOADS_PER_PEER - 1);
+
+        let resp: Response = read_msg(&mut recv, MAX_RESPONSE_LEN).await.unwrap();
+        assert!(is_error(&resp, ErrorCode::BadRequest), "{resp:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(*uploads.reserved.lock().await, 0);
+        assert_eq!(uploads.slots.available_permits(), UPLOADS_PER_PEER);
+        assert_eq!(
+            s.receiver.inner.upload_slots.available_permits(),
+            UPLOADS_TOTAL
+        );
+        // Nothing half-received is left behind.
+        let incoming = s.peer_dir().join("repo").join("incoming");
+        assert_eq!(fs::read_dir(incoming).unwrap().count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn downloads_wait_for_a_slot() {
+        let s = setup(Grant::default()).await;
+        let data = vec![3u8; 8 * 1024 * 1024];
+        let id = PackId(*blake3::hash(&data).as_bytes());
+        let r = s.remote("repo");
+        blocking_call(&r, move |r| r.put_pack(&id, &data))
+            .await
+            .unwrap();
+        // Readers that don't read: each download blocks on flow control.
+        let mut stalled = Vec::new();
+        for _ in 0..=DOWNLOADS_PER_PEER {
+            stalled.push(stall(&s, Op::GetPack { id }, &[]).await);
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let downloads = s.receiver.peer_uploads(&s.ep.id()).downloads.clone();
+        assert_eq!(downloads.available_permits(), 0);
+        // The extra one waits without taking one of everyone's slots.
+        assert_eq!(
+            s.receiver.inner.download_slots.available_permits(),
+            DOWNLOADS_TOTAL - DOWNLOADS_PER_PEER
+        );
+        // They give up once nothing is taken for a while, freeing the slots.
+        tokio::time::sleep(crate::protocol::PAYLOAD_IDLE_TIMEOUT * 3).await;
+        assert_eq!(downloads.available_permits(), DOWNLOADS_PER_PEER);
+        assert_eq!(
+            s.receiver.inner.download_slots.available_permits(),
+            DOWNLOADS_TOTAL
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mismatched_upload_leaves_nothing_behind() {
+        let s = setup(Grant::default()).await;
+        let r = s.remote("repo");
+        let err = blocking_call(&r, |r| r.put_pack(&PackId([9; 32]), b"not that"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("does not match"), "{err}");
+        let incoming = s.peer_dir().join("repo").join("incoming");
+        assert_eq!(fs::read_dir(incoming).unwrap().count(), 0);
+        assert!(
+            blocking_call(&r, |r| r.list_packs())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

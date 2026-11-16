@@ -38,7 +38,7 @@ serde_json = "1"
 socket2 = { version = "0.6", features = ["all"] }
 tempfile = "3"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "net", "io-util", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "net", "io-util", "time", "fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize = { version = "1", features = ["derive"] }

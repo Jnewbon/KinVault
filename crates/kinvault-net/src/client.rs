@@ -762,14 +762,15 @@ mod tests {
         let err = remote(&host).await.status().await.unwrap_err();
         assert!(err.to_string().contains("too large"), "{err}");
 
-        let len = MAX_OBJECT_LEN + 1;
+        // Objects older versions stored can be read back, but no larger.
+        let len = crate::protocol::MAX_STORED_OBJECT_LEN + 1;
         let host = FakeHost::serve(Misbehave::Reply(Response::Data { len })).await;
         let r = Arc::new(remote(&host).await);
         let id = PackId([1; 32]);
         assert!(blocking(&r, move |r| is_protocol_error(r.get_pack(&id))).await);
 
         // Refused before anything is sent. Zeroed memory is only reserved, not touched.
-        let huge = vec![0u8; len as usize];
+        let huge = vec![0u8; MAX_OBJECT_LEN as usize + 1];
         let err = blocking(&r, move |r| r.put_pack(&id, &huge)).await;
         assert!(matches!(err, Err(kinvault_core::Error::Invalid(_))));
     }

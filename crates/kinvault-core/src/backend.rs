@@ -148,6 +148,71 @@ impl LocalDirBackend {
         }
         Ok(freed)
     }
+
+    /// A new file for an object being received, before it's known to be
+    /// valid; [`Self::adopt_pack`] or [`Self::adopt_snapshot`] then stores
+    /// it. Abandoned ones are removed by [`Self::purge_incoming`].
+    pub fn incoming_path(&self) -> Result<PathBuf> {
+        let dir = self.root.join(INCOMING_DIR);
+        fs::create_dir_all(&dir)?;
+        Ok(dir.join(hex::encode(crate::crypto::random_bytes::<12>()?)))
+    }
+
+    /// Stores a received file (see [`Self::incoming_path`]) as a pack.
+    pub fn adopt_pack(&self, id: &PackId, file: &Path) -> Result<()> {
+        adopt(file, &self.pack_path(id))
+    }
+
+    pub fn adopt_snapshot(&self, id: &SnapshotId, file: &Path) -> Result<()> {
+        adopt(file, &self.snapshot_path(id))
+    }
+
+    /// Where a pack is stored, and its length, to send it from the file.
+    pub fn pack_file(&self, id: &PackId) -> Result<(PathBuf, u64)> {
+        object_file(self.pack_path(id), &format!("pack {id}"))
+    }
+
+    pub fn snapshot_file(&self, id: &SnapshotId) -> Result<(PathBuf, u64)> {
+        object_file(self.snapshot_path(id), &format!("snapshot {id}"))
+    }
+
+    /// Removes received files older than `age` that were never stored (the
+    /// upload was abandoned, or the host stopped). Returns bytes freed.
+    pub fn purge_incoming(&self, age: std::time::Duration) -> Result<u64> {
+        let entries = match fs::read_dir(self.root.join(INCOMING_DIR)) {
+            Ok(e) => e,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        let mut freed = 0;
+        for entry in entries {
+            let entry = entry?;
+            let meta = entry.metadata()?;
+            if meta.modified()?.elapsed().unwrap_or_default() >= age {
+                remove_object(&entry.path())?;
+                freed += meta.len();
+            }
+        }
+        Ok(freed)
+    }
+}
+
+/// Where objects being received are written, inside the repository.
+const INCOMING_DIR: &str = "incoming";
+
+fn adopt(from: &Path, to: &Path) -> Result<()> {
+    fs::create_dir_all(to.parent().expect("object paths are inside the repository"))?;
+    fs::rename(from, to)?;
+    Ok(())
+}
+
+fn object_file(path: PathBuf, what: &str) -> Result<(PathBuf, u64)> {
+    match fs::metadata(&path) {
+        Ok(m) if m.is_file() => Ok((path, m.len())),
+        Ok(_) => Err(Error::NotFound(what.to_string())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(Error::NotFound(what.to_string())),
+        Err(e) => Err(e.into()),
+    }
 }
 
 fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
@@ -274,6 +339,35 @@ mod tests {
         b.trash_snapshot(&snap).unwrap();
         assert!(b.list_snapshots().unwrap().is_empty());
         assert_eq!(b.purge_trash(Duration::ZERO).unwrap(), 8);
+    }
+
+    #[test]
+    fn received_files_are_adopted_or_purged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = LocalDirBackend::create(tmp.path()).unwrap();
+        let id = PackId([1; 32]);
+        let file = b.incoming_path().unwrap();
+        fs::write(&file, b"data").unwrap();
+        b.adopt_pack(&id, &file).unwrap();
+        assert_eq!(b.get_pack(&id).unwrap(), b"data");
+        assert_eq!(b.pack_file(&id).unwrap().1, 4);
+        assert!(matches!(
+            b.pack_file(&PackId([2; 32])),
+            Err(Error::NotFound(_))
+        ));
+        let snap = SnapshotId([3; 32]);
+        let file = b.incoming_path().unwrap();
+        fs::write(&file, b"snap").unwrap();
+        b.adopt_snapshot(&snap, &file).unwrap();
+        assert_eq!(b.snapshot_file(&snap).unwrap().1, 4);
+        assert_eq!(b.list_packs().unwrap(), [id]);
+
+        // Abandoned ones go once they're old enough.
+        let abandoned = b.incoming_path().unwrap();
+        fs::write(&abandoned, b"half").unwrap();
+        assert_eq!(b.purge_incoming(Duration::from_secs(3600)).unwrap(), 0);
+        assert_eq!(b.purge_incoming(Duration::ZERO).unwrap(), 4);
+        assert!(!abandoned.exists());
     }
 
     #[test]
