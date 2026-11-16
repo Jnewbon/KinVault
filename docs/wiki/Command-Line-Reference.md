@@ -91,7 +91,7 @@ Both take `--from <place>` to use another place the backup keeps copies in.
 | `kinvault invite cancel <id>` | Cancel a code |
 | `kinvault invite redeem <code> [options]` | Accept a code |
 | `kinvault peer list` | All peers |
-| `kinvault peer allow <peer> [--name] [--quota] [--upload-limit] [--window]` | Let a peer store backups here, or change its limits |
+| `kinvault peer allow <peer> [--name] [--quota] [--upload-limit] [--window] [--forwarding true\|false]` | Let a peer store backups here, or change its limits; `--forwarding` lets a friend have this computer send their copies on to their other places (on by default only for your own devices) |
 | `kinvault peer revoke <peer>` | Stop accepting its backups (keeps what it stored) |
 | `kinvault peer mine <peer>` | Mark as one of your devices (no limits) |
 | `kinvault peer friend <peer>` | Move back to friends |

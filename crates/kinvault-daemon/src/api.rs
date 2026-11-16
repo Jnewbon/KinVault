@@ -277,14 +277,22 @@ pub struct GrantSpec {
     /// Only accept uploads inside this daily window (local time).
     #[serde(default)]
     pub window: Option<TimeWindow>,
+    /// Whether this instance forwards the peer's backups to its other
+    /// places, using this instance's upload. `None`: only for the user's
+    /// own devices.
+    #[serde(default)]
+    pub forwarding: Option<bool>,
 }
 
 impl GrantSpec {
-    pub fn to_grant(self) -> kinvault_net::Grant {
+    /// The grant for a peer; `mine` says whether it's one of the user's
+    /// own devices.
+    pub fn to_grant(self, mine: bool) -> kinvault_net::Grant {
         kinvault_net::Grant {
             quota_bytes: self.quota_bytes,
             upload_limit: self.upload_limit,
             window: self.window,
+            forwarding: self.forwarding.unwrap_or(mine),
         }
     }
 }

@@ -345,6 +345,10 @@ struct GrantArgs {
     /// Only accept their uploads during these hours, e.g. 01:00-07:00.
     #[arg(long, value_parser = TimeWindow::parse)]
     window: Option<TimeWindow>,
+    /// Whether this computer sends their backups on to their other places
+    /// when they ask (using its upload). By default only for your own devices.
+    #[arg(long)]
+    forwarding: Option<bool>,
 }
 
 impl GrantArgs {
@@ -353,6 +357,7 @@ impl GrantArgs {
             quota_bytes: self.quota,
             upload_limit: self.upload_limit,
             window: self.window,
+            forwarding: self.forwarding,
         }
     }
 }
@@ -611,6 +616,11 @@ fn describe_grant(g: &GrantSpec) -> String {
     }
     if let Some(w) = g.window {
         parts.push(format!("uploads {w}"));
+    }
+    match g.forwarding {
+        Some(true) => parts.push("forwards their copies".into()),
+        Some(false) => parts.push("doesn't forward their copies".into()),
+        None => {}
     }
     parts.join(", ")
 }
@@ -1434,6 +1444,7 @@ async fn main() -> Result<()> {
                 quota_bytes: offer,
                 upload_limit: offer_upload_limit,
                 window: offer_window,
+                forwarding: None,
             });
             let offered = offer.is_some() || mine;
             let Reply::Redeemed {

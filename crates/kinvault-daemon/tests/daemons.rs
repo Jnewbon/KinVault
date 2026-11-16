@@ -2292,6 +2292,22 @@ async fn join(host: &Daemon, guest: &Daemon, name: &str) -> String {
     host.id().to_string()
 }
 
+/// Lets `guest` have `host` forward its backups to its other places.
+async fn allow_forwarding(host: &Daemon, guest: &Daemon) {
+    call(
+        host,
+        Request::PeerAllow {
+            id: guest.id().to_string(),
+            name: None,
+            grant: GrantSpec {
+                forwarding: Some(true),
+                ..Default::default()
+            },
+        },
+    )
+    .await;
+}
+
 fn files_in(dir: &Path) -> usize {
     fs::read_dir(dir).map_or(0, |d| d.count())
 }
@@ -2308,6 +2324,8 @@ async fn the_main_host_forwards_copies_on_its_own() {
     let pc = start(&pc_state, pc_secret.clone()).await;
     let server_id = join(&server, &pc, "server").await;
     let remote_id = join(&remote, &pc, "remote").await;
+    // A friend's computer forwards only once its owner allows it.
+    allow_forwarding(&server, &pc).await;
 
     let src = tmp.path().join("src");
     fs::create_dir_all(&src).unwrap();
@@ -2586,6 +2604,8 @@ async fn places_out_of_reach_are_cleaned_up_through_the_relay() {
     let pc = start(&pc_state, pc_secret.clone()).await;
     let server_id = join(&server, &pc, "server").await;
     let remote_id = join(&remote, &pc, "remote").await;
+    // A friend's computer forwards only once its owner allows it.
+    allow_forwarding(&server, &pc).await;
     let src = tmp.path().join("src");
     fs::create_dir_all(&src).unwrap();
     fs::write(src.join("a.txt"), b"one").unwrap();

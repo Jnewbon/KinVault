@@ -995,10 +995,14 @@ impl Worker {
             })
             .await?;
         let (snapshots, packs, cleanup) = plan;
-        let (drop, unused) = match &cleanup {
+        let (drop, mut unused) = match &cleanup {
             Some((_, drop, unused, _)) => (drop.clone(), unused.clone()),
             None => (Vec::new(), Vec::new()),
         };
+        // An order carries only so many deletions; packs left over are
+        // found unused again at the next cleanup.
+        let room = kinvault_net::protocol::MAX_ORDER_DELETIONS * Deletion::MAX_OBJECTS;
+        unused.truncate(room.saturating_sub(drop.len()));
         if snapshots.is_empty() && drop.is_empty() && unused.is_empty() {
             if let Some((kept, ..)) = cleanup {
                 // Nothing to delete: cleaning up is done until it's due again.

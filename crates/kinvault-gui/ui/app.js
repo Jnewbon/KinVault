@@ -143,6 +143,7 @@ function describeGrant(g) {
   const parts = [g.quota_bytes ? `${bytes(g.quota_bytes)} storage` : "unlimited storage"];
   if (g.upload_limit) parts.push(`max ${bytes(g.upload_limit)}/s`);
   if (g.window) parts.push(`uploads ${g.window}`);
+  if (g.forwarding) parts.push("forwards their copies");
   return parts.join(", ");
 }
 
@@ -380,11 +381,13 @@ function grantFields(g = {}) {
       { name: "from", label: "Accept uploads from", type: "time", value: ws || "", hint: "Leave empty for any time" },
       { name: "to", label: "until", type: "time", value: we || "" },
     ] },
+    { name: "forwarding", label: "Send their copies on to their other places", type: "checkbox", value: !!g.forwarding,
+      hint: "Lets them have this computer send copies of their backups to another place, using your upload. Your own devices can always do this." },
   ];
 }
 
 function grantFrom(v) {
-  return { quota_bytes: toBytes(v.quota, GiB), upload_limit: toBytes(v.rate, MiB), window: windowFrom(v.from, v.to) };
+  return { quota_bytes: toBytes(v.quota, GiB), upload_limit: toBytes(v.rate, MiB), window: windowFrom(v.from, v.to), forwarding: v.forwarding ? true : null };
 }
 
 function windowProblem(v) {

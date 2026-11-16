@@ -53,6 +53,9 @@ pub struct Grant {
     pub upload_limit: Option<u64>,
     /// Uploads are only accepted inside this daily window (host's local time).
     pub window: Option<TimeWindow>,
+    /// Whether the peer may have this host forward its objects to other
+    /// hosts (see [`Op::Forward`]), using this host's upload.
+    pub forwarding: bool,
 }
 
 /// A peer claiming an invite.
@@ -524,6 +527,12 @@ impl Receiver {
             return self.delete_repo(&peer, &req.repo).await;
         }
         match req.op {
+            Op::Forward { .. } if !grant.forwarding => {
+                return Err((
+                    ErrorCode::Denied,
+                    "this host doesn't forward backups for you; its owner can allow it".into(),
+                ));
+            }
             Op::Forward { len } => return self.take_order(peer, req.repo, len, recv).await,
             Op::ForwardStatus { place } => {
                 let queue = self.forward_queue()?;
@@ -716,6 +725,9 @@ impl Receiver {
             .map_err(|e| (ErrorCode::BadRequest, e.to_string()))?;
         let order: ForwardOrder = postcard::from_bytes(&data)
             .map_err(|e| (ErrorCode::BadRequest, format!("malformed order: {e}")))?;
+        order
+            .check_limits()
+            .map_err(|e| (ErrorCode::BadRequest, e))?;
         let d = &order.delegation;
         if d.owner != peer {
             return Err((
@@ -1408,6 +1420,50 @@ mod tests {
             self.codes.lock().unwrap().insert(peer, code);
             Ok(())
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forwarding_needs_the_hosts_permission() {
+        let s = setup(Grant::default()).await;
+        s.receiver.set_identity(s.addr().id);
+        s.receiver
+            .enable_forwarding(ForwardQueue::new(s.root.join("forwarding")));
+        let other = iroh::SecretKey::generate().public();
+        let order = ForwardOrder {
+            id: "o".into(),
+            place: "p".into(),
+            delegation: crate::protocol::Delegation::sign(
+                s.ep.secret_key(),
+                s.addr().id,
+                other,
+                "repo",
+                i64::MAX,
+            ),
+            addrs: Vec::new(),
+            hosts: Vec::new(),
+            packs: Vec::new(),
+            snapshots: Vec::new(),
+            upload_limit: None,
+            window: None,
+            deletions: Vec::new(),
+        };
+        let r = s.remote("repo");
+        let err = r.forward(&order).await.unwrap_err();
+        assert!(matches!(err, NetError::Denied(_)), "{err:?}");
+
+        s.receiver.allow(
+            s.ep.id(),
+            Grant {
+                forwarding: true,
+                ..Default::default()
+            },
+        );
+        r.forward(&order).await.unwrap();
+        let mut too_long = order.clone();
+        too_long.id = "o2".into();
+        too_long.addrs = vec!["192.0.2.1:1".parse().unwrap(); 100];
+        let err = r.forward(&too_long).await.unwrap_err();
+        assert!(matches!(err, NetError::BadRequest(_)), "{err:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -38,6 +38,13 @@ You send what they already stored with you, still encrypted, so it costs you
 upload bandwidth but no extra space. Their **Upload speed** and **Hours**
 limits apply to forwarding too.
 
+Your own devices can always ask. A friend can only once you tick **Send
+their copies on to their other places** in **Change limits…** (or
+`kinvault peer allow <friend> --forwarding true`); until then their requests
+are refused. Each peer may have at most 64 orders waiting, totalling
+64 MiB, for at most 16 places; the orders are kept in KinVault's state
+folder, not counted against their quota.
+
 ### Deleted data still counts for a while
 
 When a friend's KinVault removes old versions, you don't erase that data

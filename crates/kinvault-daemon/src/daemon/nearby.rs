@@ -388,7 +388,7 @@ impl Daemon {
         drop(config);
         self.inner
             .receiver
-            .allow(addr.id, GrantSpec::default().to_grant());
+            .allow(addr.id, GrantSpec::default().to_grant(true));
         if let Some(d) = self
             .inner
             .nearby

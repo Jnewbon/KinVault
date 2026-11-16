@@ -23,8 +23,16 @@ pub(crate) const MAX_REQUEST_LEN: usize = 64 * 1024;
 pub(crate) const MAX_RESPONSE_LEN: usize = 32 * 1024 * 1024;
 /// Most packs one `Delivery::Have` asks about, so the request stays small.
 pub(crate) const MAX_HAVE: usize = 1000;
-/// Largest forwarding order a host accepts (about 400,000 packs).
+/// Largest forwarding order a host accepts (room for the counts below).
 pub(crate) const MAX_ORDER_LEN: u64 = 16 * 1024 * 1024;
+/// Most packs one forwarding order may list (about 12 TiB of 32 MiB packs).
+pub const MAX_ORDER_PACKS: usize = 400_000;
+/// Most snapshots one forwarding order may list.
+pub const MAX_ORDER_SNAPSHOTS: usize = 10_000;
+/// Most signed deletions one forwarding order may carry.
+pub const MAX_ORDER_DELETIONS: usize = 100;
+/// Most addresses one forwarding order may give for the other host.
+pub const MAX_ORDER_ADDRS: usize = 16;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Request {
@@ -297,6 +305,35 @@ impl Delegation {
         }
         if self.expires_unix < now {
             return Err("this permission has expired".into());
+        }
+        Ok(())
+    }
+}
+
+impl ForwardOrder {
+    /// Checks the lists fit the limits above, so an order can't make the
+    /// host store, or dial, more than a real one needs.
+    pub fn check_limits(&self) -> Result<(), String> {
+        let too_many = |what: &str, n: usize, max: usize| {
+            (n > max).then(|| format!("an order may list at most {max} {what}, not {n}"))
+        };
+        let problem = too_many("packs", self.packs.len(), MAX_ORDER_PACKS)
+            .or_else(|| too_many("snapshots", self.snapshots.len(), MAX_ORDER_SNAPSHOTS))
+            .or_else(|| too_many("deletions", self.deletions.len(), MAX_ORDER_DELETIONS))
+            .or_else(|| too_many("addresses", self.addrs.len(), MAX_ORDER_ADDRS))
+            .or_else(|| too_many("host names", self.hosts.len(), MAX_PEER_HOSTS));
+        if let Some(problem) = problem {
+            return Err(problem);
+        }
+        if self.hosts.iter().any(|h| h.len() > 255) {
+            return Err("a host name in the order is too long".into());
+        }
+        if self
+            .deletions
+            .iter()
+            .any(|d| d.snapshots.len() + d.packs.len() > Deletion::MAX_OBJECTS)
+        {
+            return Err("a deletion in the order lists too many objects".into());
         }
         Ok(())
     }

@@ -121,7 +121,7 @@ impl Daemon {
         for peer in &config.peers {
             let Some(grant) = peer.grant else { continue };
             match EndpointId::from_str(&peer.id) {
-                Ok(id) => receiver.allow(id, grant.to_grant()),
+                Ok(id) => receiver.allow(id, grant.to_grant(peer.mine)),
                 Err(e) => tracing::warn!("ignoring invalid peer id {:?}: {e}", peer.id),
             }
         }
@@ -679,8 +679,9 @@ impl Daemon {
                 if name.is_some() {
                     entry.name = name;
                 }
+                let mine = entry.mine;
                 config.save(&self.config_path())?;
-                self.inner.receiver.allow(peer, grant.to_grant());
+                self.inner.receiver.allow(peer, grant.to_grant(mine));
                 Ok(Reply::Done)
             }
             Request::PeerRevoke { id } => {
@@ -801,13 +802,14 @@ impl Daemon {
                 let entry = config.peer_mut(&id);
                 entry.mine = mine;
                 // Your own devices may store as much as they like.
-                let grant = mine.then(GrantSpec::default);
-                if let Some(grant) = grant {
-                    entry.grant = Some(grant);
+                if mine {
+                    entry.grant = Some(GrantSpec::default());
                 }
+                // Forwarding by default follows whether it's yours.
+                let grant = entry.grant;
                 config.save(&self.config_path())?;
                 if let Some(grant) = grant {
-                    self.inner.receiver.allow(peer, grant.to_grant());
+                    self.inner.receiver.allow(peer, grant.to_grant(mine));
                 }
                 Ok(Reply::Done)
             }
@@ -1362,6 +1364,7 @@ impl Daemon {
         entry.grant = Some(invite.grant);
         entry.name = invite.name.clone().or(r.name.clone()).or(entry.name.take());
         entry.mine |= invite.mine;
+        let mine = entry.mine;
         if !r.hosts.is_empty() {
             entry.hosts = r.hosts.clone();
         }
@@ -1373,7 +1376,9 @@ impl Daemon {
         config
             .save(&self.config_path())
             .map_err(|e| format!("host could not save the invite: {e:#}"))?;
-        self.inner.receiver.allow(r.peer, invite.grant.to_grant());
+        self.inner
+            .receiver
+            .allow(r.peer, invite.grant.to_grant(mine));
         tracing::info!(peer = %peer_id, name = ?entry_name(&config, &peer_id), "invite redeemed");
         self.notify(Event::PeersChanged);
         Ok(InviteAccepted {
@@ -1460,7 +1465,10 @@ impl Daemon {
         });
         if let Some(grant) = offer {
             entry.grant = Some(grant);
-            self.inner.receiver.allow(ticket.host.id, grant.to_grant());
+            let mine = entry.mine;
+            self.inner
+                .receiver
+                .allow(ticket.host.id, grant.to_grant(mine));
         }
         config.save(&self.config_path())?;
         Ok(Reply::Redeemed {
