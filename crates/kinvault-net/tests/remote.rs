@@ -468,7 +468,9 @@ async fn deleted_repositories_are_hidden_then_erased_a_week_later() {
             .unwrap(),
         0
     );
-    assert_eq!(fs::read_dir(&deleted).unwrap().count(), 2);
+    // Listing it afterwards didn't bring it back, so the second deletion
+    // had nothing to hide.
+    assert_eq!(fs::read_dir(&deleted).unwrap().count(), 1);
     for (n, entry) in fs::read_dir(&deleted).unwrap().enumerate() {
         let entry = entry.unwrap().path();
         fs::rename(&entry, deleted.join(format!("{}-repo-{n}", now - 1))).unwrap();

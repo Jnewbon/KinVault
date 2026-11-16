@@ -26,7 +26,9 @@ For friends you set, per friend:
 
 Set them when inviting, or change them later: **Friends → Change limits…**,
 or `kinvault peer allow <friend> --quota 1T --upload-limit 5M --window
-01:00-07:00`. Your own devices (**Mine**) have no limits.
+01:00-07:00`. Your own devices (**Mine**) have no limits. Every peer can
+keep at most 256 backups (repositories) with you, counting deleted ones not
+yet erased.
 
 The **Friends** page shows how much each friend uses of their quota.
 

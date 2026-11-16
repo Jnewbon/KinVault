@@ -33,6 +33,10 @@ const DELETED_DIR: &str = ".deleted";
 /// held in memory until stored, so this bounds what a peer can make the
 /// host buffer (at most this many times [`MAX_OBJECT_LEN`]).
 const UPLOADS_PER_PEER: usize = 4;
+/// Repositories one peer may have here, counting deleted ones not yet
+/// erased. Empty directories aren't counted against the quota, so this
+/// keeps a peer from making any number of them.
+const MAX_REPOS_PER_PEER: usize = 256;
 
 /// Storage a peer uses on this host.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -546,8 +550,10 @@ impl Receiver {
             }
             _ => {}
         }
-        let repo_dir = self.peer_dir(&peer).join(&req.repo);
-        let backend = Arc::new(blocking(move || LocalDirBackend::create(repo_dir)).await?);
+        // Only uploads create the repository (see `put_object`).
+        let repo = req.repo.as_str();
+        let backend = self.open_repo(&peer, repo).await?;
+        let missing = || (ErrorCode::NotFound, format!("no repository {repo:?} here"));
 
         match req.op {
             Op::Status => {
@@ -561,25 +567,25 @@ impl Receiver {
                 ))
             }
             Op::ListPacks => {
-                let b = backend.clone();
-                Ok((
-                    Response::PackIds(blocking(move || b.list_packs()).await?),
-                    None,
-                ))
+                let packs = match backend {
+                    Some(b) => blocking(move || b.list_packs()).await?,
+                    None => Vec::new(),
+                };
+                Ok((Response::PackIds(packs), None))
             }
             Op::ListSnapshots => {
-                let b = backend.clone();
-                Ok((
-                    Response::SnapshotIds(blocking(move || b.list_snapshots()).await?),
-                    None,
-                ))
+                let snapshots = match backend {
+                    Some(b) => blocking(move || b.list_snapshots()).await?,
+                    None => Vec::new(),
+                };
+                Ok((Response::SnapshotIds(snapshots), None))
             }
             Op::PutPack { id, len } => {
                 self.put_object(
                     &peer,
                     &grant,
                     limiter.as_deref(),
-                    &backend,
+                    repo,
                     Object::Pack(id),
                     len,
                     recv,
@@ -591,7 +597,7 @@ impl Receiver {
                     &peer,
                     &grant,
                     limiter.as_deref(),
-                    &backend,
+                    repo,
                     Object::Snapshot(id),
                     len,
                     recv,
@@ -599,7 +605,7 @@ impl Receiver {
                 .await
             }
             Op::GetPack { id } => {
-                let b = backend.clone();
+                let b = backend.ok_or_else(missing)?;
                 let data = blocking(move || b.get_pack(&id)).await?;
                 Ok((
                     Response::Data {
@@ -609,7 +615,7 @@ impl Receiver {
                 ))
             }
             Op::GetPackTail { id, max_len } => {
-                let b = backend.clone();
+                let b = backend.ok_or_else(missing)?;
                 let (total_len, tail) = blocking(move || b.get_pack_tail(&id, max_len)).await?;
                 Ok((
                     Response::Tail {
@@ -620,7 +626,7 @@ impl Receiver {
                 ))
             }
             Op::GetSnapshot { id } => {
-                let b = backend.clone();
+                let b = backend.ok_or_else(missing)?;
                 let data = blocking(move || b.get_snapshot(&id)).await?;
                 Ok((
                     Response::Data {
@@ -632,14 +638,14 @@ impl Receiver {
             // Deletions go to the trash for a grace period, so a compromised
             // sender can't immediately destroy its own history.
             Op::DeletePack { id } => {
-                let b = backend.clone();
+                let b = backend.ok_or_else(missing)?;
                 blocking(move || b.trash_pack(&id)).await?;
                 // Same total, but more of it is now waiting to be erased.
                 self.invalidate_usage(&peer);
                 Ok((Response::Ok, None))
             }
             Op::DeleteSnapshot { id } => {
-                let b = backend.clone();
+                let b = backend.ok_or_else(missing)?;
                 blocking(move || b.trash_snapshot(&id)).await?;
                 // Same total, but more of it is now waiting to be erased.
                 self.invalidate_usage(&peer);
@@ -668,7 +674,7 @@ impl Receiver {
         owner: &EndpointId,
         grant: &Grant,
         limiter: Option<&RateLimiter>,
-        backend: &Arc<LocalDirBackend>,
+        repo: &str,
         object: Object,
         len: u64,
         recv: &mut RecvStream,
@@ -686,13 +692,61 @@ impl Receiver {
                 format!("{what} {} content does not match its id", hex::encode(id)),
             ));
         }
-        let b = backend.clone();
+        let b = self.create_repo(owner, repo).await?;
         match object {
             Object::Pack(id) => blocking(move || b.put_pack(&id, &data)).await?,
             Object::Snapshot(id) => blocking(move || b.put_snapshot(&id, &data)).await?,
         }
         reservation.release().await;
         Ok((Response::Ok, None))
+    }
+
+    /// The peer's repository, if it has one.
+    async fn open_repo(
+        &self,
+        peer: &EndpointId,
+        repo: &str,
+    ) -> Result<Option<Arc<LocalDirBackend>>, Failure> {
+        let dir = self.peer_dir(peer).join(repo);
+        match blocking(move || LocalDirBackend::open(dir)).await {
+            Ok(b) => Ok(Some(Arc::new(b))),
+            Err((ErrorCode::NotFound, _)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The peer's repository, created if it's new and the peer may have
+    /// another (see [`MAX_REPOS_PER_PEER`]).
+    async fn create_repo(
+        &self,
+        peer: &EndpointId,
+        repo: &str,
+    ) -> Result<Arc<LocalDirBackend>, Failure> {
+        if let Some(b) = self.open_repo(peer, repo).await? {
+            return Ok(b);
+        }
+        let peer_dir = self.peer_dir(peer);
+        let repo_dir = peer_dir.join(repo);
+        let count = tokio::task::spawn_blocking(move || -> io::Result<usize> {
+            let deleted = read_dirs(&peer_dir.join(DELETED_DIR))?.len();
+            let live = read_dirs(&peer_dir)?
+                .iter()
+                .filter(|d| d.file_name() != Some(DELETED_DIR.as_ref()))
+                .count();
+            Ok(deleted + live)
+        })
+        .await
+        .map_err(internal)?
+        .map_err(internal)?;
+        if count >= MAX_REPOS_PER_PEER {
+            return Err((
+                ErrorCode::QuotaExceeded,
+                format!("at most {MAX_REPOS_PER_PEER} repositories, including deleted ones"),
+            ));
+        }
+        Ok(Arc::new(
+            blocking(move || LocalDirBackend::create(repo_dir)).await?,
+        ))
     }
 
     fn forward_queue(&self) -> Result<Arc<ForwardQueue>, Failure> {
@@ -788,16 +842,19 @@ impl Receiver {
                 format!("invalid repository name {repo:?}"),
             ));
         }
-        let repo_dir = self.peer_dir(&owner).join(repo);
-        let backend = Arc::new(blocking(move || LocalDirBackend::create(repo_dir)).await?);
+        // Only deliveries of objects create the repository.
+        let backend = self.open_repo(&owner, repo).await?;
         match item {
             Delivery::Have { packs } => {
                 if packs.len() > MAX_HAVE {
                     return Err((ErrorCode::BadRequest, "asked about too many packs".into()));
                 }
-                let b = backend.clone();
-                let found =
-                    blocking(move || Ok(packs.iter().map(|p| b.has_pack(p)).collect())).await?;
+                let found = match backend {
+                    Some(b) => {
+                        blocking(move || Ok(packs.iter().map(|p| b.has_pack(p)).collect())).await?
+                    }
+                    None => vec![false; packs.len()],
+                };
                 Ok((Response::Present(found), None))
             }
             Delivery::Pack { id, len } => {
@@ -805,7 +862,7 @@ impl Receiver {
                     &owner,
                     &grant,
                     limiter.as_deref(),
-                    &backend,
+                    repo,
                     Object::Pack(id),
                     len,
                     recv,
@@ -818,7 +875,10 @@ impl Receiver {
                 }
                 d.check(&me, repo, unix_now())
                     .map_err(|e| (ErrorCode::Denied, e))?;
-                let b = backend.clone();
+                // Nothing stored, so nothing to delete.
+                let Some(b) = backend else {
+                    return Ok((Response::Ok, None));
+                };
                 blocking(move || {
                     // Already gone is fine: the deletion may be passed on twice.
                     let gone = |r: kinvault_core::Result<()>| match r {
@@ -842,7 +902,7 @@ impl Receiver {
                     &owner,
                     &grant,
                     limiter.as_deref(),
-                    &backend,
+                    repo,
                     Object::Snapshot(id),
                     len,
                     recv,
@@ -1423,6 +1483,73 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn only_uploads_create_repositories() {
+        let s = setup(Grant::default()).await;
+        let r = s.remote("new");
+        blocking_call(&r, |r| r.list_packs()).await.unwrap();
+        blocking_call(&r, |r| r.list_snapshots()).await.unwrap();
+        for op in [
+            Op::Status,
+            Op::GetPack {
+                id: PackId([0; 32]),
+            },
+            Op::DeletePack {
+                id: PackId([0; 32]),
+            },
+            Op::GetSnapshot {
+                id: SnapshotId([0; 32]),
+            },
+        ] {
+            s.raw("new", op, &[]).await;
+        }
+        let resp = s
+            .raw(
+                "other",
+                Op::GetPack {
+                    id: PackId([0; 32]),
+                },
+                &[],
+            )
+            .await;
+        assert!(is_error(&resp, ErrorCode::NotFound), "{resp:?}");
+        assert!(!s.peer_dir().join("new").exists());
+        assert!(!s.peer_dir().join("other").exists());
+
+        let data = b"pack".to_vec();
+        let id = PackId(*blake3::hash(&data).as_bytes());
+        blocking_call(&r, move |r| r.put_pack(&id, &data))
+            .await
+            .unwrap();
+        assert!(s.peer_dir().join("new").join("packs").is_dir());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repositories_per_peer_are_limited() {
+        let s = setup(Grant::default()).await;
+        // Most of them deleted but not yet erased: they still count.
+        for i in 0..MAX_REPOS_PER_PEER - 1 {
+            let dir = if i % 2 == 0 {
+                s.peer_dir().join(format!("r{i}"))
+            } else {
+                s.peer_dir().join(DELETED_DIR).join(format!("1-r{i}"))
+            };
+            fs::create_dir_all(dir).unwrap();
+        }
+        let put = |repo: &str| {
+            let r = s.remote(repo);
+            let data = repo.as_bytes().to_vec();
+            let id = PackId(*blake3::hash(&data).as_bytes());
+            async move { blocking_call(&r, move |r| r.put_pack(&id, &data)).await }
+        };
+        put("last").await.unwrap();
+        let err = put("one-too-many").await.unwrap_err();
+        assert!(err.to_string().contains("repositories"), "{err}");
+        assert!(!s.peer_dir().join("one-too-many").exists());
+        // Existing ones still take uploads.
+        put("last").await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn forwarding_needs_the_hosts_permission() {
         let s = setup(Grant::default()).await;
         s.receiver.set_identity(s.addr().id);
@@ -1726,8 +1853,19 @@ mod tests {
         let r = s.remote("repo");
         assert!(matches!(r.status().await, Err(NetError::Remote(_))));
         assert!(s.receiver.usage(&s.ep.id()).await.is_err());
-        let err = blocking_call(&r, |r| r.list_packs()).await.unwrap_err();
-        assert!(err.to_string().contains("internal storage error"));
+        // Nothing can be listed there, but storing fails.
+        assert!(
+            blocking_call(&r, |r| r.list_packs())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let data = b"pack".to_vec();
+        let id = PackId(*blake3::hash(&data).as_bytes());
+        let err = blocking_call(&r, move |r| r.put_pack(&id, &data))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("internal storage error"), "{err}");
 
         // A file where the host's storage should be.
         let broken = Receiver::new(s.peer_dir());
