@@ -75,10 +75,20 @@ no longer need (`kinvault invite cancel`).
 
 ### Pairing nearby devices
 
-**Find nearby devices** shows a six-digit code computed from both devices'
-ids. If the codes on both screens match, you're talking to the right device
-and not to someone else on the network. **Always compare them** before
-confirming.
+**Find nearby devices** shows a six-digit code for each device it finds. The
+two devices agree the code over an encrypted, authenticated connection, each
+adding fresh randomness, and one commits to its share before seeing the
+other's. So nobody else on the network can work out in advance which code
+you'll see, or make a device of theirs show the same code as your real one:
+a stranger posing as your device shows a different code (except by a
+one-in-a-million chance). Each device gets only a few tries at agreeing a
+code per search. If the codes on both screens match, you're talking to the
+right device. **Always compare them** before confirming, and if two devices
+appear with the same name, add neither: stop and search again.
+
+Version 0.1.1 and earlier computed the code from the two device ids alone, which
+someone on the same network could forge in seconds; they can't pair with
+newer versions.
 
 ## Protection against a host, or your own computer, going bad
 

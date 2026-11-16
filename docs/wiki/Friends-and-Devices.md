@@ -62,8 +62,9 @@ network.
 ### On the same network
 
 On **both** devices: **Mine → Find nearby devices**. For three minutes each
-lists the devices it finds, with a short code. Check both show the **same
-code**, then choose **The codes match, add it** on both.
+lists the devices it finds; after a moment each shows a short code, agreed
+between the two devices. Check both show the **same code**, then choose
+**The codes match, add it** on both.
 
 ```sh
 kinvault nearby find          # on both; lists devices as they appear

@@ -1569,14 +1569,16 @@ async fn main() -> Result<()> {
             let mut shown = std::collections::HashMap::new();
             while let Some(until) = status.until_unix {
                 for d in &status.devices {
-                    if shown.get(&d.id) != Some(&d.state) {
+                    let seen = (d.state, d.code.clone());
+                    if shown.get(&d.id) != Some(&seen) {
                         let state = match d.state {
                             NearbyState::Found => "found",
                             NearbyState::Waiting => "waiting for it to confirm",
                             NearbyState::Paired => "yours",
                         };
-                        println!("{}  code {}  {state}  ({})", d.name, d.code, d.id);
-                        shown.insert(d.id.clone(), d.state);
+                        let code = d.code.as_deref().unwrap_or("(agreeing…)");
+                        println!("{}  code {code}  {state}  ({})", d.name, d.id);
+                        shown.insert(d.id.clone(), seen);
                     }
                 }
                 let now = std::time::SystemTime::now()
@@ -1630,7 +1632,8 @@ async fn main() -> Result<()> {
                 }
                 _ => println!(
                     "Confirmed. Now pair with this device on {} (code {}).",
-                    d.name, d.code
+                    d.name,
+                    d.code.as_deref().unwrap_or("?")
                 ),
             }
         }

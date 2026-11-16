@@ -14,6 +14,7 @@ use kinvault_core::{Backend, LocalDirBackend, PackId, SnapshotId};
 
 use crate::error::NetError;
 use crate::limits::{RateLimiter, TimeWindow};
+use crate::nearby::PairNonce;
 use crate::protocol::{
     Delegation, Delivery, ErrorCode, ForwardOrder, MAX_HAVE, MAX_OBJECT_LEN, MAX_ORDER_LEN,
     MAX_REQUEST_LEN, Offer, Op, PeerName, Request, Response, read_msg, read_payload,
@@ -87,6 +88,18 @@ pub type PairHandler = Arc<
         + Sync,
 >;
 
+/// Answers a nearby peer agreeing a pairing code with this host (see
+/// [`crate::nearby::pairing_code`]). The host is the responder: it gets the
+/// peer's commitment, answers with its own nonce, then gets the peer's
+/// nonce and checks it against the commitment. Implementations keep the
+/// state between the two calls and limit how many attempts a peer gets.
+pub trait PairCheckHandler: Send + Sync {
+    /// The peer committed to its nonce; returns this host's nonce.
+    fn start(&self, peer: EndpointId, commitment: [u8; 32]) -> Result<PairNonce, String>;
+    /// The peer revealed its nonce; on success both sides can show the code.
+    fn reveal(&self, peer: EndpointId, nonce: PairNonce) -> Result<(), String>;
+}
+
 /// Told that a peer removed this host's owner (see [`Op::Unfriend`]), after
 /// the receiver stopped accepting its backups and scheduled them for erasing.
 pub type UnfriendHandler =
@@ -128,6 +141,7 @@ struct Inner {
     uploads: Mutex<HashMap<EndpointId, Arc<PeerUploads>>>,
     invites: RwLock<Option<InviteHandler>>,
     pairing: RwLock<Option<PairHandler>>,
+    pair_checks: RwLock<Option<Arc<dyn PairCheckHandler>>>,
     unfriending: RwLock<Option<UnfriendHandler>>,
     /// This host's own id, which deliveries must be addressed to.
     identity: RwLock<Option<EndpointId>>,
@@ -147,6 +161,7 @@ impl Receiver {
                 uploads: Mutex::default(),
                 invites: RwLock::default(),
                 pairing: RwLock::default(),
+                pair_checks: RwLock::default(),
                 unfriending: RwLock::default(),
                 identity: RwLock::default(),
                 forwarding: RwLock::default(),
@@ -190,6 +205,31 @@ impl Receiver {
 
     pub fn set_pair_handler(&self, handler: PairHandler) {
         *self.inner.pairing.write().unwrap() = Some(handler);
+    }
+
+    pub fn set_pair_check_handler(&self, handler: Arc<dyn PairCheckHandler>) {
+        *self.inner.pair_checks.write().unwrap() = Some(handler);
+    }
+
+    /// Runs one step of agreeing a pairing code (`Op::PairStart` or
+    /// `Op::PairReveal`) with the owner's handler.
+    fn pair_check(&self, peer: EndpointId, op: &Op) -> Result<Reply, Failure> {
+        let handler = self.inner.pair_checks.read().unwrap().clone();
+        let Some(handler) = handler else {
+            return Err((ErrorCode::Denied, "this host does not pair".into()));
+        };
+        let denied = |e| (ErrorCode::Denied, e);
+        match op {
+            Op::PairStart { commitment } => {
+                let nonce = handler.start(peer, *commitment).map_err(denied)?;
+                Ok((Response::PairNonce { nonce }, None))
+            }
+            Op::PairReveal { nonce } => {
+                handler.reveal(peer, *nonce).map_err(denied)?;
+                Ok((Response::Ok, None))
+            }
+            _ => unreachable!("only called for pairing code steps"),
+        }
     }
 
     pub fn set_unfriend_handler(&self, handler: UnfriendHandler) {
@@ -460,6 +500,9 @@ impl Receiver {
         if let Op::Unfriend = req.op {
             return self.unfriend(peer).await;
         }
+        if let Op::PairStart { .. } | Op::PairReveal { .. } = req.op {
+            return self.pair_check(peer, &req.op);
+        }
         // From a relay, which may not be a peer itself: allowed if the owner
         // it delivers for signed a permission for it.
         if let Op::Deliver { delegation, item } = req.op {
@@ -600,6 +643,8 @@ impl Receiver {
             | Op::Forward { .. }
             | Op::ForwardStatus { .. }
             | Op::ForwardCancel { .. }
+            | Op::PairStart { .. }
+            | Op::PairReveal { .. }
             | Op::Unfriend => {
                 unreachable!("handled above")
             }
@@ -1327,6 +1372,80 @@ mod tests {
         assert_eq!(name.unwrap(), "laptop");
         let err = pair(&s.ep, s.addr(), "stranger".into(), Vec::new()).await;
         assert!(matches!(err, Err(NetError::Denied(m)) if m == "not confirmed"));
+    }
+
+    /// A responder like the daemon's: one commitment at a time per peer,
+    /// and the code once the revealed nonce matches it.
+    #[derive(Default)]
+    struct TestChecks {
+        host: Option<EndpointId>,
+        pending: Mutex<HashMap<EndpointId, ([u8; 32], PairNonce)>>,
+        codes: Mutex<HashMap<EndpointId, String>>,
+    }
+
+    impl PairCheckHandler for TestChecks {
+        fn start(&self, peer: EndpointId, commitment: [u8; 32]) -> Result<PairNonce, String> {
+            let nonce = crate::nearby::pair_nonce();
+            self.pending
+                .lock()
+                .unwrap()
+                .insert(peer, (commitment, nonce));
+            Ok(nonce)
+        }
+
+        fn reveal(&self, peer: EndpointId, nonce: PairNonce) -> Result<(), String> {
+            let (commitment, mine) = self
+                .pending
+                .lock()
+                .unwrap()
+                .remove(&peer)
+                .ok_or("no check started")?;
+            if crate::nearby::pair_commitment(&nonce) != commitment {
+                return Err("that isn't the nonce committed to".into());
+            }
+            let code =
+                crate::nearby::pairing_code(&peer, self.host.as_ref().unwrap(), &nonce, &mine);
+            self.codes.lock().unwrap().insert(peer, code);
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pairing_codes_are_agreed_with_a_commitment() {
+        let s = setup(Grant::default()).await;
+        let err = crate::client::pair_check(&s.ep, s.addr())
+            .await
+            .unwrap_err();
+        assert!(matches!(err.error, NetError::Denied(_)), "{err:?}");
+        assert!(!err.answered);
+
+        let checks = Arc::new(TestChecks {
+            host: Some(s.addr().id),
+            ..Default::default()
+        });
+        s.receiver.set_pair_check_handler(checks.clone());
+        let code = crate::client::pair_check(&s.ep, s.addr()).await.unwrap();
+        assert_eq!(checks.codes.lock().unwrap()[&s.ep.id()], code);
+
+        // A sender that reveals a different nonce than it committed to (to
+        // choose the code after seeing the host's nonce) is refused.
+        let committed = crate::nearby::pair_nonce();
+        let start = Request {
+            repo: "pair".into(),
+            op: Op::PairStart {
+                commitment: crate::nearby::pair_commitment(&committed),
+            },
+        };
+        let resp = raw_call(&s.ep, s.addr(), &encode(&start)).await.unwrap();
+        assert!(matches!(resp, Response::PairNonce { .. }), "{resp:?}");
+        let reveal = Request {
+            repo: "pair".into(),
+            op: Op::PairReveal {
+                nonce: crate::nearby::pair_nonce(),
+            },
+        };
+        let resp = raw_call(&s.ep, s.addr(), &encode(&reveal)).await.unwrap();
+        assert!(is_error(&resp, ErrorCode::Denied), "{resp:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

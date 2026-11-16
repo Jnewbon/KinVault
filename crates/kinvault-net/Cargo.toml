@@ -7,6 +7,7 @@ edition.workspace = true
 kinvault-core.workspace = true
 blake3.workspace = true
 data-encoding.workspace = true
+getrandom.workspace = true
 hex.workspace = true
 iroh.workspace = true
 jiff.workspace = true

@@ -1434,9 +1434,11 @@ function nearbyCard() {
     let action;
     if (d.state === "paired") action = el("span", { class: "chip ok" }, "Yours");
     else if (d.state === "waiting") action = el("span", { class: "chip" }, `Now confirm on ${d.name}`);
+    else if (!d.code) action = el("span", { class: "chip" }, "Checking…");
     else action = el("button", { class: "btn primary small", onclick: () => pairDialog(d) }, "Add…");
+    const code = d.code ? `Code ${d.code}` : "Agreeing a code with it…";
     card.append(el("div", { class: "row", style: "margin-top:12px" },
-      el("span", { class: "spacer" }, el("strong", {}, d.name), el("div", { class: "muted small" }, `Code ${d.code}`)), action));
+      el("span", { class: "spacer" }, el("strong", {}, d.name), el("div", { class: "muted small" }, code)), action));
   }
   return card;
 }

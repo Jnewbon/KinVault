@@ -1177,7 +1177,9 @@ async fn nearby_devices_pair_once_confirmed_on_both() {
     let mut found = None;
     for _ in 0..100 {
         let (a, b) = (nearby(&nas).await, nearby(&laptop).await);
-        if !a.devices.is_empty() && !b.devices.is_empty() {
+        // Listed at once, with a code once the two have agreed one.
+        let agreed = |s: &NearbyStatus| s.devices.first().is_some_and(|d| d.code.is_some());
+        if agreed(&a) && agreed(&b) {
             found = Some((a.devices[0].clone(), b.devices[0].clone()));
             break;
         }
@@ -1190,6 +1192,7 @@ async fn nearby_devices_pair_once_confirmed_on_both() {
     );
     assert_eq!(on_nas.id, laptop.id().to_string());
     assert_eq!(on_nas.code, on_laptop.code);
+    assert_eq!(on_nas.code.as_ref().map(String::len), Some(7));
     assert_eq!(on_nas.state, NearbyState::Found);
 
     // Confirmed on one side only: nothing is shared yet.

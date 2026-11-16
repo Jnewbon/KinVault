@@ -114,6 +114,18 @@ pub enum Op {
     /// that may no longer store data here, since it only affects the
     /// sender's own data; `repo` is ignored.
     Unfriend,
+    /// Starts agreeing a pairing code with a nearby device: commits to the
+    /// sender's nonce (see [`crate::nearby::pairing_code`]). Answered with
+    /// [`Response::PairNonce`]. Allowed from peers the host doesn't know
+    /// yet; `repo` is ignored.
+    PairStart {
+        commitment: [u8; 32],
+    },
+    /// Reveals the nonce committed to in `PairStart`, after which both
+    /// sides can show the code.
+    PairReveal {
+        nonce: [u8; 32],
+    },
 }
 
 /// What a relay delivers, or asks about, for an owner.
@@ -379,6 +391,10 @@ pub enum Response {
     /// For each pack asked about, whether it's stored.
     Present(Vec<bool>),
     Forwarding(Vec<ForwardInfo>),
+    /// The host's nonce for the pairing code (after `Op::PairStart`).
+    PairNonce {
+        nonce: [u8; 32],
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]

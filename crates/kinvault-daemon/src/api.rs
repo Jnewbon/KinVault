@@ -765,7 +765,9 @@ pub struct NearbyDevice {
     pub id: String,
     pub name: String,
     /// Shown on both devices; the user checks they match before confirming.
-    pub code: String,
+    /// `None` until the two devices have agreed it.
+    #[serde(default)]
+    pub code: Option<String>,
     pub state: NearbyState,
 }
 

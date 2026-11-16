@@ -5,7 +5,9 @@
 //! key, so nobody else can send one under its id to change the name or
 //! addresses shown for it. Anyone can still announce made-up devices of their
 //! own: the actual pairing runs over an authenticated connection, and users
-//! compare a [`pairing_code`] shown on both devices before confirming.
+//! compare a [`pairing_code`] shown on both devices before confirming. The
+//! code is agreed over that connection with fresh randomness from both sides
+//! (see [`pairing_code`]), so it can't be predicted from the beacons.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -199,17 +201,48 @@ impl NearbySocket {
     }
 }
 
+/// A fresh random value each side contributes to a [`pairing_code`].
+pub type PairNonce = [u8; 32];
+
+/// A new random [`PairNonce`].
+pub fn pair_nonce() -> PairNonce {
+    let mut nonce = [0u8; 32];
+    getrandom::fill(&mut nonce).expect("the system's random number generator works");
+    nonce
+}
+
+/// What the device starting a code check sends first: it binds that device
+/// to its nonce before it sees the other's, so neither side can steer the
+/// code (see [`pairing_code`]).
+pub fn pair_commitment(nonce: &PairNonce) -> [u8; 32] {
+    blake3::derive_key("kinvault pairing commitment v2", nonce)
+}
+
+/// Which of two devices starts the code check: the one with the smaller id.
+pub fn starts_check(me: &EndpointId, other: &EndpointId) -> bool {
+    me.as_bytes() < other.as_bytes()
+}
+
 /// A six-digit code, the same on both devices, that users compare before
 /// pairing so a stranger on the network can't pose as one of their devices.
-pub fn pairing_code(a: &EndpointId, b: &EndpointId) -> String {
-    let (first, second) = if a.as_bytes() <= b.as_bytes() {
-        (a, b)
-    } else {
-        (b, a)
-    };
-    let mut hasher = blake3::Hasher::new_derive_key("kinvault 2026 pairing code");
-    hasher.update(first.as_bytes());
-    hasher.update(second.as_bytes());
+///
+/// It is derived from both ids and a fresh nonce from each side, exchanged
+/// over an authenticated connection: the initiator commits to its nonce
+/// ([`pair_commitment`]), the responder sends its own, then the initiator
+/// reveals its nonce. Since neither can choose its nonce after seeing the
+/// other's, a stranger can't grind keys offline until its code matches a
+/// real device's; at best it guesses, one in a million per attempt.
+pub fn pairing_code(
+    initiator: &EndpointId,
+    responder: &EndpointId,
+    initiator_nonce: &PairNonce,
+    responder_nonce: &PairNonce,
+) -> String {
+    let mut hasher = blake3::Hasher::new_derive_key("kinvault pairing sas v2");
+    hasher.update(initiator.as_bytes());
+    hasher.update(responder.as_bytes());
+    hasher.update(initiator_nonce);
+    hasher.update(responder_nonce);
     let hash = hasher.finalize();
     let n = u32::from_le_bytes(hash.as_bytes()[..4].try_into().unwrap()) % 1_000_000;
     format!("{:03} {:03}", n / 1000, n % 1000)
@@ -326,13 +359,37 @@ mod tests {
     }
 
     #[test]
-    fn code_is_symmetric_and_specific() {
+    fn code_depends_on_ids_and_both_nonces() {
         let a = iroh::SecretKey::generate().public();
         let b = iroh::SecretKey::generate().public();
         let c = iroh::SecretKey::generate().public();
-        assert_eq!(pairing_code(&a, &b), pairing_code(&b, &a));
-        assert_ne!(pairing_code(&a, &b), pairing_code(&a, &c));
-        assert_eq!(pairing_code(&a, &b).len(), 7);
+        let (na, nb) = (pair_nonce(), pair_nonce());
+        let code = pairing_code(&a, &b, &na, &nb);
+        assert_eq!(code.len(), 7);
+        assert_eq!(code, pairing_code(&a, &b, &na, &nb));
+        assert_ne!(code, pairing_code(&a, &c, &na, &nb));
+        assert_ne!(code, pairing_code(&b, &a, &na, &nb));
+        assert_ne!(code, pairing_code(&a, &b, &pair_nonce(), &nb));
+        assert_ne!(code, pairing_code(&a, &b, &na, &pair_nonce()));
+        assert_ne!(na, nb);
+        assert_ne!(pair_commitment(&na), pair_commitment(&nb));
+        assert_eq!(starts_check(&a, &b), !starts_check(&b, &a));
+    }
+
+    /// The old code depended only on the two public ids, so anyone who saw
+    /// two devices' beacons could grind keys offline until one of theirs
+    /// showed the same code (about a million tries, seconds of work). Now
+    /// the code a forger's key would get can't be computed without the
+    /// nonces exchanged with the real device: for fixed ids it's spread
+    /// over many values, one per session.
+    #[test]
+    fn a_key_cant_be_ground_to_match_a_code() {
+        let a = iroh::SecretKey::generate().public();
+        let b = iroh::SecretKey::generate().public();
+        let codes: std::collections::HashSet<_> = (0..64)
+            .map(|_| pairing_code(&a, &b, &pair_nonce(), &pair_nonce()))
+            .collect();
+        assert!(codes.len() > 60, "{} distinct codes", codes.len());
     }
 
     #[tokio::test]

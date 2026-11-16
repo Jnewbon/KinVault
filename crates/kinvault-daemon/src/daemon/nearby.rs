@@ -1,6 +1,9 @@
 //! Pairing with the user's other devices on the local network. For a few
-//! minutes the daemon announces itself and lists the devices it hears. When
-//! the user confirms one (after checking the code matches on both screens),
+//! minutes the daemon announces itself and lists the devices it hears. For
+//! each, the two devices agree a code over an authenticated connection, with
+//! fresh randomness from both (see [`pairing_code`]); it's shown only once
+//! that's done. When the user confirms one (after checking the code matches
+//! on both screens),
 //! the daemon asks it to pair over an authenticated connection; the other
 //! device agrees only once its user has confirmed this one too. Both then
 //! list each other as their own, without limits.
@@ -10,9 +13,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
-use kinvault_net::nearby::{Beacon, NearbySocket, pairing_code};
+use kinvault_net::nearby::{
+    Beacon, NearbySocket, PairNonce, pair_commitment, pair_nonce, pairing_code, starts_check,
+};
 use kinvault_net::protocol::PeerName;
-use kinvault_net::{EndpointAddr, EndpointId, NetError, PairRequest};
+use kinvault_net::{
+    EndpointAddr, EndpointId, NetError, PairCheckFailed, PairCheckHandler, PairRequest,
+};
 
 use super::{Daemon, Inner, unix_now};
 use crate::api::{Event, GrantSpec, HostOffer, NearbyDevice, NearbyState, NearbyStatus, Reply};
@@ -30,11 +37,20 @@ const MAX_PER_SENDER: usize = 4;
 /// A device not heard from for this long has gone (they announce every
 /// [`ANNOUNCE_EVERY`]), and makes way for new ones.
 const STALE_AFTER: Duration = Duration::from_secs(10);
+/// Tries at agreeing a code with one device per session. Whoever reveals
+/// its nonce last learns the code first and could drop the exchange and try
+/// again for a code it likes, so tries are few.
+const CHECK_ATTEMPTS: u8 = 3;
+/// Code checks started or answered per session, across all devices, so
+/// made-up devices can't buy unlimited tries.
+const MAX_CHECKS: usize = 2 * MAX_DEVICES;
 
 pub(super) struct Session {
     until_unix: i64,
     /// In the order they were found.
     devices: Vec<Found>,
+    /// Code checks started or answered so far (see [`MAX_CHECKS`]).
+    checks: usize,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -46,6 +62,31 @@ struct Found {
     last_seen: Instant,
     /// When the newest beacon accepted from it was sent (its clock).
     sent_unix: i64,
+    /// Agreeing the code shown for it.
+    check: Check,
+    /// Code checks tried with it so far (see [`CHECK_ATTEMPTS`]).
+    attempts: u8,
+}
+
+/// How agreeing a pairing code with a device is going.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Check {
+    NotStarted,
+    /// This side started it; `attempt` tells this try's result from a
+    /// stale one's.
+    Starting {
+        attempt: u64,
+    },
+    /// The other side committed to its nonce; this side answered with `nonce`.
+    Answered {
+        commitment: [u8; 32],
+        nonce: PairNonce,
+    },
+    Done {
+        code: String,
+    },
+    /// Out of tries, or the other side cheated.
+    Failed,
 }
 
 impl Found {
@@ -106,8 +147,77 @@ fn record(devices: &mut Vec<Found>, beacon: Beacon, now: Instant) -> bool {
         paired: false,
         last_seen: now,
         sent_unix: beacon.sent_unix,
+        check: Check::NotStarted,
+        attempts: 0,
     });
     true
+}
+
+/// Starting a code check: the device must be listed, have tries left, and
+/// the session must have checks left. Counts the try.
+fn take_attempt<'a>(session: &'a mut Session, id: &EndpointId) -> Result<&'a mut Found, String> {
+    if session.checks >= MAX_CHECKS {
+        return Err("too many pairing attempts; stop and look again".into());
+    }
+    let device = session
+        .devices
+        .iter_mut()
+        .find(|d| d.addr.id == *id)
+        .ok_or("not listed on this device")?;
+    if device.attempts >= CHECK_ATTEMPTS {
+        device.check = Check::Failed;
+        return Err("too many attempts at a code with this device".into());
+    }
+    device.attempts += 1;
+    session.checks += 1;
+    Ok(device)
+}
+
+/// Answers the other side's commitment; returns this side's nonce.
+fn answer_check(
+    session: &mut Session,
+    me: &EndpointId,
+    peer: &EndpointId,
+    commitment: [u8; 32],
+) -> Result<PairNonce, String> {
+    if starts_check(me, peer) {
+        return Err("this device starts the code check".into());
+    }
+    if let Some(d) = session.devices.iter().find(|d| d.addr.id == *peer)
+        && matches!(d.check, Check::Done { .. } | Check::Failed)
+    {
+        return Err("the code with this device is already settled".into());
+    }
+    let device = take_attempt(session, peer)?;
+    let nonce = pair_nonce();
+    device.check = Check::Answered { commitment, nonce };
+    Ok(nonce)
+}
+
+/// The other side revealed its nonce: checks it against its commitment and
+/// settles the code.
+fn finish_check(
+    session: &mut Session,
+    me: &EndpointId,
+    peer: &EndpointId,
+    revealed: PairNonce,
+) -> Result<(), String> {
+    let device = session
+        .devices
+        .iter_mut()
+        .find(|d| d.addr.id == *peer)
+        .ok_or("not listed on this device")?;
+    let Check::Answered { commitment, nonce } = device.check else {
+        return Err("no code check under way".into());
+    };
+    if pair_commitment(&revealed) != commitment {
+        device.check = Check::Failed;
+        return Err("that isn't the value committed to".into());
+    }
+    device.check = Check::Done {
+        code: pairing_code(peer, me, &revealed, &nonce),
+    };
+    Ok(())
 }
 
 impl Drop for Session {
@@ -134,6 +244,7 @@ impl Daemon {
                 *session = Some(Session {
                     until_unix,
                     devices: Vec::new(),
+                    checks: 0,
                     task,
                 });
                 tracing::info!("looking for nearby devices");
@@ -161,7 +272,6 @@ impl Daemon {
                 .map(|p| p.id.clone())
                 .collect()
         };
-        let me = self.id();
         let session = self.inner.nearby.lock().unwrap();
         let Some(session) = session.as_ref() else {
             return Ok(Reply::Nearby(NearbyStatus::default()));
@@ -179,7 +289,10 @@ impl Daemon {
                     NearbyState::Found
                 };
                 NearbyDevice {
-                    code: pairing_code(&me, &d.addr.id),
+                    code: match &d.check {
+                        Check::Done { code } => Some(code.clone()),
+                        _ => None,
+                    },
                     id,
                     name: d.name.clone(),
                     state,
@@ -205,6 +318,12 @@ impl Daemon {
                 .iter_mut()
                 .find(|d| d.addr.id == id)
                 .ok_or_else(|| anyhow!("that device is no longer nearby"))?;
+            // The user can only have compared a code that's been agreed.
+            match device.check {
+                Check::Done { .. } => {}
+                Check::Failed => bail!("couldn't agree a code with that device"),
+                _ => bail!("still agreeing a code with that device; try again in a moment"),
+            }
             device.confirmed = true;
             (device.addr.clone(), device.name.clone())
         };
@@ -233,7 +352,7 @@ impl Daemon {
             let device = session
                 .as_ref()
                 .and_then(|s| s.devices.iter().find(|d| d.addr.id == r.peer))
-                .filter(|d| d.confirmed)
+                .filter(|d| d.confirmed && matches!(d.check, Check::Done { .. }))
                 .ok_or_else(waiting)?;
             (device.addr.clone(), device.name.clone())
         };
@@ -328,19 +447,118 @@ async fn run(inner: std::sync::Weak<Inner>, socket: NearbySocket) {
 
 impl Daemon {
     fn found(&self, beacon: Beacon) {
-        if beacon.addr.id == self.id() {
+        let me = self.id();
+        let id = beacon.addr.id;
+        if id == me {
             return;
         }
-        let changed = {
+        let (changed, start) = {
             let mut session = self.inner.nearby.lock().unwrap();
             let Some(session) = session.as_mut() else {
                 return;
             };
-            record(&mut session.devices, beacon, Instant::now())
+            let changed = record(&mut session.devices, beacon, Instant::now());
+            // The device with the smaller id starts agreeing the code.
+            let start = starts_check(&me, &id)
+                && session
+                    .devices
+                    .iter()
+                    .any(|d| d.addr.id == id && d.check == Check::NotStarted)
+                && take_attempt(session, &id).is_ok();
+            let start = start.then(|| {
+                let attempt = NEXT_ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let d = session.devices.iter_mut().find(|d| d.addr.id == id);
+                let d = d.expect("just found");
+                d.check = Check::Starting { attempt };
+                (d.addr.clone(), attempt)
+            });
+            (changed, start)
         };
         if changed {
             self.notify(Event::NearbyChanged);
         }
+        if let Some((addr, attempt)) = start {
+            let weak = Arc::downgrade(&self.inner);
+            tokio::spawn(async move {
+                let Some(inner) = weak.upgrade() else { return };
+                let endpoint = inner.endpoint.clone();
+                drop(inner);
+                let result =
+                    tokio::time::timeout(PAIR_TIMEOUT, kinvault_net::pair_check(&endpoint, addr))
+                        .await;
+                let Some(inner) = weak.upgrade() else { return };
+                Daemon { inner }.check_finished(id, attempt, result);
+            });
+        }
+    }
+
+    /// Records how a code check this side started went. A failed try is
+    /// tried again on the device's next beacon, while tries are left.
+    fn check_finished(
+        &self,
+        id: EndpointId,
+        attempt: u64,
+        result: Result<Result<String, PairCheckFailed>, tokio::time::error::Elapsed>,
+    ) {
+        {
+            let mut session = self.inner.nearby.lock().unwrap();
+            let Some(session) = session.as_mut() else {
+                return;
+            };
+            let Some(device) = session.devices.iter_mut().find(|d| d.addr.id == id) else {
+                return;
+            };
+            if device.check != (Check::Starting { attempt }) {
+                return; // from an earlier session, or replaced
+            }
+            device.check = match result {
+                Ok(Ok(code)) => Check::Done { code },
+                Ok(Err(e)) => {
+                    tracing::debug!(peer = %id, "agreeing a pairing code failed: {e}");
+                    // The other device wasn't ready (it may not have heard
+                    // this one yet): that try doesn't count.
+                    if !e.answered {
+                        device.attempts -= 1;
+                        session.checks -= 1;
+                    }
+                    Check::NotStarted
+                }
+                // It may have answered; count the try.
+                Err(_) => Check::NotStarted,
+            };
+            if device.check == Check::NotStarted && device.attempts >= CHECK_ATTEMPTS {
+                device.check = Check::Failed;
+            }
+        }
+        self.notify(Event::NearbyChanged);
+    }
+}
+
+/// Tells code-check tries apart, across sessions.
+static NEXT_ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Answers nearby devices agreeing a pairing code with this one.
+pub(super) struct PairChecks(pub(super) std::sync::Weak<Inner>);
+
+impl PairCheckHandler for PairChecks {
+    fn start(&self, peer: EndpointId, commitment: [u8; 32]) -> Result<PairNonce, String> {
+        let inner = self.0.upgrade().ok_or("host is shutting down")?;
+        let me = inner.endpoint.id();
+        let mut session = inner.nearby.lock().unwrap();
+        let session = session.as_mut().ok_or("not looking for nearby devices")?;
+        answer_check(session, &me, &peer, commitment)
+    }
+
+    fn reveal(&self, peer: EndpointId, nonce: PairNonce) -> Result<(), String> {
+        let inner = self.0.upgrade().ok_or("host is shutting down")?;
+        let me = inner.endpoint.id();
+        let result = {
+            let mut session = inner.nearby.lock().unwrap();
+            let session = session.as_mut().ok_or("not looking for nearby devices")?;
+            finish_check(session, &me, &peer, nonce)
+        };
+        Daemon { inner }.notify(Event::NearbyChanged);
+        result
     }
 }
 
@@ -443,6 +661,81 @@ mod tests {
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].name, "renamed");
         assert_eq!(devices[0].last_seen, later);
+    }
+
+    /// A session listing one device, `peer`, as heard by `me`; `me` is the
+    /// side that answers code checks.
+    fn answering_session() -> (Session, EndpointId, EndpointId) {
+        let (mut me, mut peer) = (SecretKey::generate().public(), beacon([10, 0, 0, 1]));
+        while starts_check(&me, &peer.addr.id) {
+            me = SecretKey::generate().public();
+            peer = beacon([10, 0, 0, 1]);
+        }
+        let id = peer.addr.id;
+        let mut session = Session {
+            until_unix: i64::MAX,
+            devices: Vec::new(),
+            checks: 0,
+            task: tokio::spawn(async {}),
+        };
+        record(&mut session.devices, peer, Instant::now());
+        (session, me, id)
+    }
+
+    #[tokio::test]
+    async fn a_code_is_agreed_with_a_commitment() {
+        let (mut session, me, peer) = answering_session();
+        let theirs = pair_nonce();
+        let mine = answer_check(&mut session, &me, &peer, pair_commitment(&theirs)).unwrap();
+        // Only the side with the smaller id starts.
+        assert!(answer_check(&mut session, &peer, &me, [0; 32]).is_err());
+        finish_check(&mut session, &me, &peer, theirs).unwrap();
+        assert_eq!(
+            session.devices[0].check,
+            Check::Done {
+                code: pairing_code(&peer, &me, &theirs, &mine)
+            }
+        );
+        // Settled for the rest of the session.
+        assert!(answer_check(&mut session, &me, &peer, [0; 32]).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_reveal_that_breaks_the_commitment_fails_the_check() {
+        let (mut session, me, peer) = answering_session();
+        answer_check(&mut session, &me, &peer, pair_commitment(&pair_nonce())).unwrap();
+        assert!(finish_check(&mut session, &me, &peer, pair_nonce()).is_err());
+        assert_eq!(session.devices[0].check, Check::Failed);
+        assert!(answer_check(&mut session, &me, &peer, [0; 32]).is_err());
+    }
+
+    #[tokio::test]
+    async fn tries_at_a_code_are_limited() {
+        // Dropping exchanges after seeing the nonce, to retry for a chosen code.
+        let (mut session, me, peer) = answering_session();
+        for _ in 0..CHECK_ATTEMPTS {
+            answer_check(&mut session, &me, &peer, [1; 32]).unwrap();
+        }
+        assert!(answer_check(&mut session, &me, &peer, [1; 32]).is_err());
+        assert_eq!(session.devices[0].check, Check::Failed);
+
+        // And across devices, per session.
+        let (mut session, me, _) = answering_session();
+        session.checks = MAX_CHECKS;
+        let id = session.devices[0].addr.id;
+        assert!(answer_check(&mut session, &me, &id, [1; 32]).is_err());
+    }
+
+    #[tokio::test]
+    async fn unlisted_devices_cant_start_a_check() {
+        let (mut session, me, _) = answering_session();
+        let mut stranger = SecretKey::generate().public();
+        while starts_check(&me, &stranger) {
+            stranger = SecretKey::generate().public();
+        }
+        assert!(answer_check(&mut session, &me, &stranger, [1; 32]).is_err());
+        assert!(finish_check(&mut session, &me, &stranger, [1; 32]).is_err());
+        assert_eq!(session.checks, 0);
     }
 
     #[test]

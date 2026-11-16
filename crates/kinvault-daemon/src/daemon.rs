@@ -165,6 +165,10 @@ impl Daemon {
                 Daemon { inner }.accept_invite(r).await
             })
         }));
+        daemon
+            .inner
+            .receiver
+            .set_pair_check_handler(Arc::new(nearby::PairChecks(Arc::downgrade(&daemon.inner))));
         let weak = Arc::downgrade(&daemon.inner);
         daemon.inner.receiver.set_pair_handler(Arc::new(move |r| {
             let weak = weak.clone();
