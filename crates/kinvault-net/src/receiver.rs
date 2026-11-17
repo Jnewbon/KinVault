@@ -38,6 +38,17 @@ const UPLOADS_TOTAL: usize = 16;
 /// Downloads one peer may have in progress, and across all peers.
 const DOWNLOADS_PER_PEER: usize = 4;
 const DOWNLOADS_TOTAL: usize = 32;
+/// Connections served at once, in all and from one peer. Anyone who knows
+/// this host's id can connect, so these bound what strangers can tie up.
+/// A sender keeps one connection per backup set (and place) it has here,
+/// plus a few for checks, so the per-peer limit leaves room for many sets.
+const MAX_CONNECTIONS: usize = 1024;
+const MAX_CONNECTIONS_PER_PEER: usize = 64;
+/// How long a new stream may take to send its request. Requests are small.
+#[cfg(not(test))]
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 /// Received files never stored (the upload broke off, or the host stopped)
 /// are removed after this long.
 const INCOMING_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -164,6 +175,8 @@ struct Inner {
     /// Shared by all peers: see [`UPLOADS_TOTAL`] and [`DOWNLOADS_TOTAL`].
     upload_slots: Arc<tokio::sync::Semaphore>,
     download_slots: Arc<tokio::sync::Semaphore>,
+    /// Connections open per peer (see [`MAX_CONNECTIONS_PER_PEER`]).
+    connections: Mutex<HashMap<EndpointId, usize>>,
 }
 
 /// What follows a response: `len` bytes of a stored object from `offset`,
@@ -197,6 +210,7 @@ impl Receiver {
                 forwarding: RwLock::default(),
                 upload_slots: Arc::new(tokio::sync::Semaphore::new(UPLOADS_TOTAL)),
                 download_slots: Arc::new(tokio::sync::Semaphore::new(DOWNLOADS_TOTAL)),
+                connections: Mutex::default(),
             }),
         }
     }
@@ -396,7 +410,10 @@ impl Receiver {
         mut send: SendStream,
         mut recv: RecvStream,
     ) -> Result<(), NetError> {
-        let req: Request = read_msg(&mut recv, MAX_REQUEST_LEN).await?;
+        let req: Request =
+            tokio::time::timeout(REQUEST_TIMEOUT, read_msg(&mut recv, MAX_REQUEST_LEN))
+                .await
+                .map_err(|_| NetError::Protocol("no request arrived in time".into()))??;
         let (resp, payload) = match self.dispatch(peer, req, &mut recv).await {
             Ok(reply) => reply,
             Err((code, message)) => {
@@ -457,6 +474,20 @@ impl Receiver {
     /// A peer removed this host's owner: stop accepting its backups, schedule
     /// what it stored for erasing, then let the owner's handler forget it.
     async fn unfriend(&self, peer: EndpointId) -> Result<Reply, Failure> {
+        // Nothing to stop or erase for a peer that stores nothing here (any
+        // stranger can send this), so don't track anything for it either.
+        // The owner's handler still hears of it: the peer may be a host of
+        // ours rather than a guest.
+        let dir = self.peer_dir(&peer);
+        let stores_here =
+            self.access(&peer).is_some() || tokio::fs::try_exists(&dir).await.unwrap_or(true);
+        if !stores_here {
+            let handler = self.inner.unfriending.read().unwrap().clone();
+            if let Some(handler) = handler {
+                handler(peer).await;
+            }
+            return Ok((Response::Ok, None));
+        }
         let erase_after_unix = self.remove_peer(&peer).await.map_err(internal)?;
         let handler = self.inner.unfriending.read().unwrap().clone();
         if let Some(handler) = handler {
@@ -1135,6 +1166,11 @@ impl Drop for Reservation {
 impl ProtocolHandler for Receiver {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let peer = connection.remote_id();
+        let Some(_counted) = ConnectionSlot::take(self, peer) else {
+            tracing::debug!(%peer, "refusing a connection: too many open");
+            connection.close(1u32.into(), b"too many connections");
+            return Ok(());
+        };
         tracing::debug!(%peer, "accepted connection");
         // Serve streams until the peer closes the connection.
         while let Ok((send, recv)) = connection.accept_bi().await {
@@ -1146,6 +1182,40 @@ impl ProtocolHandler for Receiver {
             });
         }
         Ok(())
+    }
+}
+
+/// Counts an open connection against the limits until dropped.
+struct ConnectionSlot {
+    receiver: Receiver,
+    peer: EndpointId,
+}
+
+impl ConnectionSlot {
+    fn take(receiver: &Receiver, peer: EndpointId) -> Option<Self> {
+        let mut open = receiver.inner.connections.lock().unwrap();
+        let total: usize = open.values().sum();
+        let from_peer = open.get(&peer).copied().unwrap_or(0);
+        if total >= MAX_CONNECTIONS || from_peer >= MAX_CONNECTIONS_PER_PEER {
+            return None;
+        }
+        *open.entry(peer).or_default() += 1;
+        Some(Self {
+            receiver: receiver.clone(),
+            peer,
+        })
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        let mut open = self.receiver.inner.connections.lock().unwrap();
+        if let Some(n) = open.get_mut(&self.peer) {
+            *n -= 1;
+            if *n == 0 {
+                open.remove(&self.peer);
+            }
+        }
     }
 }
 
@@ -1607,6 +1677,74 @@ mod tests {
         bytes.extend_from_slice(partial);
         send.write_all(&bytes).await.unwrap();
         (conn, send, recv)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn strangers_unfriending_leave_nothing_behind() {
+        let s = setup(Grant::default()).await;
+        for _ in 0..20 {
+            let stranger = local_endpoint().await;
+            let req = Request {
+                repo: String::new(),
+                op: Op::Unfriend,
+            };
+            let resp = raw_call(&stranger, s.addr(), &encode(&req)).await.unwrap();
+            assert!(matches!(resp, Response::Ok), "{resp:?}");
+        }
+        assert!(s.receiver.inner.usage.lock().unwrap().is_empty());
+        assert!(!s.root.exists() || fs::read_dir(&s.root).unwrap().count() == 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stream_that_sends_no_request_is_closed() {
+        let s = setup(Grant::default()).await;
+        let conn = s.ep.connect(s.addr(), crate::protocol::ALPN).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        // Half a length prefix, then nothing.
+        send.write_all(&[1, 0]).await.unwrap();
+        let started = std::time::Instant::now();
+        let got = tokio::time::timeout(REQUEST_TIMEOUT * 5, recv.read_to_end(1024))
+            .await
+            .expect("the host gives up on the stream");
+        assert!(got.map_or(true, |b| b.is_empty()));
+        assert!(started.elapsed() >= REQUEST_TIMEOUT / 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connections_per_peer_are_limited() {
+        let s = setup(Grant::default()).await;
+        let mut open = Vec::new();
+        for _ in 0..MAX_CONNECTIONS_PER_PEER {
+            let conn = s.ep.connect(s.addr(), crate::protocol::ALPN).await.unwrap();
+            // A request on each, so the host has accepted it.
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            let req = Request {
+                repo: "repo".into(),
+                op: Op::Status,
+            };
+            send.write_all(&encode(&req)).await.unwrap();
+            send.finish().unwrap();
+            let _: Response = read_msg(&mut recv, MAX_RESPONSE_LEN).await.unwrap();
+            open.push(conn);
+        }
+        let extra = s.ep.connect(s.addr(), crate::protocol::ALPN).await.unwrap();
+        let reason = tokio::time::timeout(Duration::from_secs(5), extra.closed())
+            .await
+            .expect("the extra connection is closed");
+        assert!(format!("{reason:?}").contains("too many"), "{reason:?}");
+        // Closing one makes room.
+        open.pop().unwrap().close(0u32.into(), b"done");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let again = s.ep.connect(s.addr(), crate::protocol::ALPN).await.unwrap();
+        let (mut send, mut recv) = again.open_bi().await.unwrap();
+        let req = Request {
+            repo: "repo".into(),
+            op: Op::Status,
+        };
+        send.write_all(&encode(&req)).await.unwrap();
+        send.finish().unwrap();
+        let resp: Response = read_msg(&mut recv, MAX_RESPONSE_LEN).await.unwrap();
+        assert!(matches!(resp, Response::Status { .. }), "{resp:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

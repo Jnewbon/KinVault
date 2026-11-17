@@ -34,13 +34,26 @@ pub use ticket::InviteTicket;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use iroh::endpoint::{BindOpts, presets};
+use iroh::endpoint::{BindOpts, QuicTransportConfig, VarInt, presets};
+
+/// Requests one connection may have in progress at once. Clients use a
+/// handful; the transport's default (100) is more than strangers need.
+pub const MAX_STREAMS_PER_CONNECTION: u32 = 32;
+
+/// Transport settings for KinVault endpoints.
+pub fn transport_config() -> QuicTransportConfig {
+    QuicTransportConfig::builder()
+        .max_concurrent_bidi_streams(VarInt::from_u32(MAX_STREAMS_PER_CONNECTION))
+        .build()
+}
 
 /// Binds an endpoint with the default discovery and relay servers. With a
 /// `port`, it listens on that UDP port (so it can be forwarded on a router)
 /// instead of a random one.
 pub async fn bind(secret: SecretKey, port: Option<u16>) -> Result<Endpoint, NetError> {
-    let mut builder = Endpoint::builder(presets::N0).secret_key(secret);
+    let mut builder = Endpoint::builder(presets::N0)
+        .secret_key(secret)
+        .transport_config(transport_config());
     if let Some(port) = port {
         builder = builder
             .bind_addr((Ipv4Addr::UNSPECIFIED, port))
