@@ -669,8 +669,7 @@ async fn main() -> Result<()> {
     }
     // Importing a recovery kit happens before the daemon runs.
     if let Command::Recovery(RecoveryCommand::Import { file, force }) = &cli.command {
-        let json =
-            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+        let json = kinvault_daemon::recovery::read_kit(file)?;
         let summary = kinvault_daemon::recovery::import_offline(
             &state,
             &json,

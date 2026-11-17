@@ -157,7 +157,7 @@ async fn import_recovery_kit(
     let Some(path) = rx.await.map_err(err)? else {
         return Ok(None);
     };
-    let json = std::fs::read_to_string(&path).map_err(err)?;
+    let json = recovery::read_kit(&path).map_err(err)?;
     let state_dir = state.state_dir.clone();
     let summary = tauri::async_runtime::spawn_blocking(move || {
         recovery::import_offline(&state_dir, &json, &passphrase, false)

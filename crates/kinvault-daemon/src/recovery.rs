@@ -100,6 +100,27 @@ pub struct ImportSummary {
     pub sets: Vec<String>,
 }
 
+/// Largest recovery kit read, and most backup sets one may hold. A kit is
+/// a few KiB per set; these keep a crafted file from tying up the import.
+pub const MAX_KIT_BYTES: u64 = 4 * 1024 * 1024;
+pub const MAX_KIT_SETS: usize = 256;
+
+/// Reads a recovery kit file, refusing one far larger than a kit can be.
+pub fn read_kit(path: &Path) -> Result<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut json = String::new();
+    file.take(MAX_KIT_BYTES + 1)
+        .read_to_string(&mut json)
+        .with_context(|| format!("reading {}", path.display()))?;
+    ensure!(
+        json.len() as u64 <= MAX_KIT_BYTES,
+        "{} is too large to be a recovery kit",
+        path.display()
+    );
+    Ok(json)
+}
+
 /// Writes a kit's identity, sets and peers into `state_dir`. The daemon must
 /// not be running. Refuses to replace an instance that already has sets or
 /// peers unless `force` is set.
@@ -109,8 +130,17 @@ pub fn import_offline(
     passphrase: &str,
     force: bool,
 ) -> Result<ImportSummary> {
+    ensure!(
+        kit_json.len() as u64 <= MAX_KIT_BYTES,
+        "this is too large to be a recovery kit"
+    );
     let kit: RecoveryKit =
         serde_json::from_str(kit_json).context("this is not a KinVault recovery kit")?;
+    ensure!(
+        kit.sets.len() <= MAX_KIT_SETS,
+        "this recovery kit lists {} backups; at most {MAX_KIT_SETS} can be imported",
+        kit.sets.len()
+    );
     ensure!(
         kit.kinvault_recovery_kit == KIT_VERSION,
         "unsupported recovery kit version {}",
@@ -199,4 +229,63 @@ pub fn import_offline(
         instance_id: kit.instance_id,
         sets: imported,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_key() -> KeyFile {
+        KeyFile {
+            version: 1,
+            m_cost_kib: 64 * 1024,
+            t_cost: 3,
+            p_cost: 1,
+            salt: "00".repeat(16),
+            wrapped: "00".repeat(56),
+        }
+    }
+
+    #[test]
+    fn oversized_kits_are_refused_before_any_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let set = KitSet {
+            name: "s".into(),
+            paths: Vec::new(),
+            target: StoredTarget::Local {
+                path: "/nowhere".into(),
+            },
+            upload_limit: None,
+            window: None,
+            retention: RetentionPolicy::default(),
+            excludes: Vec::new(),
+            shared_key: false,
+            extra_targets: Vec::new(),
+            key: dummy_key(),
+        };
+        let kit = RecoveryKit {
+            kinvault_recovery_kit: KIT_VERSION,
+            created_unix: 0,
+            instance_name: None,
+            instance_id: String::new(),
+            identity: dummy_key(),
+            sets: vec![set; MAX_KIT_SETS + 1],
+            peers: Vec::new(),
+        };
+        let json = serde_json::to_string(&kit).unwrap();
+        let started = std::time::Instant::now();
+        let err = import_offline(tmp.path(), &json, "passphrase", false).unwrap_err();
+        assert!(err.to_string().contains("at most"), "{err:#}");
+        // Refused without deriving a single key.
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+
+        let huge = " ".repeat(MAX_KIT_BYTES as usize + 1);
+        let err = import_offline(tmp.path(), &huge, "passphrase", false).unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err:#}");
+        let path = tmp.path().join("kit.json");
+        std::fs::write(&path, &huge).unwrap();
+        assert!(read_kit(&path).is_err());
+        std::fs::write(&path, &json).unwrap();
+        assert_eq!(read_kit(&path).unwrap(), json);
+    }
 }
