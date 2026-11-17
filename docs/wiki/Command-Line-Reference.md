@@ -136,5 +136,7 @@ See [[Recovery Kit]].
 | `KINVAULT_PASSPHRASE` | `recovery` | Passphrase, instead of asking |
 | `KINVAULT_LISTEN_PORT` | `kinvaultd` | UDP port, if none is configured yet |
 | `KINVAULT_WEB` | `kinvaultd` (web builds) | Serve the web interface on this address |
-| `KINVAULT_WEB_PASSWORD` | `kinvaultd` (web builds) | Web sign-in password |
+| `KINVAULT_WEB_PASSWORD` | `kinvaultd` (web builds) | Web sign-in password (at least 12 characters) |
+| `KINVAULT_WEB_HTTPS` | `kinvaultd` (web builds) | `true` when only reached through an HTTPS proxy: cookies are marked Secure |
+| `KINVAULT_WEB_HOSTS` | `kinvaultd` (web builds) | Host names the web interface answers to, comma-separated (default: any) |
 | `RUST_LOG` | `kinvaultd` | Log detail, e.g. `debug` (`kinvaultd -v` or `-vv` overrides it) |

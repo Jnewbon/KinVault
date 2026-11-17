@@ -36,9 +36,14 @@ services:
       KINVAULT_WEB: "0.0.0.0:8080"
       # UDP port for other KinVault instances; forward it on your router.
       KINVAULT_LISTEN_PORT: "47100"
-      # Sign-in password for the web interface. Leave unset to have one
-      # generated and printed in the app's logs on first start.
+      # Sign-in password for the web interface (at least 12 characters).
+      # Leave unset to have one generated on first start and kept in
+      # /data/web-password.
       # KINVAULT_WEB_PASSWORD: "choose-a-long-password"
+      # Host names you open the web interface by; others are refused.
+      # KINVAULT_WEB_HOSTS: "nas.lan,192.168.1.10"
+      # Set when only reached through an HTTPS reverse proxy.
+      # KINVAULT_WEB_HTTPS: "true"
     volumes:
       # Identity, encryption keys, settings and indexes. Keep it on a dataset
       # you snapshot; without it (or a recovery kit) backups can't be read.

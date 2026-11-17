@@ -29,13 +29,16 @@ Then open `http://<server>:8080`.
 | Environment variable | Default | Meaning |
 |---|---|---|
 | `KINVAULT_WEB` | `0.0.0.0:8080` | Address of the web interface |
-| `KINVAULT_WEB_PASSWORD` | generated | Web sign-in password |
+| `KINVAULT_WEB_PASSWORD` | generated | Web sign-in password (at least 12 characters) |
+| `KINVAULT_WEB_HTTPS` | `false` | Set to `true` when only reached through an HTTPS proxy |
+| `KINVAULT_WEB_HOSTS` | any | Host names the web interface answers to, comma-separated |
 | `KINVAULT_LISTEN_PORT` | `47100` | UDP port for peers, used until you set one in the interface |
 | `KINVAULT_STATE` | `/data` | State folder |
 | `RUST_LOG` | `info,iroh=error` | Log detail |
 
 If you don't set `KINVAULT_WEB_PASSWORD`, a password is generated on first
-start, printed in the logs and kept in `/data/web-password`. Delete that file
+start and kept in `/data/web-password` (the logs say where, but not the
+password): `docker exec kinvault cat /data/web-password`. Delete that file
 and restart to get a new one.
 
 The command line tool is in the image:
@@ -101,7 +104,19 @@ Start the app, restore what you need, and resume each backup.
 
 The web interface uses plain HTTP. Use it only on your own network, or put it
 behind a reverse proxy with HTTPS (Nginx Proxy Manager, Caddy, Traefik, …) to
-reach it from elsewhere. Sign-ins last 30 days.
+reach it from elsewhere, and then set `KINVAULT_WEB_HTTPS=true` so its sign-in
+cookie is only ever sent over HTTPS.
+
+- A sign-in lasts 30 days, or until it's unused for a day. At most 32 are
+  kept; signing in again ends the least recently used.
+- After a wrong password, that address must wait before trying again: a
+  second at first, doubling with each further mistake, up to 15 minutes.
+  Other addresses aren't affected.
+- A `KINVAULT_WEB_PASSWORD` must be at least 12 characters.
+- Set `KINVAULT_WEB_HOSTS` to the names you reach it by (e.g.
+  `nas.lan,192.168.1.10`): requests for any other host name are refused,
+  which stops web pages that point their own domain at your server (DNS
+  rebinding) from talking to it.
 
 ## Without Docker
 

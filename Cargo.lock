@@ -2796,6 +2796,7 @@ name = "kinvault-daemon"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "argon2",
  "axum",
  "blake3",
  "clap",
@@ -2814,6 +2815,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
