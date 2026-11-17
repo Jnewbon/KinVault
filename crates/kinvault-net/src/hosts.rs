@@ -155,9 +155,34 @@ fn valid_domain(host: &str) -> bool {
         })
 }
 
+/// Whether an address peers gave can be dialled. Never the unspecified
+/// address, multicast, broadcast or link-local ones (no peer is reached
+/// there, and a peer could otherwise have packets sent anywhere on this
+/// machine's network segment); loopback only when `loopback` says so.
+pub fn dialable(ip: IpAddr, loopback: bool) -> bool {
+    if ip.is_unspecified() || ip.is_multicast() || (ip.is_loopback() && !loopback) {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(v4) => !v4.is_broadcast() && !v4.is_link_local(),
+        IpAddr::V6(v6) => !v6.is_unicast_link_local(),
+    }
+}
+
 /// Resolves `hosts` (entries without a port, or that fail to parse or
-/// resolve, are skipped) and adds the results to `addr`.
-pub async fn with_hosts(mut addr: EndpointAddr, hosts: &[String]) -> EndpointAddr {
+/// resolve, are skipped) and adds the results to `addr`. Addresses that
+/// can't be a peer's (see [`dialable`]) are left out; loopback ones stay,
+/// for instances on the same machine.
+pub async fn with_hosts(addr: EndpointAddr, hosts: &[String]) -> EndpointAddr {
+    with_hosts_where(addr, hosts, |ip| dialable(ip, true)).await
+}
+
+/// Like [`with_hosts`], keeping only resolved addresses `keep` accepts.
+pub(crate) async fn with_hosts_where(
+    mut addr: EndpointAddr,
+    hosts: &[String],
+    keep: impl Fn(IpAddr) -> bool,
+) -> EndpointAddr {
     let mut lookups = JoinSet::new();
     for entry in hosts {
         match entry.parse::<HostAddr>() {
@@ -169,7 +194,11 @@ pub async fn with_hosts(mut addr: EndpointAddr, hosts: &[String]) -> EndpointAdd
     }
     while let Some(result) = lookups.join_next().await {
         for socket in result.unwrap_or_default() {
-            addr = addr.with_ip_addr(socket);
+            if keep(socket.ip()) {
+                addr = addr.with_ip_addr(socket);
+            } else {
+                tracing::debug!("not dialling {socket}");
+            }
         }
     }
     addr
@@ -236,6 +265,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn only_addresses_a_peer_could_have_are_dialled() {
+        for ok in ["192.0.2.1", "10.0.0.5", "2001:db8::1", "fd00::1"] {
+            assert!(dialable(ok.parse().unwrap(), false), "{ok}");
+        }
+        for bad in [
+            "0.0.0.0",
+            "::",
+            "255.255.255.255",
+            "224.0.0.1",
+            "ff02::1",
+            "169.254.1.1",
+            "fe80::1",
+        ] {
+            assert!(!dialable(bad.parse().unwrap(), true), "{bad}");
+        }
+        assert!(!dialable("127.0.0.1".parse().unwrap(), false));
+        assert!(dialable("127.0.0.1".parse().unwrap(), true));
+        assert!(!dialable("::1".parse().unwrap(), false));
+    }
+
     #[tokio::test]
     async fn resolves_into_endpoint_addr() {
         let id = iroh::SecretKey::generate().public();
@@ -243,6 +293,8 @@ mod tests {
             EndpointAddr::new(id),
             &[
                 "192.0.2.1:4433".into(),
+                "0.0.0.0:4435".into(),
+                "169.254.0.1:4436".into(),
                 "localhost:4434".into(),
                 "no-port.example".into(),
                 "not valid".into(),

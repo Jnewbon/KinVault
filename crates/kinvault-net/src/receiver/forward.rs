@@ -18,6 +18,7 @@ use tokio::sync::Notify;
 use super::{Receiver, blocking_io, unix_now};
 use crate::client::{Deliverer, connect};
 use crate::error::NetError;
+use crate::hosts::{dialable, with_hosts_where};
 use crate::limits::RateLimiter;
 use crate::protocol::{ForwardInfo, ForwardOrder, ForwardState, valid_repo_name};
 
@@ -506,13 +507,23 @@ impl Receiver {
                 .await
                 .map_err(|e| NetError::Protocol(format!("its source repository is gone: {e}")))?,
         );
+        // The addresses and names come from the peer: dial only ones a
+        // host could have. Loopback only when this host itself listens only
+        // there (instances on one machine, as in tests).
+        let loopback = endpoint
+            .bound_sockets()
+            .iter()
+            .all(|s| s.ip().is_loopback());
+        let keep = |ip| dialable(ip, loopback);
         let host = job.order.delegation.host;
         let addr = job
             .order
             .addrs
             .iter()
+            .filter(|s| keep(s.ip()))
             .fold(EndpointAddr::new(host), |a, s| a.with_ip_addr(*s));
-        let conn = connect(endpoint, addr, &job.order.hosts, DIAL_TIMEOUT).await?;
+        let addr = with_hosts_where(addr, &job.order.hosts, keep).await;
+        let conn = connect(endpoint, addr, &[], DIAL_TIMEOUT).await?;
         let to = Deliverer {
             conn: conn.clone(),
             delegation: job.order.delegation.clone(),
