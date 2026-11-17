@@ -1094,7 +1094,9 @@ async fn main() -> Result<()> {
             println!("Choose a passphrase for the recovery kit. You need it to use the kit.");
             let passphrase = kit_passphrase(true)?;
             let Reply::RecoveryKit { json } = client
-                .call(&Request::ExportRecoveryKit { passphrase })
+                .call(&Request::ExportRecoveryKit {
+                    passphrase: passphrase.into(),
+                })
                 .await?
             else {
                 bail!("unexpected reply")

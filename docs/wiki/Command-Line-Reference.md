@@ -133,10 +133,15 @@ See [[Recovery Kit]].
 | Variable | Used by | Meaning |
 |---|---|---|
 | `KINVAULT_STATE` | all | State folder |
-| `KINVAULT_PASSPHRASE` | `recovery` | Passphrase, instead of asking |
+| `KINVAULT_PASSPHRASE` | `recovery` | Passphrase, instead of asking (see below) |
 | `KINVAULT_LISTEN_PORT` | `kinvaultd` | UDP port, if none is configured yet |
 | `KINVAULT_WEB` | `kinvaultd` (web builds) | Serve the web interface on this address |
 | `KINVAULT_WEB_PASSWORD` | `kinvaultd` (web builds) | Web sign-in password (at least 12 characters) |
 | `KINVAULT_WEB_HTTPS` | `kinvaultd` (web builds) | `true` when only reached through an HTTPS proxy: cookies are marked Secure |
 | `KINVAULT_WEB_HOSTS` | `kinvaultd` (web builds) | Host names the web interface answers to, comma-separated (default: any) |
 | `RUST_LOG` | `kinvaultd` | Log detail, e.g. `debug` (`kinvaultd -v` or `-vv` overrides it) |
+
+`KINVAULT_PASSPHRASE` is for scripts. While the command runs, other
+processes of the same user (and root) can read a process's environment, and
+it may end up in your shell history or a service file. Prefer typing the
+passphrase when asked.

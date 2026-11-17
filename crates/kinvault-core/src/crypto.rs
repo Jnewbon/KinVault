@@ -107,6 +107,42 @@ pub fn open(key: &[u8; KEY_LEN], aad: &[u8], sealed: &[u8]) -> Result<Vec<u8>> {
         .map_err(|_| Error::Decrypt)
 }
 
+/// A passphrase or other secret text. Its `Debug` output is redacted, so
+/// logging a request that carries one can't reveal it, and it's wiped from
+/// memory when dropped. Serialises as a plain string.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(secret: impl Into<String>) -> Self {
+        Self(secret.into())
+    }
+
+    /// The secret itself; avoid copying it into longer-lived strings.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for Secret {
+    fn from(secret: String) -> Self {
+        Self(secret)
+    }
+}
+
+impl From<&str> for Secret {
+    fn from(secret: &str) -> Self {
+        Self(secret.to_string())
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(redacted)")
+    }
+}
+
 /// Argon2 costs a key file may ask for. Key files come from outside (a
 /// recovery kit someone hands over), so these keep a crafted one from
 /// demanding terabytes of memory or hours of work, or from being trivially
@@ -218,6 +254,15 @@ mod tests {
         assert!(matches!(keys.open_data(b"aad", &bad), Err(Error::Decrypt)));
         // Data and metadata keys are separated.
         assert!(keys.open_meta(b"aad", &sealed).is_err());
+    }
+
+    #[test]
+    fn secrets_are_redacted_but_serialise_plainly() {
+        let s = Secret::from("hunter2 hunter2");
+        assert_eq!(format!("{s:?}"), "Secret(redacted)");
+        assert_eq!(serde_json::to_string(&s).unwrap(), r#""hunter2 hunter2""#);
+        let back: Secret = serde_json::from_str(r#""x""#).unwrap();
+        assert_eq!(back.expose(), "x");
     }
 
     #[test]

@@ -121,7 +121,7 @@ pub enum Request {
     /// Everything needed to restore this instance's backups on a new machine,
     /// with all keys encrypted under `passphrase`.
     ExportRecoveryKit {
-        passphrase: String,
+        passphrase: kinvault_core::Secret,
     },
     /// Turns this connection into a stream of [`Event`]s, one JSON object per
     /// line, after a `Subscribed` reply.

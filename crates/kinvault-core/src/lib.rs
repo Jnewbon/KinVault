@@ -14,7 +14,7 @@ pub mod retention;
 pub mod snapshot;
 
 pub use backend::{Backend, LocalDirBackend};
-pub use crypto::{KeyFile, Keys, MasterKey};
+pub use crypto::{KeyFile, Keys, MasterKey, Secret};
 pub use error::{Error, Result};
 pub use exclude::Excludes;
 pub use ids::{ChunkId, PackId, SnapshotId};

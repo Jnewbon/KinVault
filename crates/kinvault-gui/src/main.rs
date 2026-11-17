@@ -116,7 +116,9 @@ async fn export_recovery_kit(
 ) -> CmdResult<Option<String>> {
     let mut client = Client::connect(&state.state_dir).await.map_err(err)?;
     let Reply::RecoveryKit { json } = client
-        .call(&Request::ExportRecoveryKit { passphrase })
+        .call(&Request::ExportRecoveryKit {
+            passphrase: passphrase.into(),
+        })
         .await
         .map_err(err)?
     else {
@@ -134,7 +136,8 @@ async fn export_recovery_kit(
     let Some(path) = rx.await.map_err(err)? else {
         return Ok(None);
     };
-    write_private(&path, json.as_bytes()).map_err(err)?;
+    // Private even when replacing an existing file with wider permissions.
+    kinvault_daemon::config::write_private(&path, json.as_bytes()).map_err(err)?;
     Ok(Some(path.display().to_string()))
 }
 
@@ -166,15 +169,6 @@ async fn import_recovery_kit(
     .map_err(err)?
     .map_err(err)?;
     Ok(Some(summary.sets))
-}
-
-fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-    opts.open(path)?.write_all(data)
 }
 
 /// Relays daemon events to the window as `daemon-event`, and connection

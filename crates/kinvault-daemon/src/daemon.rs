@@ -596,7 +596,7 @@ impl Daemon {
                 }
                 let identity = self.inner.endpoint.secret_key().clone();
                 let kit = blocking(move || {
-                    crate::recovery::build(&config, &identity, &set_keys, &passphrase)
+                    crate::recovery::build(&config, &identity, &set_keys, passphrase.expose())
                 })
                 .await?;
                 Ok(Reply::RecoveryKit {
