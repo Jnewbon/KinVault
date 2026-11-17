@@ -3,8 +3,10 @@
 On a machine without a screen, run the background service in Docker. It
 serves the same interface as the desktop app over HTTP, with a password.
 
-The image is published as `ghcr.io/jnewbon/kinvault` (tags: `latest`, and one
-per release). It runs as user `568:568` (TrueNAS's `apps` user).
+The image is published as `ghcr.io/jnewbon/kinvault`, with a tag per
+release (e.g. `0.1.1`, and `0.1` for the newest 0.1.x) and `latest` for the
+newest development build. Use a release tag, and change it to update. It
+runs as user `568:568` (TrueNAS's `apps` user).
 
 ## Docker
 
@@ -13,8 +15,8 @@ docker run -d --name kinvault --restart unless-stopped --network host \
   -v kinvault-data:/data \
   -v ~/Documents:/backup/documents:ro \
   -v ~/kinvault-restore:/restore \
-  ghcr.io/jnewbon/kinvault:latest
-docker logs kinvault        # shows the generated web password
+  ghcr.io/jnewbon/kinvault:0.1.1
+docker exec kinvault cat /data/web-password   # the generated web password
 ```
 
 Then open `http://<server>:8080`.
@@ -94,7 +96,7 @@ starts (or with it stopped):
 
 ```sh
 docker run --rm -it --user 568:568 -v /mnt/tank/apps/kinvault:/data \
-  --entrypoint kinvault ghcr.io/jnewbon/kinvault:latest \
+  --entrypoint kinvault ghcr.io/jnewbon/kinvault:0.1.1 \
   recovery import /data/kinvault-recovery-kit.json
 ```
 

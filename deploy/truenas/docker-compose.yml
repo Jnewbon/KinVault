@@ -7,7 +7,7 @@ services:
   # volumes in step with the writable ones below. Not needed if you already
   # gave `apps` write access to them (e.g. with Edit Permissions).
   permissions:
-    image: ghcr.io/jnewbon/kinvault:latest
+    image: ghcr.io/jnewbon/kinvault:0.1.1
     user: "0:0"
     entrypoint: ["chown", "568:568", "/data", "/restore"]
     network_mode: none
@@ -19,7 +19,8 @@ services:
       - /mnt/tank/kinvault-restore:/restore
 
   kinvault:
-    image: ghcr.io/jnewbon/kinvault:latest
+    # A release tag; change both images' tag to update.
+    image: ghcr.io/jnewbon/kinvault:0.1.1
     container_name: kinvault
     restart: unless-stopped
     depends_on:

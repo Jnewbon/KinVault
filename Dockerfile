@@ -1,7 +1,8 @@
 # KinVault server: kinvaultd with the web interface, plus the kinvault CLI.
 # See deploy/truenas/README.md for running it on TrueNAS SCALE.
 
-FROM rust:1.91-trixie AS build
+# Pinned by digest; update both the tag and the digest together.
+FROM rust:1.91-trixie@sha256:867f1d1162913c401378a8504fb17fe2032c760dc316448766f150a130204aad AS build
 WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -10,7 +11,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         -p kinvault-daemon -p kinvault-cli --features kinvault-daemon/web \
     && cp target/release/kinvaultd target/release/kinvault /usr/local/bin/
 
-FROM debian:trixie-slim
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates tini \
     && rm -rf /var/lib/apt/lists/* \

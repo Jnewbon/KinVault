@@ -82,7 +82,7 @@ stopped). Put the kit file in the state dataset, then:
 
 ```sh
 docker run --rm -it --user 568:568 -v /mnt/tank/apps/kinvault:/data \
-  --entrypoint kinvault ghcr.io/jnewbon/kinvault:latest \
+  --entrypoint kinvault ghcr.io/jnewbon/kinvault:0.1.1 \
   recovery import /data/kinvault-recovery-kit.json
 ```
 
