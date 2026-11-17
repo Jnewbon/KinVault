@@ -832,7 +832,7 @@ impl<'a, B: Backend> BackupRun<'a, B> {
         }
 
         tracing::debug!(bytes = size, "reading {}", path.display());
-        match fs::File::open(path) {
+        match open_listed_file(path, meta) {
             Ok(file) => self.store_contents(path, file, size, mtime, inode),
             Err(e) => {
                 self.warn(path, e);
@@ -1071,6 +1071,32 @@ fn mode(_meta: &fs::Metadata) -> u32 {
     0
 }
 
+/// Opens the regular file that `listed` (its `lstat`) describes. If the
+/// path was swapped since for a symlink, a FIFO or another file, it's
+/// refused rather than read: a more privileged daemon would otherwise copy
+/// whatever the link points to, outside what's being backed up.
+#[cfg(unix)]
+fn open_listed_file(path: &Path, listed: &fs::Metadata) -> io::Result<fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    // Not following a symlink, and not waiting for a FIFO's writer.
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || opened.ino() != listed.ino() || opened.dev() != listed.dev() {
+        return Err(io::Error::other(
+            "it was replaced by something else while being backed up",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_listed_file(path: &Path, _listed: &fs::Metadata) -> io::Result<fs::File> {
+    fs::File::open(path)
+}
+
 #[cfg(unix)]
 fn inode(meta: &fs::Metadata) -> u64 {
     std::os::unix::fs::MetadataExt::ino(meta)
@@ -1166,6 +1192,36 @@ mod tests {
         assert_eq!(run.stats.warnings.len(), 2);
         assert!(run.stats.warnings[0].contains("disk went away"));
         assert_eq!(run.stats.files, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_swapped_after_listing_arent_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (file, secret) = (tmp.path().join("file"), tmp.path().join("secret"));
+        fs::write(&file, b"mine").unwrap();
+        fs::write(&secret, b"not mine").unwrap();
+        let listed = fs::symlink_metadata(&file).unwrap();
+        let mut read = String::new();
+        open_listed_file(&file, &listed)
+            .unwrap()
+            .read_to_string(&mut read)
+            .unwrap();
+        assert_eq!(read, "mine");
+
+        // Swapped for a symlink to a file the backup shouldn't include.
+        fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink(&secret, &file).unwrap();
+        assert!(open_listed_file(&file, &listed).is_err());
+        // For another file.
+        fs::remove_file(&file).unwrap();
+        fs::copy(&secret, &file).unwrap();
+        assert!(open_listed_file(&file, &listed).is_err());
+        // For a FIFO with no writer: refused, without waiting for one.
+        fs::remove_file(&file).unwrap();
+        let c = std::ffi::CString::new(file.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(open_listed_file(&file, &listed).is_err());
     }
 
     #[test]
