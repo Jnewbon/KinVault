@@ -34,8 +34,9 @@ Apps → Discover Apps → ⋮ → **Install via YAML**. Paste
 ## 3. Sign in
 
 Open `http://<nas-address>:8080`. Unless you set `KINVAULT_WEB_PASSWORD`, the
-password is generated on first start. It's shown in the app's logs
-(Apps → kinvault → Logs) and kept in `/data/web-password`.
+password is generated on first start and kept in `/data/web-password` (the
+logs say where, but don't show it). Read it from a shell (Apps → kinvault →
+Shell): `cat /data/web-password`.
 
 The web interface uses plain HTTP. Use it only on your own network, or put it
 behind a reverse proxy with HTTPS (for example TrueNAS's own, or Nginx Proxy
@@ -81,7 +82,7 @@ stopped). Put the kit file in the state dataset, then:
 
 ```sh
 docker run --rm -it --user 568:568 -v /mnt/tank/apps/kinvault:/data \
-  --entrypoint kinvault ghcr.io/jnewbon/kinvault:latest \
+  --entrypoint kinvault ghcr.io/jnewbon/kinvault:0.1.1 \
   recovery import /data/kinvault-recovery-kit.json
 ```
 

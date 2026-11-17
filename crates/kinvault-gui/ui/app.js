@@ -143,6 +143,7 @@ function describeGrant(g) {
   const parts = [g.quota_bytes ? `${bytes(g.quota_bytes)} storage` : "unlimited storage"];
   if (g.upload_limit) parts.push(`max ${bytes(g.upload_limit)}/s`);
   if (g.window) parts.push(`uploads ${g.window}`);
+  if (g.forwarding) parts.push("forwards their copies");
   return parts.join(", ");
 }
 
@@ -380,11 +381,13 @@ function grantFields(g = {}) {
       { name: "from", label: "Accept uploads from", type: "time", value: ws || "", hint: "Leave empty for any time" },
       { name: "to", label: "until", type: "time", value: we || "" },
     ] },
+    { name: "forwarding", label: "Send their copies on to their other places", type: "checkbox", value: !!g.forwarding,
+      hint: "Lets them have this computer send copies of their backups to another place, using your upload. Your own devices can always do this." },
   ];
 }
 
 function grantFrom(v) {
-  return { quota_bytes: toBytes(v.quota, GiB), upload_limit: toBytes(v.rate, MiB), window: windowFrom(v.from, v.to) };
+  return { quota_bytes: toBytes(v.quota, GiB), upload_limit: toBytes(v.rate, MiB), window: windowFrom(v.from, v.to), forwarding: v.forwarding ? true : null };
 }
 
 function windowProblem(v) {
@@ -1434,9 +1437,11 @@ function nearbyCard() {
     let action;
     if (d.state === "paired") action = el("span", { class: "chip ok" }, "Yours");
     else if (d.state === "waiting") action = el("span", { class: "chip" }, `Now confirm on ${d.name}`);
+    else if (!d.code) action = el("span", { class: "chip" }, "Checking…");
     else action = el("button", { class: "btn primary small", onclick: () => pairDialog(d) }, "Add…");
+    const code = d.code ? `Code ${d.code}` : "Agreeing a code with it…";
     card.append(el("div", { class: "row", style: "margin-top:12px" },
-      el("span", { class: "spacer" }, el("strong", {}, d.name), el("div", { class: "muted small" }, `Code ${d.code}`)), action));
+      el("span", { class: "spacer" }, el("strong", {}, d.name), el("div", { class: "muted small" }, code)), action));
   }
   return card;
 }

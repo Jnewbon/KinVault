@@ -18,7 +18,10 @@ use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::api::{self, Event, GrantSpec, HostOffer, Reply, Request};
-use crate::config::{Config, PendingDeletion, PendingInvite, SetConfig, StoppedSet, StoredTarget};
+use crate::config::{
+    Config, PendingDeletion, PendingInvite, SetConfig, StoppedSet, StoredTarget,
+    create_dir_private_if_new, create_private_dir,
+};
 use crate::reachability::{HostTarget, Hosts, ReachabilityOptions};
 mod deletion;
 mod nearby;
@@ -111,7 +114,8 @@ impl Daemon {
             .hosting_store
             .clone()
             .unwrap_or_else(|| state_dir.join("hosted"));
-        fs::create_dir_all(&hosting_store)?;
+        // Private unless it's an existing folder the user chose.
+        create_dir_private_if_new(&hosting_store)?;
         let receiver = Receiver::new(&hosting_store);
         receiver.set_identity(endpoint.id());
         // Peers storing backups here may have them forwarded to other hosts.
@@ -121,7 +125,7 @@ impl Daemon {
         for peer in &config.peers {
             let Some(grant) = peer.grant else { continue };
             match EndpointId::from_str(&peer.id) {
-                Ok(id) => receiver.allow(id, grant.to_grant()),
+                Ok(id) => receiver.allow(id, grant.to_grant(peer.mine)),
                 Err(e) => tracing::warn!("ignoring invalid peer id {:?}: {e}", peer.id),
             }
         }
@@ -165,6 +169,10 @@ impl Daemon {
                 Daemon { inner }.accept_invite(r).await
             })
         }));
+        daemon
+            .inner
+            .receiver
+            .set_pair_check_handler(Arc::new(nearby::PairChecks(Arc::downgrade(&daemon.inner))));
         let weak = Arc::downgrade(&daemon.inner);
         daemon.inner.receiver.set_pair_handler(Arc::new(move |r| {
             let weak = weak.clone();
@@ -588,7 +596,7 @@ impl Daemon {
                 }
                 let identity = self.inner.endpoint.secret_key().clone();
                 let kit = blocking(move || {
-                    crate::recovery::build(&config, &identity, &set_keys, &passphrase)
+                    crate::recovery::build(&config, &identity, &set_keys, passphrase.expose())
                 })
                 .await?;
                 Ok(Reply::RecoveryKit {
@@ -675,8 +683,9 @@ impl Daemon {
                 if name.is_some() {
                     entry.name = name;
                 }
+                let mine = entry.mine;
                 config.save(&self.config_path())?;
-                self.inner.receiver.allow(peer, grant.to_grant());
+                self.inner.receiver.allow(peer, grant.to_grant(mine));
                 Ok(Reply::Done)
             }
             Request::PeerRevoke { id } => {
@@ -797,13 +806,14 @@ impl Daemon {
                 let entry = config.peer_mut(&id);
                 entry.mine = mine;
                 // Your own devices may store as much as they like.
-                let grant = mine.then(GrantSpec::default);
-                if let Some(grant) = grant {
-                    entry.grant = Some(grant);
+                if mine {
+                    entry.grant = Some(GrantSpec::default());
                 }
+                // Forwarding by default follows whether it's yours.
+                let grant = entry.grant;
                 config.save(&self.config_path())?;
                 if let Some(grant) = grant {
-                    self.inner.receiver.allow(peer, grant.to_grant());
+                    self.inner.receiver.allow(peer, grant.to_grant(mine));
                 }
                 Ok(Reply::Done)
             }
@@ -1358,6 +1368,7 @@ impl Daemon {
         entry.grant = Some(invite.grant);
         entry.name = invite.name.clone().or(r.name.clone()).or(entry.name.take());
         entry.mine |= invite.mine;
+        let mine = entry.mine;
         if !r.hosts.is_empty() {
             entry.hosts = r.hosts.clone();
         }
@@ -1369,7 +1380,9 @@ impl Daemon {
         config
             .save(&self.config_path())
             .map_err(|e| format!("host could not save the invite: {e:#}"))?;
-        self.inner.receiver.allow(r.peer, invite.grant.to_grant());
+        self.inner
+            .receiver
+            .allow(r.peer, invite.grant.to_grant(mine));
         tracing::info!(peer = %peer_id, name = ?entry_name(&config, &peer_id), "invite redeemed");
         self.notify(Event::PeersChanged);
         Ok(InviteAccepted {
@@ -1456,7 +1469,10 @@ impl Daemon {
         });
         if let Some(grant) = offer {
             entry.grant = Some(grant);
-            self.inner.receiver.allow(ticket.host.id, grant.to_grant());
+            let mine = entry.mine;
+            self.inner
+                .receiver
+                .allow(ticket.host.id, grant.to_grant(mine));
         }
         config.save(&self.config_path())?;
         Ok(Reply::Redeemed {
@@ -1565,25 +1581,6 @@ fn canonical_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
 
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
     tokio::task::spawn_blocking(f).await?
-}
-
-fn create_private_dir(path: &std::path::Path) -> Result<()> {
-    fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // Only the owner may change permissions. A directory we can write to
-        // but don't own (e.g. a NAS dataset shared through an ACL) keeps the
-        // access its owner gave it.
-        match fs::set_permissions(path, fs::Permissions::from_mode(0o700)) {
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => tracing::warn!(
-                "couldn't make {} private ({e}); make sure only KinVault's user can read it",
-                path.display()
-            ),
-            other => other.with_context(|| format!("making {} private", path.display()))?,
-        }
-    }
-    Ok(())
 }
 
 /// Trims patterns, drops blank ones and checks the rest are valid.

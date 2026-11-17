@@ -189,6 +189,9 @@ instead of from your computer: tick **Send copies through …** (or add
   used once, for the home server.
 - The other place stores them as your backup, counted against what it lets
   *you* store. It doesn't need to know the home server.
+- If the home server is a friend's computer rather than one of yours, its
+  owner must first allow it to forward for you (see
+  [Hosting for Others](Hosting-for-Others#forwarding)).
 - The home server can't read anything it forwards, and you give it
   permission only to *add* to that place, for 60 days at a time (renewed
   with each new order): it can't list, read or delete what's there.

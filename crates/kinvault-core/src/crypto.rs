@@ -107,6 +107,54 @@ pub fn open(key: &[u8; KEY_LEN], aad: &[u8], sealed: &[u8]) -> Result<Vec<u8>> {
         .map_err(|_| Error::Decrypt)
 }
 
+/// A passphrase or other secret text. Its `Debug` output is redacted, so
+/// logging a request that carries one can't reveal it, and it's wiped from
+/// memory when dropped. Serialises as a plain string.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(secret: impl Into<String>) -> Self {
+        Self(secret.into())
+    }
+
+    /// The secret itself; avoid copying it into longer-lived strings.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for Secret {
+    fn from(secret: String) -> Self {
+        Self(secret)
+    }
+}
+
+impl From<&str> for Secret {
+    fn from(secret: &str) -> Self {
+        Self(secret.to_string())
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(redacted)")
+    }
+}
+
+/// Argon2 costs a key file may ask for. Key files come from outside (a
+/// recovery kit someone hands over), so these keep a crafted one from
+/// demanding terabytes of memory or hours of work, or from being trivially
+/// weak. What this version writes (64 MiB, 3 passes, 1 lane) is well inside.
+#[cfg(not(test))]
+const M_COST_KIB: std::ops::RangeInclusive<u32> = 19 * 1024..=1024 * 1024;
+/// Unit tests use tiny costs to run fast.
+#[cfg(test)]
+const M_COST_KIB: std::ops::RangeInclusive<u32> = 8..=1024 * 1024;
+const T_COST: std::ops::RangeInclusive<u32> = 1..=10;
+const P_COST: std::ops::RangeInclusive<u32> = 1..=8;
+
 /// A [`MasterKey`] wrapped with an Argon2id-derived key. Safe to write to disk
 /// and to include in a recovery kit; useless without the passphrase.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -150,6 +198,16 @@ impl KeyFile {
             return Err(Error::Invalid(format!(
                 "unsupported keyfile version {}",
                 self.version
+            )));
+        }
+        if !M_COST_KIB.contains(&self.m_cost_kib)
+            || !T_COST.contains(&self.t_cost)
+            || !P_COST.contains(&self.p_cost)
+        {
+            return Err(Error::Invalid(format!(
+                "keyfile asks for unsupported key-derivation costs \
+                 ({} KiB, {} passes, {} lanes)",
+                self.m_cost_kib, self.t_cost, self.p_cost
             )));
         }
         let salt =
@@ -196,6 +254,15 @@ mod tests {
         assert!(matches!(keys.open_data(b"aad", &bad), Err(Error::Decrypt)));
         // Data and metadata keys are separated.
         assert!(keys.open_meta(b"aad", &sealed).is_err());
+    }
+
+    #[test]
+    fn secrets_are_redacted_but_serialise_plainly() {
+        let s = Secret::from("hunter2 hunter2");
+        assert_eq!(format!("{s:?}"), "Secret(redacted)");
+        assert_eq!(serde_json::to_string(&s).unwrap(), r#""hunter2 hunter2""#);
+        let back: Secret = serde_json::from_str(r#""x""#).unwrap();
+        assert_eq!(back.expose(), "x");
     }
 
     #[test]
@@ -246,6 +313,26 @@ mod tests {
             ..good.clone()
         };
         assert!(matches!(bad_cost.unlock("pass"), Err(Error::Invalid(_))));
+        // Costs outside the accepted range, whether huge or trivially weak,
+        // are refused before any work is done.
+        for (m, t, p) in [
+            (u32::MAX, 1, 1),
+            (64, 1_000_000, 1),
+            (64, 1, 255),
+            (64, 0, 1),
+            (4, 1, 1),
+        ] {
+            let kf = KeyFile {
+                m_cost_kib: m,
+                t_cost: t,
+                p_cost: p,
+                ..good.clone()
+            };
+            assert!(
+                matches!(kf.unlock("pass"), Err(Error::Invalid(_))),
+                "{m} {t} {p}"
+            );
+        }
         let short = KeyFile {
             wrapped: "00".into(),
             ..good.clone()

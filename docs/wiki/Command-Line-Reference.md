@@ -91,7 +91,7 @@ Both take `--from <place>` to use another place the backup keeps copies in.
 | `kinvault invite cancel <id>` | Cancel a code |
 | `kinvault invite redeem <code> [options]` | Accept a code |
 | `kinvault peer list` | All peers |
-| `kinvault peer allow <peer> [--name] [--quota] [--upload-limit] [--window]` | Let a peer store backups here, or change its limits |
+| `kinvault peer allow <peer> [--name] [--quota] [--upload-limit] [--window] [--forwarding true\|false]` | Let a peer store backups here, or change its limits; `--forwarding` lets a friend have this computer send their copies on to their other places (on by default only for your own devices) |
 | `kinvault peer revoke <peer>` | Stop accepting its backups (keeps what it stored) |
 | `kinvault peer mine <peer>` | Mark as one of your devices (no limits) |
 | `kinvault peer friend <peer>` | Move back to friends |
@@ -133,8 +133,15 @@ See [[Recovery Kit]].
 | Variable | Used by | Meaning |
 |---|---|---|
 | `KINVAULT_STATE` | all | State folder |
-| `KINVAULT_PASSPHRASE` | `recovery` | Passphrase, instead of asking |
+| `KINVAULT_PASSPHRASE` | `recovery` | Passphrase, instead of asking (see below) |
 | `KINVAULT_LISTEN_PORT` | `kinvaultd` | UDP port, if none is configured yet |
 | `KINVAULT_WEB` | `kinvaultd` (web builds) | Serve the web interface on this address |
-| `KINVAULT_WEB_PASSWORD` | `kinvaultd` (web builds) | Web sign-in password |
+| `KINVAULT_WEB_PASSWORD` | `kinvaultd` (web builds) | Web sign-in password (at least 12 characters) |
+| `KINVAULT_WEB_HTTPS` | `kinvaultd` (web builds) | `true` when only reached through an HTTPS proxy: cookies are marked Secure |
+| `KINVAULT_WEB_HOSTS` | `kinvaultd` (web builds) | Host names the web interface answers to, comma-separated (default: any) |
 | `RUST_LOG` | `kinvaultd` | Log detail, e.g. `debug` (`kinvaultd -v` or `-vv` overrides it) |
+
+`KINVAULT_PASSPHRASE` is for scripts. While the command runs, other
+processes of the same user (and root) can read a process's environment, and
+it may end up in your shell history or a service file. Prefer typing the
+passphrase when asked.

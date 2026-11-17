@@ -7,6 +7,7 @@ edition.workspace = true
 kinvault-core.workspace = true
 blake3.workspace = true
 data-encoding.workspace = true
+getrandom.workspace = true
 hex.workspace = true
 iroh.workspace = true
 jiff.workspace = true
@@ -17,6 +18,7 @@ socket2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

@@ -25,6 +25,16 @@ struct Args {
     #[cfg(feature = "web")]
     #[arg(long, env = "KINVAULT_WEB")]
     web: Option<std::net::SocketAddr>,
+    /// The web interface is only reached through an HTTPS reverse proxy:
+    /// mark its session cookies Secure.
+    #[cfg(feature = "web")]
+    #[arg(long, env = "KINVAULT_WEB_HTTPS")]
+    web_https: bool,
+    /// Host names the web interface may be reached by (comma-separated),
+    /// e.g. nas.lan,backup.example.org. By default any.
+    #[cfg(feature = "web")]
+    #[arg(long, env = "KINVAULT_WEB_HOSTS", value_delimiter = ',')]
+    web_hosts: Vec<String>,
 }
 
 #[tokio::main]
@@ -44,7 +54,8 @@ async fn main() -> Result<()> {
             default_state_dir().context("could not determine a data directory; pass --state")?
         }
     };
-    std::fs::create_dir_all(&state_dir)
+    // Private before anything goes in it, the control socket included.
+    kinvault_daemon::config::create_private_dir(&state_dir)
         .with_context(|| format!("creating the state directory {}", state_dir.display()))?;
 
     let listener = ipc::Listener::bind(&ipc::listen_name(&state_dir)?)
@@ -70,7 +81,16 @@ async fn main() -> Result<()> {
             let tcp = tokio::net::TcpListener::bind(addr)
                 .await
                 .with_context(|| format!("listening for the web interface on {addr}"))?;
-            Some((tcp, password))
+            let options = kinvault_daemon::web::WebOptions {
+                behind_https: args.web_https,
+                allowed_hosts: args
+                    .web_hosts
+                    .iter()
+                    .map(|h| h.trim().to_string())
+                    .filter(|h| !h.is_empty())
+                    .collect(),
+            };
+            Some((tcp, password, options))
         }
         None => None,
     };
@@ -90,9 +110,9 @@ async fn main() -> Result<()> {
     #[cfg(feature = "web")]
     let web = async {
         match web {
-            Some((tcp, password)) => {
+            Some((tcp, password, options)) => {
                 tracing::info!("web interface on http://{}", tcp.local_addr()?);
-                kinvault_daemon::web::serve(daemon.clone(), tcp, &password).await
+                kinvault_daemon::web::serve(daemon.clone(), tcp, &password, options).await
             }
             None => std::future::pending().await,
         }

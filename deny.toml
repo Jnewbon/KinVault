@@ -1,0 +1,16 @@
+# cargo-deny configuration, checked in CI (`cargo deny check advisories bans sources`).
+
+[advisories]
+# Fail on any RustSec advisory (vulnerability, unmaintained or unsound) for
+# a crate in Cargo.lock. Add an `ignore` entry with a reason to accept one.
+ignore = []
+
+[bans]
+# Several versions of one crate are common in this dependency tree.
+multiple-versions = "allow"
+wildcards = "deny"
+
+[sources]
+# Crates only from crates.io; no git dependencies.
+unknown-registry = "deny"
+unknown-git = "deny"

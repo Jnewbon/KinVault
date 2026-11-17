@@ -5,13 +5,15 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use axum::extract::{Json, State};
+use axum::extract::{ConnectInfo, Json, Request as HttpRequest, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::middleware::Next;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -19,14 +21,27 @@ use axum::{Router, middleware};
 use futures_util::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Semaphore, broadcast};
 
 use crate::Daemon;
 use crate::api::{Event, Request};
 
 const SESSION_COOKIE: &str = "kv_session";
+/// A session ends this long after signing in, or after this long unused.
 const SESSION_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-const FAILED_LOGIN_DELAY: Duration = Duration::from_secs(1);
+const SESSION_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
+/// Sessions kept at once; signing in again ends the least recently used.
+const MAX_SESSIONS: usize = 32;
+/// Wrong passwords from one address make it wait longer each time, up to
+/// this long; forgotten after an hour without tries.
+const MAX_LOGIN_BACKOFF: Duration = Duration::from_secs(15 * 60);
+const FORGET_FAILURES_AFTER: Duration = Duration::from_secs(60 * 60);
+/// Addresses whose failed tries are remembered at once.
+const MAX_TRACKED_ADDRESSES: usize = 4096;
+/// Password checks running at once (each takes ~20 MiB and some CPU).
+const CONCURRENT_CHECKS: usize = 2;
+/// Shortest `KINVAULT_WEB_PASSWORD` accepted.
+pub const MIN_PASSWORD_LEN: usize = 12;
 const MAX_DIR_ENTRIES: usize = 5000;
 
 macro_rules! ui_file {
@@ -60,26 +75,86 @@ static INDEX: LazyLock<String> = LazyLock::new(|| {
     .replace(app, &format!(r#"<script src="web.js"></script>{app}"#))
 });
 
+/// How the web interface is reached.
+#[derive(Clone, Debug, Default)]
+pub struct WebOptions {
+    /// It's only reached through an HTTPS reverse proxy: session cookies
+    /// are marked `Secure`.
+    pub behind_https: bool,
+    /// Host names (as in the `Host` header, without the port) it may be
+    /// reached by. Empty: any. Setting it stops DNS-rebinding pages.
+    pub allowed_hosts: Vec<String>,
+}
+
 struct Web {
     daemon: Daemon,
-    password: blake3::Hash,
-    sessions: std::sync::Mutex<HashMap<String, Instant>>,
-    /// Held during a password check, so guesses are made one at a time.
-    login: Mutex<()>,
+    password: PasswordHash,
+    sessions: std::sync::Mutex<HashMap<String, Session>>,
+    /// Wrong passwords, per address they came from.
+    failures: std::sync::Mutex<HashMap<IpAddr, Failures>>,
+    checks: Semaphore,
+    options: WebOptions,
+}
+
+struct Session {
+    created: Instant,
+    last_used: Instant,
+}
+
+#[derive(Default)]
+struct Failures {
+    count: u32,
+    /// No more tries from that address before this.
+    next_try: Option<Instant>,
+}
+
+/// An Argon2id hash of the web password, made at start.
+struct PasswordHash {
+    salt: [u8; 16],
+    hash: blake3::Hash,
+}
+
+impl PasswordHash {
+    fn new(password: &str) -> Result<Self> {
+        let salt = kinvault_core::crypto::random_bytes::<16>()?;
+        let hash = Self::derive(password, &salt)?;
+        Ok(Self { salt, hash })
+    }
+
+    fn derive(password: &str, salt: &[u8; 16]) -> Result<blake3::Hash> {
+        let params = argon2::Params::new(19 * 1024, 2, 1, Some(32))
+            .map_err(|e| anyhow::anyhow!("argon2 parameters: {e}"))?;
+        let argon =
+            argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+        let mut out = [0u8; 32];
+        argon
+            .hash_password_into(password.as_bytes(), salt, &mut out)
+            .map_err(|e| anyhow::anyhow!("hashing the password: {e}"))?;
+        // blake3::Hash compares in constant time.
+        Ok(blake3::Hash::from(out))
+    }
+
+    fn matches(&self, password: &str) -> bool {
+        Self::derive(password, &self.salt).is_ok_and(|h| h == self.hash)
+    }
 }
 
 type Shared = State<Arc<Web>>;
 type Rejection = (StatusCode, &'static str);
 
 /// Serves the web interface on `listener` until the daemon shuts down.
-pub async fn serve(daemon: Daemon, listener: TcpListener, password: &str) -> Result<()> {
-    let web = Arc::new(Web {
-        daemon,
-        password: blake3::hash(password.as_bytes()),
-        sessions: Default::default(),
-        login: Mutex::new(()),
-    });
-    axum::serve(listener, router(web)).await?;
+pub async fn serve(
+    daemon: Daemon,
+    listener: TcpListener,
+    password: &str,
+    options: WebOptions,
+) -> Result<()> {
+    let web = Arc::new(Web::new(daemon, password, options)?);
+    axum::serve(
+        listener,
+        router(web).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -101,8 +176,56 @@ fn router(web: Arc<Web>) -> Router {
         .route("/api/call", post(call))
         .route("/api/list-dir", post(list_dir))
         .route("/api/events", get(events))
+        .layer(middleware::from_fn_with_state(web.clone(), check_origin))
         .layer(middleware::map_response(security_headers))
         .with_state(web)
+}
+
+/// Refuses requests for a host name not allowed (see
+/// [`WebOptions::allowed_hosts`]), and state-changing requests a browser
+/// sent from a page of another origin.
+async fn check_origin(State(web): Shared, req: HttpRequest, next: Next) -> Response {
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+    if !web.options.allowed_hosts.is_empty() {
+        let name = host_name(host);
+        if !web
+            .options
+            .allowed_hosts
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(name))
+        {
+            return (StatusCode::MISDIRECTED_REQUEST, "unknown host name").into_response();
+        }
+    }
+    if req.method() != axum::http::Method::GET && req.method() != axum::http::Method::HEAD {
+        // Browsers send Origin with every such request; tools may not.
+        if let Some(origin) = req.headers().get(header::ORIGIN) {
+            let same = origin
+                .to_str()
+                .ok()
+                .and_then(|o| o.split_once("://"))
+                .is_some_and(|(_, authority)| authority.eq_ignore_ascii_case(host));
+            if !same {
+                return (StatusCode::FORBIDDEN, "cross-origin request").into_response();
+            }
+        }
+    }
+    next.run(req).await
+}
+
+/// `host[:port]` without the port (and without brackets for IPv6).
+fn host_name(host: &str) -> &str {
+    if let Some(rest) = host.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    match host.rsplit_once(':') {
+        Some((name, port)) if port.bytes().all(|b| b.is_ascii_digit()) => name,
+        _ => host,
+    }
 }
 
 async fn security_headers(mut res: Response) -> Response {
@@ -136,13 +259,28 @@ fn session_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 impl Web {
+    fn new(daemon: Daemon, password: &str, options: WebOptions) -> Result<Self> {
+        Ok(Self {
+            daemon,
+            password: PasswordHash::new(password)?,
+            sessions: Default::default(),
+            failures: Default::default(),
+            checks: Semaphore::new(CONCURRENT_CHECKS),
+            options,
+        })
+    }
+
     fn signed_in(&self, headers: &HeaderMap) -> bool {
         let Some(token) = session_token(headers) else {
             return false;
         };
         let mut sessions = self.sessions.lock().unwrap();
-        match sessions.get(token) {
-            Some(expires) if *expires > Instant::now() => true,
+        let now = Instant::now();
+        match sessions.get_mut(token) {
+            Some(s) if live(s, now) => {
+                s.last_used = now;
+                true
+            }
             Some(_) => {
                 sessions.remove(token);
                 false
@@ -151,6 +289,51 @@ impl Web {
         }
     }
 
+    /// Counts a try at the password from `ip`, unless it must wait first;
+    /// then returns how long.
+    fn take_try(&self, ip: IpAddr) -> Result<(), Duration> {
+        let now = Instant::now();
+        let mut failures = self.failures.lock().unwrap();
+        failures.retain(|_, f| f.next_try.is_some_and(|t| t + FORGET_FAILURES_AFTER > now));
+        if failures.len() >= MAX_TRACKED_ADDRESSES && !failures.contains_key(&ip) {
+            // Forget whoever may try again soonest.
+            if let Some(oldest) = failures
+                .iter()
+                .min_by_key(|(_, f)| f.next_try)
+                .map(|(ip, _)| *ip)
+            {
+                failures.remove(&oldest);
+            }
+        }
+        let f = failures.entry(ip).or_default();
+        if let Some(next) = f.next_try
+            && next > now
+        {
+            return Err(next - now);
+        }
+        // Counted before checking, so tries sent at once can't all go ahead.
+        f.count += 1;
+        f.next_try = Some(now + login_backoff(f.count));
+        Ok(())
+    }
+
+    fn forget_failures(&self, ip: IpAddr) {
+        self.failures.lock().unwrap().remove(&ip);
+    }
+}
+
+fn live(s: &Session, now: Instant) -> bool {
+    now < s.created + SESSION_TTL && now < s.last_used + SESSION_IDLE
+}
+
+/// How long to wait after the `count`th try: a second at first, doubling
+/// after the second wrong one.
+fn login_backoff(count: u32) -> Duration {
+    let secs = 1u64 << count.saturating_sub(2).min(20);
+    Duration::from_secs(secs).min(MAX_LOGIN_BACKOFF)
+}
+
+impl Web {
     /// Checks the session, and for state-changing requests the custom header
     /// that a cross-site form or script can't send without CORS approval.
     fn check(&self, headers: &HeaderMap, changes_state: bool) -> Result<(), Rejection> {
@@ -186,16 +369,38 @@ struct Login {
     password: String,
 }
 
-async fn login(State(web): Shared, headers: HeaderMap, Json(req): Json<Login>) -> Response {
+async fn login(
+    State(web): Shared,
+    ConnectInfo(from): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<Login>,
+) -> Response {
     if headers.get("x-kinvault").is_none_or(|v| v != "1") {
         return (StatusCode::FORBIDDEN, "missing X-KinVault header").into_response();
     }
-    let _one_at_a_time = web.login.lock().await;
-    // blake3::Hash compares in constant time.
-    if blake3::hash(req.password.as_bytes()) != web.password {
-        tokio::time::sleep(FAILED_LOGIN_DELAY).await;
+    // Per address, so someone guessing doesn't hold up anyone else.
+    if let Err(wait) = web.take_try(from.ip()) {
+        let secs = wait.as_secs().max(1);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, secs.to_string())],
+            format!("Too many tries. Wait {secs} seconds and try again."),
+        )
+            .into_response();
+    }
+    let matches = {
+        let Ok(_slot) = web.checks.acquire().await else {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        let web = web.clone();
+        tokio::task::spawn_blocking(move || web.password.matches(&req.password))
+            .await
+            .unwrap_or(false)
+    };
+    if !matches {
         return (StatusCode::UNAUTHORIZED, "Wrong password.").into_response();
     }
+    web.forget_failures(from.ip());
     let Ok(token) = kinvault_core::crypto::random_bytes::<32>() else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
@@ -203,13 +408,29 @@ async fn login(State(web): Shared, headers: HeaderMap, Json(req): Json<Login>) -
     {
         let mut sessions = web.sessions.lock().unwrap();
         let now = Instant::now();
-        sessions.retain(|_, expires| *expires > now);
-        sessions.insert(token.clone(), now + SESSION_TTL);
+        sessions.retain(|_, s| live(s, now));
+        while sessions.len() >= MAX_SESSIONS {
+            let Some(oldest) = sessions
+                .iter()
+                .min_by_key(|(_, s)| s.last_used)
+                .map(|(t, _)| t.clone())
+            else {
+                break;
+            };
+            sessions.remove(&oldest);
+        }
+        sessions.insert(
+            token.clone(),
+            Session {
+                created: now,
+                last_used: now,
+            },
+        );
     }
-    // Secure only behind an HTTPS proxy; plain-HTTP LAN access must still work.
-    let secure = headers
-        .get("x-forwarded-proto")
-        .is_some_and(|v| v == "https");
+    // Secure only when configured as behind an HTTPS proxy (a header from
+    // the client can't be trusted for that); plain-HTTP LAN access must
+    // still work.
+    let secure = web.options.behind_https;
     let cookie = format!(
         "{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
         SESSION_TTL.as_secs(),
@@ -319,12 +540,21 @@ async fn events(State(web): Shared, headers: HeaderMap) -> Response {
         .into_response()
 }
 
+fn check_password_len(password: &str) -> Result<()> {
+    anyhow::ensure!(
+        password.chars().count() >= MIN_PASSWORD_LEN,
+        "KINVAULT_WEB_PASSWORD must be at least {MIN_PASSWORD_LEN} characters"
+    );
+    Ok(())
+}
+
 /// The web password: `KINVAULT_WEB_PASSWORD` if set, otherwise one generated
 /// on first use and kept in `<state>/web-password`.
 pub fn password(state_dir: &Path) -> Result<String> {
     if let Ok(password) = std::env::var("KINVAULT_WEB_PASSWORD")
         && !password.is_empty()
     {
+        check_password_len(&password)?;
         return Ok(password);
     }
     let path = state_dir.join("web-password");
@@ -338,9 +568,11 @@ pub fn password(state_dir: &Path) -> Result<String> {
         .encode(&kinvault_core::crypto::random_bytes::<15>()?)
         .to_ascii_lowercase();
     crate::config::write_private(&path, password.as_bytes())?;
+    // Not the password itself: logs are often kept or shipped elsewhere,
+    // readable by more people than the state folder.
     tracing::warn!(
-        "generated a password for the web interface: {password} (kept in {}; \
-         set KINVAULT_WEB_PASSWORD to choose your own)",
+        "generated a password for the web interface; read it from {} \
+         (or set KINVAULT_WEB_PASSWORD to choose your own)",
         path.display()
     );
     Ok(password)
@@ -348,7 +580,221 @@ pub fn password(state_dir: &Path) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use axum::body::Body;
+    use axum::extract::connect_info::MockConnectInfo;
+    use tower::ServiceExt;
+
     use super::*;
+
+    const PASSWORD: &str = "correct horse battery";
+
+    async fn test_web(options: WebOptions) -> (Arc<Web>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .clear_ip_transports()
+            .bind_addr(("127.0.0.1", 0))
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let daemon = Daemon::start(crate::DaemonOptions {
+            state_dir: tmp.path().to_path_buf(),
+            endpoint: Some(endpoint),
+            nearby: Default::default(),
+            reachability: Default::default(),
+        })
+        .await
+        .unwrap();
+        (Arc::new(Web::new(daemon, PASSWORD, options).unwrap()), tmp)
+    }
+
+    /// The router as seen from `ip`.
+    fn from(web: &Arc<Web>, ip: [u8; 4]) -> Router {
+        router(web.clone()).layer(MockConnectInfo(SocketAddr::from((ip, 50000))))
+    }
+
+    fn login_request(password: &str) -> HttpRequest {
+        axum::http::Request::post("/api/login")
+            .header(header::HOST, "nas.lan:8080")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-kinvault", "1")
+            .body(Body::from(
+                serde_json::json!({ "password": password }).to_string(),
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wrong_passwords_slow_down_only_their_sender() {
+        let (web, _tmp) = test_web(WebOptions::default()).await;
+        let (attacker, user) = (from(&web, [10, 0, 0, 66]), from(&web, [10, 0, 0, 2]));
+        let res = attacker
+            .clone()
+            .oneshot(login_request("guess"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        // The next guess must wait, and is refused at once rather than queued.
+        let started = Instant::now();
+        let res = attacker
+            .clone()
+            .oneshot(login_request(PASSWORD))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(res.headers().contains_key(header::RETRY_AFTER));
+        // Someone else signs in straight away.
+        let res = user.clone().oneshot(login_request(PASSWORD)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert!(started.elapsed() < LOGIN_BUDGET);
+        let cookie = res.headers()[header::SET_COOKIE].to_str().unwrap();
+        assert!(
+            cookie.contains("HttpOnly") && !cookie.contains("Secure"),
+            "{cookie}"
+        );
+    }
+
+    /// How long a successful sign-in may take, Argon2 included.
+    const LOGIN_BUDGET: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn waits_grow_after_repeated_failures() {
+        assert_eq!(login_backoff(1), Duration::from_secs(1));
+        assert_eq!(login_backoff(2), Duration::from_secs(1));
+        assert_eq!(login_backoff(3), Duration::from_secs(2));
+        assert_eq!(login_backoff(6), Duration::from_secs(16));
+        assert_eq!(login_backoff(1000), MAX_LOGIN_BACKOFF);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cross_origin_and_unknown_hosts_are_refused() {
+        let (web, _tmp) = test_web(WebOptions {
+            allowed_hosts: vec!["nas.lan".into()],
+            ..Default::default()
+        })
+        .await;
+        let app = from(&web, [10, 0, 0, 2]);
+        let mut req = login_request(PASSWORD);
+        req.headers_mut().insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://evil.example"),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // A DNS-rebinding page: same origin as far as the browser knows,
+        // but not a host name this server answers to.
+        let mut req = login_request(PASSWORD);
+        req.headers_mut()
+            .insert(header::HOST, HeaderValue::from_static("evil.example:8080"));
+        req.headers_mut().insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://evil.example:8080"),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::MISDIRECTED_REQUEST);
+
+        let mut req = login_request(PASSWORD);
+        req.headers_mut().insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://nas.lan:8080"),
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn secure_cookies_follow_the_setting_not_a_header() {
+        let (web, _tmp) = test_web(WebOptions::default()).await;
+        let mut req = login_request(PASSWORD);
+        req.headers_mut()
+            .insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        let res = from(&web, [10, 0, 0, 2]).oneshot(req).await.unwrap();
+        let cookie = res.headers()[header::SET_COOKIE].to_str().unwrap();
+        assert!(!cookie.contains("Secure"), "{cookie}");
+
+        let (web, _tmp) = test_web(WebOptions {
+            behind_https: true,
+            ..Default::default()
+        })
+        .await;
+        let res = from(&web, [10, 0, 0, 2])
+            .oneshot(login_request(PASSWORD))
+            .await
+            .unwrap();
+        let cookie = res.headers()[header::SET_COOKIE].to_str().unwrap();
+        assert!(cookie.contains("; Secure"), "{cookie}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sessions_end_when_idle_and_are_capped() {
+        let (web, _tmp) = test_web(WebOptions::default()).await;
+        let app = from(&web, [10, 0, 0, 2]);
+        let mut tokens = Vec::new();
+        for _ in 0..=MAX_SESSIONS {
+            let res = app.clone().oneshot(login_request(PASSWORD)).await.unwrap();
+            let cookie = res.headers()[header::SET_COOKIE].to_str().unwrap();
+            let token = cookie.split(';').next().unwrap().to_string();
+            tokens.push(token);
+        }
+        assert_eq!(web.sessions.lock().unwrap().len(), MAX_SESSIONS);
+        let headers = |token: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::COOKIE, HeaderValue::from_str(token).unwrap());
+            h
+        };
+        // The least recently used made way.
+        assert!(!web.signed_in(&headers(&tokens[0])));
+        let newest = tokens.last().unwrap();
+        assert!(web.signed_in(&headers(newest)));
+        // Unused for a day: signed out.
+        let key = newest.strip_prefix("kv_session=").unwrap();
+        web.sessions.lock().unwrap().get_mut(key).unwrap().last_used =
+            Instant::now() - SESSION_IDLE - Duration::from_secs(1);
+        assert!(!web.signed_in(&headers(newest)));
+    }
+
+    #[test]
+    fn generated_passwords_are_not_logged() {
+        use std::io::Write;
+        #[derive(Clone, Default)]
+        struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .finish();
+        let tmp = tempfile::tempdir().unwrap();
+        // Assumes KINVAULT_WEB_PASSWORD isn't set where tests run.
+        let password =
+            tracing::subscriber::with_default(subscriber, || super::password(tmp.path()).unwrap());
+        let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("web-password"), "{logged}");
+        assert!(!logged.contains(&password), "{logged}");
+    }
+
+    #[test]
+    fn short_passwords_are_refused() {
+        assert!(check_password_len("short").is_err());
+        assert!(check_password_len(&"x".repeat(MIN_PASSWORD_LEN)).is_ok());
+    }
+
+    #[test]
+    fn host_names_drop_the_port() {
+        assert_eq!(host_name("nas.lan:8080"), "nas.lan");
+        assert_eq!(host_name("nas.lan"), "nas.lan");
+        assert_eq!(host_name("[::1]:8080"), "::1");
+        assert_eq!(host_name("192.0.2.1:80"), "192.0.2.1");
+    }
 
     #[test]
     fn index_loads_the_web_bridge_first() {

@@ -121,7 +121,7 @@ pub enum Request {
     /// Everything needed to restore this instance's backups on a new machine,
     /// with all keys encrypted under `passphrase`.
     ExportRecoveryKit {
-        passphrase: String,
+        passphrase: kinvault_core::Secret,
     },
     /// Turns this connection into a stream of [`Event`]s, one JSON object per
     /// line, after a `Subscribed` reply.
@@ -277,14 +277,22 @@ pub struct GrantSpec {
     /// Only accept uploads inside this daily window (local time).
     #[serde(default)]
     pub window: Option<TimeWindow>,
+    /// Whether this instance forwards the peer's backups to its other
+    /// places, using this instance's upload. `None`: only for the user's
+    /// own devices.
+    #[serde(default)]
+    pub forwarding: Option<bool>,
 }
 
 impl GrantSpec {
-    pub fn to_grant(self) -> kinvault_net::Grant {
+    /// The grant for a peer; `mine` says whether it's one of the user's
+    /// own devices.
+    pub fn to_grant(self, mine: bool) -> kinvault_net::Grant {
         kinvault_net::Grant {
             quota_bytes: self.quota_bytes,
             upload_limit: self.upload_limit,
             window: self.window,
+            forwarding: self.forwarding.unwrap_or(mine),
         }
     }
 }
@@ -765,7 +773,9 @@ pub struct NearbyDevice {
     pub id: String,
     pub name: String,
     /// Shown on both devices; the user checks they match before confirming.
-    pub code: String,
+    /// `None` until the two devices have agreed it.
+    #[serde(default)]
+    pub code: Option<String>,
     pub state: NearbyState,
 }
 

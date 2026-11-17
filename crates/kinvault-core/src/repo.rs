@@ -450,30 +450,47 @@ impl<B: Backend> Repository<B> {
             let Some(child_include) = included(include, &node_rel) else {
                 continue;
             };
-            let path = dir.join(&node.name);
+            // Names in the root tree have several components. Directories
+            // on the way are checked (and created) one by one, so a symlink
+            // already in the target can't redirect what's restored.
+            let (parent, leaf) = match node.name.rsplit_once('/') {
+                Some((parent, leaf)) => (safe_dirs(dir, parent)?, leaf),
+                None => (dir.to_path_buf(), node.name.as_str()),
+            };
+            let path = parent.join(leaf);
             match &node.kind {
                 NodeKind::Dir { tree } => {
-                    fs::create_dir_all(&path)?;
+                    let path = safe_dirs(&parent, leaf)?;
                     self.restore_tree(tree, &path, &node_rel, child_include, ctx)?;
                     ctx.stats.dirs += 1;
-                    set_mode(&path, node.mode)?;
+                    set_mode(&path, restored_mode(node.mode))?;
                 }
                 // The include path points inside a file; nothing to restore here.
                 _ if child_include.is_some() => continue,
                 NodeKind::File { chunks, .. } => {
-                    let mut file = fs::File::create(&path)?;
-                    for chunk in chunks {
-                        let data = self.read_blob(chunk, &mut ctx.cache)?;
-                        std::io::Write::write_all(&mut file, &data)?;
-                        ctx.stats.bytes += data.len() as u64;
-                        ctx.progress.bytes += data.len() as u64;
-                        if !(ctx.report)(&ctx.progress) {
-                            return Err(Error::Cancelled);
+                    // Written to a new private file, then moved into place:
+                    // never readable by others while incomplete, and an
+                    // existing file or symlink at the path is replaced, not
+                    // written through.
+                    let (mut file, tmp) = new_private_file(&parent, leaf)?;
+                    let written = (|| -> Result<()> {
+                        for chunk in chunks {
+                            let data = self.read_blob(chunk, &mut ctx.cache)?;
+                            std::io::Write::write_all(&mut file, &data)?;
+                            ctx.stats.bytes += data.len() as u64;
+                            ctx.progress.bytes += data.len() as u64;
+                            if !(ctx.report)(&ctx.progress) {
+                                return Err(Error::Cancelled);
+                            }
                         }
+                        file.set_modified(from_mtime_ns(node.mtime_ns))?;
+                        set_mode(&tmp, restored_mode(node.mode))?;
+                        replace_file(&tmp, &path)
+                    })();
+                    if written.is_err() {
+                        let _ = fs::remove_file(&tmp);
                     }
-                    file.set_modified(from_mtime_ns(node.mtime_ns))?;
-                    drop(file);
-                    set_mode(&path, node.mode)?;
+                    written?;
                     ctx.stats.files += 1;
                     ctx.progress.files += 1;
                     if !(ctx.report)(&ctx.progress) {
@@ -815,7 +832,7 @@ impl<'a, B: Backend> BackupRun<'a, B> {
         }
 
         tracing::debug!(bytes = size, "reading {}", path.display());
-        match fs::File::open(path) {
+        match open_listed_file(path, meta) {
             Ok(file) => self.store_contents(path, file, size, mtime, inode),
             Err(e) => {
                 self.warn(path, e);
@@ -922,13 +939,107 @@ fn validate_name(name: &str) -> Result<()> {
     let bad = name.is_empty()
         || name.starts_with('/')
         || name.contains('\\')
-        || name
-            .split('/')
-            .any(|c| c.is_empty() || c == "." || c == "..");
+        || name.split('/').any(|c| {
+            c.is_empty() || c == "." || c == ".." || (cfg!(windows) && unsafe_on_windows(c))
+        });
     if bad {
         return Err(Error::Corrupt(format!("unsafe path in snapshot: {name:?}")));
     }
     Ok(())
+}
+
+/// Whether a path component restored on Windows could land outside its
+/// directory (`C:foo` makes `dir.join` drop `dir`) or name a device.
+fn unsafe_on_windows(component: &str) -> bool {
+    if component.contains(':') || component.ends_with('.') || component.ends_with(' ') {
+        return true;
+    }
+    let stem = component.split('.').next().unwrap_or("").trim_end();
+    let stem = stem.to_ascii_uppercase();
+    matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+        && stem.len() == 4
+        && stem.as_bytes()[3].is_ascii_digit())
+}
+
+/// The mode to give a restored file or directory. Ownership isn't
+/// restored (everything belongs to whoever runs the restore), so setuid
+/// and setgid bits are dropped: they'd now grant that user's rights.
+fn restored_mode(mode: u32) -> u32 {
+    mode & 0o1777
+}
+
+/// `dir/rel`, creating missing directories along the way (private until
+/// their own mode is applied). Refuses to pass through a symlink or a
+/// non-directory, which someone else able to write to the target could
+/// have planted to redirect the restore.
+fn safe_dirs(dir: &Path, rel: &str) -> Result<PathBuf> {
+    let mut path = dir.to_path_buf();
+    for component in rel.split('/') {
+        path.push(component);
+        match fs::symlink_metadata(&path) {
+            Ok(m) if m.is_dir() => {}
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err(Error::Invalid(format!(
+                    "won't restore through the symlink {}",
+                    path.display()
+                )));
+            }
+            Ok(_) => {
+                return Err(Error::Invalid(format!(
+                    "{} is in the way (not a directory)",
+                    path.display()
+                )));
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => create_private_dir(&path)?,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(path)
+}
+
+#[cfg(unix)]
+fn create_private_dir(path: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    Ok(fs::DirBuilder::new().mode(0o700).create(path)?)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(path: &Path) -> Result<()> {
+    Ok(fs::create_dir(path)?)
+}
+
+/// A new file next to where `name` goes in `dir`, readable only by its
+/// owner, that no one else could have created first.
+fn new_private_file(dir: &Path, name: &str) -> Result<(fs::File, PathBuf)> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    loop {
+        let suffix = hex::encode(crate::crypto::random_bytes::<6>()?);
+        let tmp = dir.join(format!(".{name}.kvrestore-{suffix}"));
+        match options.open(&tmp) {
+            Ok(f) => return Ok((f, tmp)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// Moves a restored file into place. A symlink there is replaced, never
+/// followed; a directory there is an error.
+fn replace_file(from: &Path, to: &Path) -> Result<()> {
+    #[cfg(windows)]
+    if let Ok(m) = fs::symlink_metadata(to)
+        && !m.is_dir()
+    {
+        // Windows won't rename over an existing file.
+        fs::remove_file(to)?;
+    }
+    Ok(fs::rename(from, to)?)
 }
 
 fn mtime_ns(meta: &fs::Metadata) -> i64 {
@@ -958,6 +1069,32 @@ fn mode(meta: &fs::Metadata) -> u32 {
 #[cfg(not(unix))]
 fn mode(_meta: &fs::Metadata) -> u32 {
     0
+}
+
+/// Opens the regular file that `listed` (its `lstat`) describes. If the
+/// path was swapped since for a symlink, a FIFO or another file, it's
+/// refused rather than read: a more privileged daemon would otherwise copy
+/// whatever the link points to, outside what's being backed up.
+#[cfg(unix)]
+fn open_listed_file(path: &Path, listed: &fs::Metadata) -> io::Result<fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    // Not following a symlink, and not waiting for a FIFO's writer.
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || opened.ino() != listed.ino() || opened.dev() != listed.dev() {
+        return Err(io::Error::other(
+            "it was replaced by something else while being backed up",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_listed_file(path: &Path, _listed: &fs::Metadata) -> io::Result<fs::File> {
+    fs::File::open(path)
 }
 
 #[cfg(unix)]
@@ -1055,6 +1192,103 @@ mod tests {
         assert_eq!(run.stats.warnings.len(), 2);
         assert!(run.stats.warnings[0].contains("disk went away"));
         assert_eq!(run.stats.files, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_swapped_after_listing_arent_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (file, secret) = (tmp.path().join("file"), tmp.path().join("secret"));
+        fs::write(&file, b"mine").unwrap();
+        fs::write(&secret, b"not mine").unwrap();
+        let listed = fs::symlink_metadata(&file).unwrap();
+        let mut read = String::new();
+        open_listed_file(&file, &listed)
+            .unwrap()
+            .read_to_string(&mut read)
+            .unwrap();
+        assert_eq!(read, "mine");
+
+        // Swapped for a symlink to a file the backup shouldn't include.
+        fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink(&secret, &file).unwrap();
+        assert!(open_listed_file(&file, &listed).is_err());
+        // For another file.
+        fs::remove_file(&file).unwrap();
+        fs::copy(&secret, &file).unwrap();
+        assert!(open_listed_file(&file, &listed).is_err());
+        // For a FIFO with no writer: refused, without waiting for one.
+        fs::remove_file(&file).unwrap();
+        let c = std::ffi::CString::new(file.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(open_listed_file(&file, &listed).is_err());
+    }
+
+    #[test]
+    fn setuid_and_setgid_bits_are_dropped() {
+        assert_eq!(restored_mode(0o4755), 0o755);
+        assert_eq!(restored_mode(0o2775), 0o775);
+        assert_eq!(restored_mode(0o1777), 0o1777);
+        assert_eq!(restored_mode(0o6600), 0o600);
+    }
+
+    #[test]
+    fn windows_drive_and_device_names_are_unsafe() {
+        for bad in [
+            "C:foo", "c:", "a:b", "CON", "con.txt", "Nul", "COM1", "lpt9.log", "AUX ", "dots.",
+        ] {
+            assert!(unsafe_on_windows(bad), "{bad}");
+        }
+        for ok in ["foo", "CONSOLE", "com", "COM10", "lpt", "a.b", ".hidden"] {
+            assert!(!unsafe_on_windows(ok), "{ok}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn validate_name_rejects_windows_paths_on_windows() {
+        assert!(validate_name("C:foo").is_err());
+        assert!(validate_name("docs/NUL").is_err());
+        assert!(validate_name("docs/notes.txt").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restoring_never_goes_through_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (target, outside) = (tmp.path().join("target"), tmp.path().join("outside"));
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, target.join("home")).unwrap();
+        assert!(safe_dirs(&target, "home/me").is_err());
+        assert!(!outside.join("me").exists());
+        // A file in the way isn't a directory.
+        fs::write(target.join("file"), b"").unwrap();
+        assert!(safe_dirs(&target, "file/x").is_err());
+        // New directories are private until their mode is applied.
+        use std::os::unix::fs::PermissionsExt;
+        let made = safe_dirs(&target, "a/b").unwrap();
+        assert_eq!(made, target.join("a/b"));
+        let mode = fs::metadata(&made).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+
+        // A symlink where a file goes is replaced, not written through.
+        let victim = outside.join("victim");
+        fs::write(&victim, b"keep").unwrap();
+        std::os::unix::fs::symlink(&victim, target.join("f")).unwrap();
+        let (_file, tmp_path) = new_private_file(&target, "f").unwrap();
+        let mode = fs::metadata(&tmp_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        fs::write(&tmp_path, b"restored").unwrap();
+        replace_file(&tmp_path, &target.join("f")).unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"keep");
+        assert_eq!(fs::read(target.join("f")).unwrap(), b"restored");
+        assert!(
+            !fs::symlink_metadata(target.join("f"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[cfg(unix)]

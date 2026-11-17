@@ -7,7 +7,7 @@ services:
   # volumes in step with the writable ones below. Not needed if you already
   # gave `apps` write access to them (e.g. with Edit Permissions).
   permissions:
-    image: ghcr.io/jnewbon/kinvault:latest
+    image: ghcr.io/jnewbon/kinvault:0.1.1
     user: "0:0"
     entrypoint: ["chown", "568:568", "/data", "/restore"]
     network_mode: none
@@ -19,7 +19,8 @@ services:
       - /mnt/tank/kinvault-restore:/restore
 
   kinvault:
-    image: ghcr.io/jnewbon/kinvault:latest
+    # A release tag; change both images' tag to update.
+    image: ghcr.io/jnewbon/kinvault:0.1.1
     container_name: kinvault
     restart: unless-stopped
     depends_on:
@@ -36,9 +37,14 @@ services:
       KINVAULT_WEB: "0.0.0.0:8080"
       # UDP port for other KinVault instances; forward it on your router.
       KINVAULT_LISTEN_PORT: "47100"
-      # Sign-in password for the web interface. Leave unset to have one
-      # generated and printed in the app's logs on first start.
+      # Sign-in password for the web interface (at least 12 characters).
+      # Leave unset to have one generated on first start and kept in
+      # /data/web-password.
       # KINVAULT_WEB_PASSWORD: "choose-a-long-password"
+      # Host names you open the web interface by; others are refused.
+      # KINVAULT_WEB_HOSTS: "nas.lan,192.168.1.10"
+      # Set when only reached through an HTTPS reverse proxy.
+      # KINVAULT_WEB_HTTPS: "true"
     volumes:
       # Identity, encryption keys, settings and indexes. Keep it on a dataset
       # you snapshot; without it (or a recovery kit) backups can't be read.

@@ -1177,7 +1177,9 @@ async fn nearby_devices_pair_once_confirmed_on_both() {
     let mut found = None;
     for _ in 0..100 {
         let (a, b) = (nearby(&nas).await, nearby(&laptop).await);
-        if !a.devices.is_empty() && !b.devices.is_empty() {
+        // Listed at once, with a code once the two have agreed one.
+        let agreed = |s: &NearbyStatus| s.devices.first().is_some_and(|d| d.code.is_some());
+        if agreed(&a) && agreed(&b) {
             found = Some((a.devices[0].clone(), b.devices[0].clone()));
             break;
         }
@@ -1190,6 +1192,7 @@ async fn nearby_devices_pair_once_confirmed_on_both() {
     );
     assert_eq!(on_nas.id, laptop.id().to_string());
     assert_eq!(on_nas.code, on_laptop.code);
+    assert_eq!(on_nas.code.as_ref().map(String::len), Some(7));
     assert_eq!(on_nas.state, NearbyState::Found);
 
     // Confirmed on one side only: nothing is shared yet.
@@ -2289,6 +2292,22 @@ async fn join(host: &Daemon, guest: &Daemon, name: &str) -> String {
     host.id().to_string()
 }
 
+/// Lets `guest` have `host` forward its backups to its other places.
+async fn allow_forwarding(host: &Daemon, guest: &Daemon) {
+    call(
+        host,
+        Request::PeerAllow {
+            id: guest.id().to_string(),
+            name: None,
+            grant: GrantSpec {
+                forwarding: Some(true),
+                ..Default::default()
+            },
+        },
+    )
+    .await;
+}
+
 fn files_in(dir: &Path) -> usize {
     fs::read_dir(dir).map_or(0, |d| d.count())
 }
@@ -2305,6 +2324,8 @@ async fn the_main_host_forwards_copies_on_its_own() {
     let pc = start(&pc_state, pc_secret.clone()).await;
     let server_id = join(&server, &pc, "server").await;
     let remote_id = join(&remote, &pc, "remote").await;
+    // A friend's computer forwards only once its owner allows it.
+    allow_forwarding(&server, &pc).await;
 
     let src = tmp.path().join("src");
     fs::create_dir_all(&src).unwrap();
@@ -2583,6 +2604,8 @@ async fn places_out_of_reach_are_cleaned_up_through_the_relay() {
     let pc = start(&pc_state, pc_secret.clone()).await;
     let server_id = join(&server, &pc, "server").await;
     let remote_id = join(&remote, &pc, "remote").await;
+    // A friend's computer forwards only once its owner allows it.
+    allow_forwarding(&server, &pc).await;
     let src = tmp.path().join("src");
     fs::create_dir_all(&src).unwrap();
     fs::write(src.join("a.txt"), b"one").unwrap();

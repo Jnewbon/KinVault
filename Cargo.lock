@@ -2781,9 +2781,11 @@ dependencies = [
  "fastcdc",
  "getrandom 0.3.4",
  "hex",
+ "libc",
  "postcard",
  "rusqlite",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
@@ -2796,6 +2798,7 @@ name = "kinvault-daemon"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "argon2",
  "axum",
  "blake3",
  "clap",
@@ -2814,8 +2817,10 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -2838,6 +2843,7 @@ version = "0.1.1"
 dependencies = [
  "blake3",
  "data-encoding",
+ "getrandom 0.3.4",
  "hex",
  "iroh",
  "jiff",
@@ -2850,6 +2856,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

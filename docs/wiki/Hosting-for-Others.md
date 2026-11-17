@@ -26,7 +26,9 @@ For friends you set, per friend:
 
 Set them when inviting, or change them later: **Friends → Change limits…**,
 or `kinvault peer allow <friend> --quota 1T --upload-limit 5M --window
-01:00-07:00`. Your own devices (**Mine**) have no limits.
+01:00-07:00`. Your own devices (**Mine**) have no limits. Every peer can
+keep at most 256 backups (repositories) with you, counting deleted ones not
+yet erased.
 
 The **Friends** page shows how much each friend uses of their quota.
 
@@ -37,6 +39,13 @@ another computer they use (see [Backups](Backups#sending-copies-through-the-main
 You send what they already stored with you, still encrypted, so it costs you
 upload bandwidth but no extra space. Their **Upload speed** and **Hours**
 limits apply to forwarding too.
+
+Your own devices can always ask. A friend can only once you tick **Send
+their copies on to their other places** in **Change limits…** (or
+`kinvault peer allow <friend> --forwarding true`); until then their requests
+are refused. Each peer may have at most 64 orders waiting, totalling
+64 MiB, for at most 16 places; the orders are kept in KinVault's state
+folder, not counted against their quota.
 
 ### Deleted data still counts for a while
 

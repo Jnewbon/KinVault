@@ -11,6 +11,7 @@ use tokio::sync::Mutex;
 use crate::error::{NetError, transport};
 use crate::hosts::with_hosts;
 use crate::limits::RateLimiter;
+use crate::nearby::{pair_commitment, pair_nonce, pairing_code};
 use crate::protocol::{
     ALPN, Delegation, Deletion, Delivery, ForwardInfo, ForwardOrder, MAX_OBJECT_LEN,
     MAX_RESPONSE_LEN, Offer, Op, PeerHosts, PeerName, Request, Response, read_msg, read_payload,
@@ -357,6 +358,79 @@ pub async fn pair(
     }
 }
 
+/// Why agreeing a pairing code failed.
+#[derive(Debug)]
+pub struct PairCheckFailed {
+    pub error: NetError,
+    /// Whether the peer had answered with its nonce: it could then have
+    /// worked out the code, so the attempt counts against the tries allowed.
+    pub answered: bool,
+}
+
+impl std::fmt::Display for PairCheckFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+/// Agrees a pairing code with a nearby peer, as the side that starts (see
+/// [`crate::nearby::pairing_code`]): commits to a fresh nonce, gets the
+/// peer's, then reveals this one. Returns the code both sides now show.
+pub async fn pair_check(
+    endpoint: &Endpoint,
+    addr: EndpointAddr,
+) -> Result<String, PairCheckFailed> {
+    let failed = |error| PairCheckFailed {
+        error,
+        answered: false,
+    };
+    let peer = addr.id;
+    let conn = endpoint
+        .connect(addr, ALPN)
+        .await
+        .map_err(|e| failed(transport(e)))?;
+    let result = async {
+        let nonce = pair_nonce();
+        let start = Request {
+            repo: "pair".into(),
+            op: Op::PairStart {
+                commitment: pair_commitment(&nonce),
+            },
+        };
+        let theirs = match call_once(&conn, &start, None, None)
+            .await
+            .map_err(failed)?
+            .0
+        {
+            Response::PairNonce { nonce } => nonce,
+            Response::Error { code, message } => {
+                return Err(failed(NetError::from_code(code, message)));
+            }
+            other => return Err(failed(unexpected(&other))),
+        };
+        let answered = |error| PairCheckFailed {
+            error,
+            answered: true,
+        };
+        let reveal = Request {
+            repo: "pair".into(),
+            op: Op::PairReveal { nonce },
+        };
+        match call_once(&conn, &reveal, None, None)
+            .await
+            .map_err(answered)?
+            .0
+        {
+            Response::Ok => Ok(pairing_code(&endpoint.id(), &peer, &nonce, &theirs)),
+            Response::Error { code, message } => Err(answered(NetError::from_code(code, message))),
+            other => Err(answered(unexpected(&other))),
+        }
+    }
+    .await;
+    conn.close(0u32.into(), b"done");
+    result
+}
+
 /// Tells a peer this instance removed its owner, so it forgets this
 /// instance and erases what this instance stored there after
 /// [`REPO_DELETE_DELAY`](crate::REPO_DELETE_DELAY).
@@ -399,6 +473,8 @@ fn describe(op: &Op) -> String {
         Op::Pair { .. } => "pair".into(),
         Op::DeleteRepo => "delete repository".into(),
         Op::Unfriend => "unfriend".into(),
+        Op::PairStart { .. } => "start agreeing a pairing code".into(),
+        Op::PairReveal { .. } => "finish agreeing a pairing code".into(),
         Op::Forward { len } => format!("forwarding order ({len} bytes)"),
         Op::ForwardStatus { place } => format!("forwarding status for {place}"),
         Op::ForwardCancel { place } => format!("cancel forwarding to {place}"),
@@ -443,6 +519,7 @@ fn describe_response(resp: &Response) -> String {
             format!("{here} of {} here", found.len())
         }
         Response::Forwarding(orders) => format!("{} forwarding orders", orders.len()),
+        Response::PairNonce { .. } => "pairing nonce".into(),
     }
 }
 
@@ -685,14 +762,15 @@ mod tests {
         let err = remote(&host).await.status().await.unwrap_err();
         assert!(err.to_string().contains("too large"), "{err}");
 
-        let len = MAX_OBJECT_LEN + 1;
+        // Objects older versions stored can be read back, but no larger.
+        let len = crate::protocol::MAX_STORED_OBJECT_LEN + 1;
         let host = FakeHost::serve(Misbehave::Reply(Response::Data { len })).await;
         let r = Arc::new(remote(&host).await);
         let id = PackId([1; 32]);
         assert!(blocking(&r, move |r| is_protocol_error(r.get_pack(&id))).await);
 
         // Refused before anything is sent. Zeroed memory is only reserved, not touched.
-        let huge = vec![0u8; len as usize];
+        let huge = vec![0u8; MAX_OBJECT_LEN as usize + 1];
         let err = blocking(&r, move |r| r.put_pack(&id, &huge)).await;
         assert!(matches!(err, Err(kinvault_core::Error::Invalid(_))));
     }

@@ -345,6 +345,10 @@ struct GrantArgs {
     /// Only accept their uploads during these hours, e.g. 01:00-07:00.
     #[arg(long, value_parser = TimeWindow::parse)]
     window: Option<TimeWindow>,
+    /// Whether this computer sends their backups on to their other places
+    /// when they ask (using its upload). By default only for your own devices.
+    #[arg(long)]
+    forwarding: Option<bool>,
 }
 
 impl GrantArgs {
@@ -353,6 +357,7 @@ impl GrantArgs {
             quota_bytes: self.quota,
             upload_limit: self.upload_limit,
             window: self.window,
+            forwarding: self.forwarding,
         }
     }
 }
@@ -612,6 +617,11 @@ fn describe_grant(g: &GrantSpec) -> String {
     if let Some(w) = g.window {
         parts.push(format!("uploads {w}"));
     }
+    match g.forwarding {
+        Some(true) => parts.push("forwards their copies".into()),
+        Some(false) => parts.push("doesn't forward their copies".into()),
+        None => {}
+    }
     parts.join(", ")
 }
 
@@ -659,8 +669,7 @@ async fn main() -> Result<()> {
     }
     // Importing a recovery kit happens before the daemon runs.
     if let Command::Recovery(RecoveryCommand::Import { file, force }) = &cli.command {
-        let json =
-            std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+        let json = kinvault_daemon::recovery::read_kit(file)?;
         let summary = kinvault_daemon::recovery::import_offline(
             &state,
             &json,
@@ -1085,7 +1094,9 @@ async fn main() -> Result<()> {
             println!("Choose a passphrase for the recovery kit. You need it to use the kit.");
             let passphrase = kit_passphrase(true)?;
             let Reply::RecoveryKit { json } = client
-                .call(&Request::ExportRecoveryKit { passphrase })
+                .call(&Request::ExportRecoveryKit {
+                    passphrase: passphrase.into(),
+                })
                 .await?
             else {
                 bail!("unexpected reply")
@@ -1434,6 +1445,7 @@ async fn main() -> Result<()> {
                 quota_bytes: offer,
                 upload_limit: offer_upload_limit,
                 window: offer_window,
+                forwarding: None,
             });
             let offered = offer.is_some() || mine;
             let Reply::Redeemed {
@@ -1569,14 +1581,16 @@ async fn main() -> Result<()> {
             let mut shown = std::collections::HashMap::new();
             while let Some(until) = status.until_unix {
                 for d in &status.devices {
-                    if shown.get(&d.id) != Some(&d.state) {
+                    let seen = (d.state, d.code.clone());
+                    if shown.get(&d.id) != Some(&seen) {
                         let state = match d.state {
                             NearbyState::Found => "found",
                             NearbyState::Waiting => "waiting for it to confirm",
                             NearbyState::Paired => "yours",
                         };
-                        println!("{}  code {}  {state}  ({})", d.name, d.code, d.id);
-                        shown.insert(d.id.clone(), d.state);
+                        let code = d.code.as_deref().unwrap_or("(agreeing…)");
+                        println!("{}  code {code}  {state}  ({})", d.name, d.id);
+                        shown.insert(d.id.clone(), seen);
                     }
                 }
                 let now = std::time::SystemTime::now()
@@ -1630,7 +1644,8 @@ async fn main() -> Result<()> {
                 }
                 _ => println!(
                     "Confirmed. Now pair with this device on {} (code {}).",
-                    d.name, d.code
+                    d.name,
+                    d.code.as_deref().unwrap_or("?")
                 ),
             }
         }

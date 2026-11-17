@@ -14,10 +14,11 @@ use kinvault_core::{Backend, LocalDirBackend, PackId, SnapshotId};
 
 use crate::error::NetError;
 use crate::limits::{RateLimiter, TimeWindow};
+use crate::nearby::PairNonce;
 use crate::protocol::{
     Delegation, Delivery, ErrorCode, ForwardOrder, MAX_HAVE, MAX_OBJECT_LEN, MAX_ORDER_LEN,
     MAX_REQUEST_LEN, Offer, Op, PeerName, Request, Response, read_msg, read_payload,
-    valid_repo_name, write_msg,
+    read_payload_into, valid_repo_name, write_msg, write_payload_from,
 };
 
 mod forward;
@@ -28,10 +29,33 @@ pub const REPO_DELETE_DELAY: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Per-peer directory of deleted repositories, named `<erase unix>-<repo>`.
 /// Repository names can't start with a dot, so it never clashes with one.
 const DELETED_DIR: &str = ".deleted";
-/// Uploads one peer may have in progress; more wait their turn. Each is
-/// held in memory until stored, so this bounds what a peer can make the
-/// host buffer (at most this many times [`MAX_OBJECT_LEN`]).
+/// Uploads one peer may have in progress; more wait their turn. Uploads
+/// are written to disk as they arrive, so this bounds open files and the
+/// quota held in reservations rather than memory.
 const UPLOADS_PER_PEER: usize = 4;
+/// Uploads (and forwarding orders being read) in progress across all peers.
+const UPLOADS_TOTAL: usize = 16;
+/// Downloads one peer may have in progress, and across all peers.
+const DOWNLOADS_PER_PEER: usize = 4;
+const DOWNLOADS_TOTAL: usize = 32;
+/// Connections served at once, in all and from one peer. Anyone who knows
+/// this host's id can connect, so these bound what strangers can tie up.
+/// A sender keeps one connection per backup set (and place) it has here,
+/// plus a few for checks, so the per-peer limit leaves room for many sets.
+const MAX_CONNECTIONS: usize = 1024;
+const MAX_CONNECTIONS_PER_PEER: usize = 64;
+/// How long a new stream may take to send its request. Requests are small.
+#[cfg(not(test))]
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+/// Received files never stored (the upload broke off, or the host stopped)
+/// are removed after this long.
+const INCOMING_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+/// Repositories one peer may have here, counting deleted ones not yet
+/// erased. Empty directories aren't counted against the quota, so this
+/// keeps a peer from making any number of them.
+const MAX_REPOS_PER_PEER: usize = 256;
 
 /// Storage a peer uses on this host.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -52,6 +76,9 @@ pub struct Grant {
     pub upload_limit: Option<u64>,
     /// Uploads are only accepted inside this daily window (host's local time).
     pub window: Option<TimeWindow>,
+    /// Whether the peer may have this host forward its objects to other
+    /// hosts (see [`Op::Forward`]), using this host's upload.
+    pub forwarding: bool,
 }
 
 /// A peer claiming an invite.
@@ -86,6 +113,18 @@ pub type PairHandler = Arc<
         + Send
         + Sync,
 >;
+
+/// Answers a nearby peer agreeing a pairing code with this host (see
+/// [`crate::nearby::pairing_code`]). The host is the responder: it gets the
+/// peer's commitment, answers with its own nonce, then gets the peer's
+/// nonce and checks it against the commitment. Implementations keep the
+/// state between the two calls and limit how many attempts a peer gets.
+pub trait PairCheckHandler: Send + Sync {
+    /// The peer committed to its nonce; returns this host's nonce.
+    fn start(&self, peer: EndpointId, commitment: [u8; 32]) -> Result<PairNonce, String>;
+    /// The peer revealed its nonce; on success both sides can show the code.
+    fn reveal(&self, peer: EndpointId, nonce: PairNonce) -> Result<(), String>;
+}
 
 /// Told that a peer removed this host's owner (see [`Op::Unfriend`]), after
 /// the receiver stopped accepting its backups and scheduled them for erasing.
@@ -128,13 +167,31 @@ struct Inner {
     uploads: Mutex<HashMap<EndpointId, Arc<PeerUploads>>>,
     invites: RwLock<Option<InviteHandler>>,
     pairing: RwLock<Option<PairHandler>>,
+    pair_checks: RwLock<Option<Arc<dyn PairCheckHandler>>>,
     unfriending: RwLock<Option<UnfriendHandler>>,
     /// This host's own id, which deliveries must be addressed to.
     identity: RwLock<Option<EndpointId>>,
     forwarding: RwLock<Option<Arc<ForwardQueue>>>,
+    /// Shared by all peers: see [`UPLOADS_TOTAL`] and [`DOWNLOADS_TOTAL`].
+    upload_slots: Arc<tokio::sync::Semaphore>,
+    download_slots: Arc<tokio::sync::Semaphore>,
+    /// Connections open per peer (see [`MAX_CONNECTIONS_PER_PEER`]).
+    connections: Mutex<HashMap<EndpointId, usize>>,
 }
 
-type Reply = (Response, Option<Vec<u8>>);
+/// What follows a response: `len` bytes of a stored object from `offset`,
+/// sent from its file while holding download slots.
+struct Payload {
+    path: PathBuf,
+    offset: u64,
+    len: u64,
+    _slots: (
+        tokio::sync::OwnedSemaphorePermit,
+        tokio::sync::OwnedSemaphorePermit,
+    ),
+}
+
+type Reply = (Response, Option<Payload>);
 type Failure = (ErrorCode, String);
 
 impl Receiver {
@@ -147,9 +204,13 @@ impl Receiver {
                 uploads: Mutex::default(),
                 invites: RwLock::default(),
                 pairing: RwLock::default(),
+                pair_checks: RwLock::default(),
                 unfriending: RwLock::default(),
                 identity: RwLock::default(),
                 forwarding: RwLock::default(),
+                upload_slots: Arc::new(tokio::sync::Semaphore::new(UPLOADS_TOTAL)),
+                download_slots: Arc::new(tokio::sync::Semaphore::new(DOWNLOADS_TOTAL)),
+                connections: Mutex::default(),
             }),
         }
     }
@@ -190,6 +251,31 @@ impl Receiver {
 
     pub fn set_pair_handler(&self, handler: PairHandler) {
         *self.inner.pairing.write().unwrap() = Some(handler);
+    }
+
+    pub fn set_pair_check_handler(&self, handler: Arc<dyn PairCheckHandler>) {
+        *self.inner.pair_checks.write().unwrap() = Some(handler);
+    }
+
+    /// Runs one step of agreeing a pairing code (`Op::PairStart` or
+    /// `Op::PairReveal`) with the owner's handler.
+    fn pair_check(&self, peer: EndpointId, op: &Op) -> Result<Reply, Failure> {
+        let handler = self.inner.pair_checks.read().unwrap().clone();
+        let Some(handler) = handler else {
+            return Err((ErrorCode::Denied, "this host does not pair".into()));
+        };
+        let denied = |e| (ErrorCode::Denied, e);
+        match op {
+            Op::PairStart { commitment } => {
+                let nonce = handler.start(peer, *commitment).map_err(denied)?;
+                Ok((Response::PairNonce { nonce }, None))
+            }
+            Op::PairReveal { nonce } => {
+                handler.reveal(peer, *nonce).map_err(denied)?;
+                Ok((Response::Ok, None))
+            }
+            _ => unreachable!("only called for pairing code steps"),
+        }
     }
 
     pub fn set_unfriend_handler(&self, handler: UnfriendHandler) {
@@ -298,7 +384,12 @@ impl Receiver {
                         continue;
                     }
                     match LocalDirBackend::open(&repo) {
-                        Ok(b) => freed += b.purge_trash(grace).map_err(io::Error::other)?,
+                        Ok(b) => {
+                            freed += b.purge_trash(grace).map_err(io::Error::other)?;
+                            freed += b
+                                .purge_incoming(INCOMING_MAX_AGE)
+                                .map_err(io::Error::other)?;
+                        }
                         Err(_) => continue,
                     }
                 }
@@ -319,7 +410,10 @@ impl Receiver {
         mut send: SendStream,
         mut recv: RecvStream,
     ) -> Result<(), NetError> {
-        let req: Request = read_msg(&mut recv, MAX_REQUEST_LEN).await?;
+        let req: Request =
+            tokio::time::timeout(REQUEST_TIMEOUT, read_msg(&mut recv, MAX_REQUEST_LEN))
+                .await
+                .map_err(|_| NetError::Protocol("no request arrived in time".into()))??;
         let (resp, payload) = match self.dispatch(peer, req, &mut recv).await {
             Ok(reply) => reply,
             Err((code, message)) => {
@@ -329,10 +423,14 @@ impl Receiver {
             }
         };
         write_msg(&mut send, &resp).await?;
-        if let Some(data) = payload {
-            send.write_all(&data)
-                .await
-                .map_err(crate::error::transport)?;
+        if let Some(Payload {
+            path, offset, len, ..
+        }) = payload
+        {
+            use tokio::io::AsyncSeekExt;
+            let mut file = tokio::fs::File::open(&path).await?;
+            file.seek(std::io::SeekFrom::Start(offset)).await?;
+            write_payload_from(&mut send, &mut file, len).await?;
         }
         send.finish().map_err(crate::error::transport)?;
         Ok(())
@@ -376,6 +474,20 @@ impl Receiver {
     /// A peer removed this host's owner: stop accepting its backups, schedule
     /// what it stored for erasing, then let the owner's handler forget it.
     async fn unfriend(&self, peer: EndpointId) -> Result<Reply, Failure> {
+        // Nothing to stop or erase for a peer that stores nothing here (any
+        // stranger can send this), so don't track anything for it either.
+        // The owner's handler still hears of it: the peer may be a host of
+        // ours rather than a guest.
+        let dir = self.peer_dir(&peer);
+        let stores_here =
+            self.access(&peer).is_some() || tokio::fs::try_exists(&dir).await.unwrap_or(true);
+        if !stores_here {
+            let handler = self.inner.unfriending.read().unwrap().clone();
+            if let Some(handler) = handler {
+                handler(peer).await;
+            }
+            return Ok((Response::Ok, None));
+        }
         let erase_after_unix = self.remove_peer(&peer).await.map_err(internal)?;
         let handler = self.inner.unfriending.read().unwrap().clone();
         if let Some(handler) = handler {
@@ -460,6 +572,9 @@ impl Receiver {
         if let Op::Unfriend = req.op {
             return self.unfriend(peer).await;
         }
+        if let Op::PairStart { .. } | Op::PairReveal { .. } = req.op {
+            return self.pair_check(peer, &req.op);
+        }
         // From a relay, which may not be a peer itself: allowed if the owner
         // it delivers for signed a permission for it.
         if let Op::Deliver { delegation, item } = req.op {
@@ -481,6 +596,12 @@ impl Receiver {
             return self.delete_repo(&peer, &req.repo).await;
         }
         match req.op {
+            Op::Forward { .. } if !grant.forwarding => {
+                return Err((
+                    ErrorCode::Denied,
+                    "this host doesn't forward backups for you; its owner can allow it".into(),
+                ));
+            }
             Op::Forward { len } => return self.take_order(peer, req.repo, len, recv).await,
             Op::ForwardStatus { place } => {
                 let queue = self.forward_queue()?;
@@ -494,8 +615,10 @@ impl Receiver {
             }
             _ => {}
         }
-        let repo_dir = self.peer_dir(&peer).join(&req.repo);
-        let backend = Arc::new(blocking(move || LocalDirBackend::create(repo_dir)).await?);
+        // Only uploads create the repository (see `put_object`).
+        let repo = req.repo.as_str();
+        let backend = self.open_repo(&peer, repo).await?;
+        let missing = || (ErrorCode::NotFound, format!("no repository {repo:?} here"));
 
         match req.op {
             Op::Status => {
@@ -509,25 +632,25 @@ impl Receiver {
                 ))
             }
             Op::ListPacks => {
-                let b = backend.clone();
-                Ok((
-                    Response::PackIds(blocking(move || b.list_packs()).await?),
-                    None,
-                ))
+                let packs = match backend {
+                    Some(b) => blocking(move || b.list_packs()).await?,
+                    None => Vec::new(),
+                };
+                Ok((Response::PackIds(packs), None))
             }
             Op::ListSnapshots => {
-                let b = backend.clone();
-                Ok((
-                    Response::SnapshotIds(blocking(move || b.list_snapshots()).await?),
-                    None,
-                ))
+                let snapshots = match backend {
+                    Some(b) => blocking(move || b.list_snapshots()).await?,
+                    None => Vec::new(),
+                };
+                Ok((Response::SnapshotIds(snapshots), None))
             }
             Op::PutPack { id, len } => {
                 self.put_object(
                     &peer,
                     &grant,
                     limiter.as_deref(),
-                    &backend,
+                    repo,
                     Object::Pack(id),
                     len,
                     recv,
@@ -539,7 +662,7 @@ impl Receiver {
                     &peer,
                     &grant,
                     limiter.as_deref(),
-                    &backend,
+                    repo,
                     Object::Snapshot(id),
                     len,
                     recv,
@@ -547,47 +670,42 @@ impl Receiver {
                 .await
             }
             Op::GetPack { id } => {
-                let b = backend.clone();
-                let data = blocking(move || b.get_pack(&id)).await?;
+                let b = backend.ok_or_else(missing)?;
+                let slots = self.download_slots(&peer).await?;
+                let (path, len) = blocking(move || b.pack_file(&id)).await?;
                 Ok((
-                    Response::Data {
-                        len: data.len() as u64,
-                    },
-                    Some(data),
+                    Response::Data { len },
+                    Some(file_payload(path, 0, len, slots)),
                 ))
             }
             Op::GetPackTail { id, max_len } => {
-                let b = backend.clone();
-                let (total_len, tail) = blocking(move || b.get_pack_tail(&id, max_len)).await?;
-                Ok((
-                    Response::Tail {
-                        total_len,
-                        len: tail.len() as u64,
-                    },
-                    Some(tail),
-                ))
+                let b = backend.ok_or_else(missing)?;
+                let slots = self.download_slots(&peer).await?;
+                let (path, total_len) = blocking(move || b.pack_file(&id)).await?;
+                let len = total_len.min(max_len);
+                let payload = file_payload(path, total_len - len, len, slots);
+                Ok((Response::Tail { total_len, len }, Some(payload)))
             }
             Op::GetSnapshot { id } => {
-                let b = backend.clone();
-                let data = blocking(move || b.get_snapshot(&id)).await?;
+                let b = backend.ok_or_else(missing)?;
+                let slots = self.download_slots(&peer).await?;
+                let (path, len) = blocking(move || b.snapshot_file(&id)).await?;
                 Ok((
-                    Response::Data {
-                        len: data.len() as u64,
-                    },
-                    Some(data),
+                    Response::Data { len },
+                    Some(file_payload(path, 0, len, slots)),
                 ))
             }
             // Deletions go to the trash for a grace period, so a compromised
             // sender can't immediately destroy its own history.
             Op::DeletePack { id } => {
-                let b = backend.clone();
+                let b = backend.ok_or_else(missing)?;
                 blocking(move || b.trash_pack(&id)).await?;
                 // Same total, but more of it is now waiting to be erased.
                 self.invalidate_usage(&peer);
                 Ok((Response::Ok, None))
             }
             Op::DeleteSnapshot { id } => {
-                let b = backend.clone();
+                let b = backend.ok_or_else(missing)?;
                 blocking(move || b.trash_snapshot(&id)).await?;
                 // Same total, but more of it is now waiting to be erased.
                 self.invalidate_usage(&peer);
@@ -600,6 +718,8 @@ impl Receiver {
             | Op::Forward { .. }
             | Op::ForwardStatus { .. }
             | Op::ForwardCancel { .. }
+            | Op::PairStart { .. }
+            | Op::PairReveal { .. }
             | Op::Unfriend => {
                 unreachable!("handled above")
             }
@@ -614,31 +734,93 @@ impl Receiver {
         owner: &EndpointId,
         grant: &Grant,
         limiter: Option<&RateLimiter>,
-        backend: &Arc<LocalDirBackend>,
+        repo: &str,
         object: Object,
         len: u64,
         recv: &mut RecvStream,
     ) -> Result<Reply, Failure> {
-        let (data, reservation) = self
-            .receive_object(owner, grant, limiter, len, recv)
-            .await?;
-        let (what, id) = match object {
-            Object::Pack(id) => ("pack", id.0),
-            Object::Snapshot(id) => ("snapshot", id.0),
-        };
-        if blake3::hash(&data).as_bytes() != &id {
-            return Err((
-                ErrorCode::BadRequest,
-                format!("{what} {} content does not match its id", hex::encode(id)),
-            ));
-        }
+        let reservation = self.reserve_upload(owner, grant, len).await?;
+        let backend = self.create_repo(owner, repo).await?;
         let b = backend.clone();
-        match object {
-            Object::Pack(id) => blocking(move || b.put_pack(&id, &data)).await?,
-            Object::Snapshot(id) => blocking(move || b.put_snapshot(&id, &data)).await?,
+        let tmp = blocking(move || b.incoming_path()).await?;
+        let received = receive_to_file(&tmp, recv, len, limiter).await;
+        let stored = match received {
+            Ok(hash) => {
+                let (what, id) = match object {
+                    Object::Pack(id) => ("pack", id.0),
+                    Object::Snapshot(id) => ("snapshot", id.0),
+                };
+                if hash.as_bytes() != &id {
+                    Err((
+                        ErrorCode::BadRequest,
+                        format!("{what} {} content does not match its id", hex::encode(id)),
+                    ))
+                } else {
+                    let (b, file) = (backend.clone(), tmp.clone());
+                    match object {
+                        Object::Pack(id) => blocking(move || b.adopt_pack(&id, &file)).await,
+                        Object::Snapshot(id) => {
+                            blocking(move || b.adopt_snapshot(&id, &file)).await
+                        }
+                    }
+                }
+            }
+            Err(e) => Err((ErrorCode::BadRequest, e.to_string())),
+        };
+        if stored.is_err() {
+            let _ = tokio::fs::remove_file(&tmp).await;
         }
+        stored?;
         reservation.release().await;
         Ok((Response::Ok, None))
+    }
+
+    /// The peer's repository, if it has one.
+    async fn open_repo(
+        &self,
+        peer: &EndpointId,
+        repo: &str,
+    ) -> Result<Option<Arc<LocalDirBackend>>, Failure> {
+        let dir = self.peer_dir(peer).join(repo);
+        match blocking(move || LocalDirBackend::open(dir)).await {
+            Ok(b) => Ok(Some(Arc::new(b))),
+            Err((ErrorCode::NotFound, _)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The peer's repository, created if it's new and the peer may have
+    /// another (see [`MAX_REPOS_PER_PEER`]).
+    async fn create_repo(
+        &self,
+        peer: &EndpointId,
+        repo: &str,
+    ) -> Result<Arc<LocalDirBackend>, Failure> {
+        if let Some(b) = self.open_repo(peer, repo).await? {
+            return Ok(b);
+        }
+        let peer_dir = self.peer_dir(peer);
+        let repo_dir = peer_dir.join(repo);
+        let count = tokio::task::spawn_blocking(move || -> io::Result<usize> {
+            let deleted = read_dirs(&peer_dir.join(DELETED_DIR))?.len();
+            let live = read_dirs(&peer_dir)?
+                .iter()
+                .filter(|d| d.file_name() != Some(DELETED_DIR.as_ref()))
+                .count();
+            Ok(deleted + live)
+        })
+        .await
+        .map_err(internal)?
+        .map_err(internal)?;
+        if count >= MAX_REPOS_PER_PEER {
+            return Err((
+                ErrorCode::QuotaExceeded,
+                format!("at most {MAX_REPOS_PER_PEER} repositories, including deleted ones"),
+            ));
+        }
+        Ok(Arc::new(
+            blocking(move || LocalDirBackend::create(repo_dir)).await?,
+        ))
     }
 
     fn forward_queue(&self) -> Result<Arc<ForwardQueue>, Failure> {
@@ -666,11 +848,16 @@ impl Receiver {
                 format!("order of {len} bytes is too large"),
             ));
         }
+        // Read into memory, so it takes upload slots like an upload.
+        let _slots = self.upload_slots(&self.peer_uploads(&peer)).await?;
         let data = read_payload(recv, len, None)
             .await
             .map_err(|e| (ErrorCode::BadRequest, e.to_string()))?;
         let order: ForwardOrder = postcard::from_bytes(&data)
             .map_err(|e| (ErrorCode::BadRequest, format!("malformed order: {e}")))?;
+        order
+            .check_limits()
+            .map_err(|e| (ErrorCode::BadRequest, e))?;
         let d = &order.delegation;
         if d.owner != peer {
             return Err((
@@ -731,16 +918,19 @@ impl Receiver {
                 format!("invalid repository name {repo:?}"),
             ));
         }
-        let repo_dir = self.peer_dir(&owner).join(repo);
-        let backend = Arc::new(blocking(move || LocalDirBackend::create(repo_dir)).await?);
+        // Only deliveries of objects create the repository.
+        let backend = self.open_repo(&owner, repo).await?;
         match item {
             Delivery::Have { packs } => {
                 if packs.len() > MAX_HAVE {
                     return Err((ErrorCode::BadRequest, "asked about too many packs".into()));
                 }
-                let b = backend.clone();
-                let found =
-                    blocking(move || Ok(packs.iter().map(|p| b.has_pack(p)).collect())).await?;
+                let found = match backend {
+                    Some(b) => {
+                        blocking(move || Ok(packs.iter().map(|p| b.has_pack(p)).collect())).await?
+                    }
+                    None => vec![false; packs.len()],
+                };
                 Ok((Response::Present(found), None))
             }
             Delivery::Pack { id, len } => {
@@ -748,7 +938,7 @@ impl Receiver {
                     &owner,
                     &grant,
                     limiter.as_deref(),
-                    &backend,
+                    repo,
                     Object::Pack(id),
                     len,
                     recv,
@@ -761,7 +951,10 @@ impl Receiver {
                 }
                 d.check(&me, repo, unix_now())
                     .map_err(|e| (ErrorCode::Denied, e))?;
-                let b = backend.clone();
+                // Nothing stored, so nothing to delete.
+                let Some(b) = backend else {
+                    return Ok((Response::Ok, None));
+                };
                 blocking(move || {
                     // Already gone is fine: the deletion may be passed on twice.
                     let gone = |r: kinvault_core::Result<()>| match r {
@@ -785,7 +978,7 @@ impl Receiver {
                     &owner,
                     &grant,
                     limiter.as_deref(),
-                    &backend,
+                    repo,
                     Object::Snapshot(id),
                     len,
                     recv,
@@ -793,6 +986,40 @@ impl Receiver {
                 .await
             }
         }
+    }
+
+    /// Waits for one of the peer's upload slots, then one of all peers'
+    /// (in that order, so one peer can't take them all).
+    async fn upload_slots(
+        &self,
+        uploads: &PeerUploads,
+    ) -> Result<
+        (
+            tokio::sync::OwnedSemaphorePermit,
+            tokio::sync::OwnedSemaphorePermit,
+        ),
+        Failure,
+    > {
+        let mine = uploads.slots.clone().acquire_owned().await;
+        let all = self.inner.upload_slots.clone().acquire_owned().await;
+        Ok((mine.map_err(internal)?, all.map_err(internal)?))
+    }
+
+    /// Like [`Self::upload_slots`], for downloads.
+    async fn download_slots(
+        &self,
+        peer: &EndpointId,
+    ) -> Result<
+        (
+            tokio::sync::OwnedSemaphorePermit,
+            tokio::sync::OwnedSemaphorePermit,
+        ),
+        Failure,
+    > {
+        let uploads = self.peer_uploads(peer);
+        let mine = uploads.downloads.clone().acquire_owned().await;
+        let all = self.inner.download_slots.clone().acquire_owned().await;
+        Ok((mine.map_err(internal)?, all.map_err(internal)?))
     }
 
     fn peer_uploads(&self, peer: &EndpointId) -> Arc<PeerUploads> {
@@ -804,23 +1031,22 @@ impl Receiver {
             .or_insert_with(|| {
                 Arc::new(PeerUploads {
                     slots: Arc::new(tokio::sync::Semaphore::new(UPLOADS_PER_PEER)),
+                    downloads: Arc::new(tokio::sync::Semaphore::new(DOWNLOADS_PER_PEER)),
                     reserved: tokio::sync::Mutex::new(0),
                 })
             })
             .clone()
     }
 
-    /// Checks window, size limits and quota, then reads an uploaded object.
+    /// Checks window, size limits and quota for an upload of `len` bytes.
     /// The returned reservation counts the object against the quota until it
     /// is stored and released.
-    async fn receive_object(
+    async fn reserve_upload(
         &self,
         peer: &EndpointId,
         grant: &Grant,
-        limiter: Option<&RateLimiter>,
         len: u64,
-        recv: &mut RecvStream,
-    ) -> Result<(Vec<u8>, Reservation), Failure> {
+    ) -> Result<Reservation, Failure> {
         if let Some(window) = grant.window
             && !window.is_open_now()
         {
@@ -836,12 +1062,7 @@ impl Receiver {
             ));
         }
         let uploads = self.peer_uploads(peer);
-        let slot = uploads
-            .slots
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(internal)?;
+        let slots = self.upload_slots(&uploads).await?;
         {
             // Checking and reserving under one lock means uploads running
             // at the same time can't all pass against the same usage.
@@ -867,12 +1088,9 @@ impl Receiver {
             uploads,
             len,
             released: false,
-            _slot: slot,
+            _slots: slots,
         };
-        let data = read_payload(recv, len, limiter)
-            .await
-            .map_err(|e| (ErrorCode::BadRequest, e.to_string()))?;
-        Ok((data, reservation))
+        Ok(reservation)
     }
 }
 
@@ -887,6 +1105,7 @@ struct CachedUsage {
 /// A peer's uploads in progress.
 struct PeerUploads {
     slots: Arc<tokio::sync::Semaphore>,
+    downloads: Arc<tokio::sync::Semaphore>,
     /// Bytes of uploads in progress, not yet in the usage figure.
     reserved: tokio::sync::Mutex<u64>,
 }
@@ -899,7 +1118,10 @@ struct Reservation {
     uploads: Arc<PeerUploads>,
     len: u64,
     released: bool,
-    _slot: tokio::sync::OwnedSemaphorePermit,
+    _slots: (
+        tokio::sync::OwnedSemaphorePermit,
+        tokio::sync::OwnedSemaphorePermit,
+    ),
 }
 
 impl Reservation {
@@ -944,6 +1166,11 @@ impl Drop for Reservation {
 impl ProtocolHandler for Receiver {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let peer = connection.remote_id();
+        let Some(_counted) = ConnectionSlot::take(self, peer) else {
+            tracing::debug!(%peer, "refusing a connection: too many open");
+            connection.close(1u32.into(), b"too many connections");
+            return Ok(());
+        };
         tracing::debug!(%peer, "accepted connection");
         // Serve streams until the peer closes the connection.
         while let Ok((send, recv)) = connection.accept_bi().await {
@@ -955,6 +1182,75 @@ impl ProtocolHandler for Receiver {
             });
         }
         Ok(())
+    }
+}
+
+/// Counts an open connection against the limits until dropped.
+struct ConnectionSlot {
+    receiver: Receiver,
+    peer: EndpointId,
+}
+
+impl ConnectionSlot {
+    fn take(receiver: &Receiver, peer: EndpointId) -> Option<Self> {
+        let mut open = receiver.inner.connections.lock().unwrap();
+        let total: usize = open.values().sum();
+        let from_peer = open.get(&peer).copied().unwrap_or(0);
+        if total >= MAX_CONNECTIONS || from_peer >= MAX_CONNECTIONS_PER_PEER {
+            return None;
+        }
+        *open.entry(peer).or_default() += 1;
+        Some(Self {
+            receiver: receiver.clone(),
+            peer,
+        })
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        let mut open = self.receiver.inner.connections.lock().unwrap();
+        if let Some(n) = open.get_mut(&self.peer) {
+            *n -= 1;
+            if *n == 0 {
+                open.remove(&self.peer);
+            }
+        }
+    }
+}
+
+/// Streams an upload of `len` bytes into a new file at `path`, synced to
+/// disk, and returns its hash.
+async fn receive_to_file(
+    path: &Path,
+    recv: &mut RecvStream,
+    len: u64,
+    limiter: Option<&RateLimiter>,
+) -> Result<blake3::Hash, NetError> {
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::fs::File::create(path).await?;
+    let mut hasher = blake3::Hasher::new();
+    let mut out = tokio::io::BufWriter::new(&mut file);
+    read_payload_into(recv, len, limiter, &mut out, Some(&mut hasher)).await?;
+    out.flush().await?;
+    file.sync_all().await?;
+    Ok(hasher.finalize())
+}
+
+fn file_payload(
+    path: PathBuf,
+    offset: u64,
+    len: u64,
+    slots: (
+        tokio::sync::OwnedSemaphorePermit,
+        tokio::sync::OwnedSemaphorePermit,
+    ),
+) -> Payload {
+    Payload {
+        path,
+        offset,
+        len,
+        _slots: slots,
     }
 }
 
@@ -1329,6 +1625,354 @@ mod tests {
         assert!(matches!(err, Err(NetError::Denied(m)) if m == "not confirmed"));
     }
 
+    /// A responder like the daemon's: one commitment at a time per peer,
+    /// and the code once the revealed nonce matches it.
+    #[derive(Default)]
+    struct TestChecks {
+        host: Option<EndpointId>,
+        pending: Mutex<HashMap<EndpointId, ([u8; 32], PairNonce)>>,
+        codes: Mutex<HashMap<EndpointId, String>>,
+    }
+
+    impl PairCheckHandler for TestChecks {
+        fn start(&self, peer: EndpointId, commitment: [u8; 32]) -> Result<PairNonce, String> {
+            let nonce = crate::nearby::pair_nonce();
+            self.pending
+                .lock()
+                .unwrap()
+                .insert(peer, (commitment, nonce));
+            Ok(nonce)
+        }
+
+        fn reveal(&self, peer: EndpointId, nonce: PairNonce) -> Result<(), String> {
+            let (commitment, mine) = self
+                .pending
+                .lock()
+                .unwrap()
+                .remove(&peer)
+                .ok_or("no check started")?;
+            if crate::nearby::pair_commitment(&nonce) != commitment {
+                return Err("that isn't the nonce committed to".into());
+            }
+            let code =
+                crate::nearby::pairing_code(&peer, self.host.as_ref().unwrap(), &nonce, &mine);
+            self.codes.lock().unwrap().insert(peer, code);
+            Ok(())
+        }
+    }
+
+    /// Sends a request and `partial` of its payload, then neither finishes
+    /// nor reads. Returns the streams to keep them open.
+    async fn stall(
+        s: &Setup,
+        op: Op,
+        partial: &[u8],
+    ) -> (iroh::endpoint::Connection, SendStream, RecvStream) {
+        let conn = s.ep.connect(s.addr(), crate::protocol::ALPN).await.unwrap();
+        let (mut send, recv) = conn.open_bi().await.unwrap();
+        let mut bytes = encode(&Request {
+            repo: "repo".into(),
+            op,
+        });
+        bytes.extend_from_slice(partial);
+        send.write_all(&bytes).await.unwrap();
+        (conn, send, recv)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn strangers_unfriending_leave_nothing_behind() {
+        let s = setup(Grant::default()).await;
+        for _ in 0..20 {
+            let stranger = local_endpoint().await;
+            let req = Request {
+                repo: String::new(),
+                op: Op::Unfriend,
+            };
+            let resp = raw_call(&stranger, s.addr(), &encode(&req)).await.unwrap();
+            assert!(matches!(resp, Response::Ok), "{resp:?}");
+        }
+        assert!(s.receiver.inner.usage.lock().unwrap().is_empty());
+        assert!(!s.root.exists() || fs::read_dir(&s.root).unwrap().count() == 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stream_that_sends_no_request_is_closed() {
+        let s = setup(Grant::default()).await;
+        let conn = s.ep.connect(s.addr(), crate::protocol::ALPN).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        // Half a length prefix, then nothing.
+        send.write_all(&[1, 0]).await.unwrap();
+        let started = std::time::Instant::now();
+        let got = tokio::time::timeout(REQUEST_TIMEOUT * 5, recv.read_to_end(1024))
+            .await
+            .expect("the host gives up on the stream");
+        assert!(got.map_or(true, |b| b.is_empty()));
+        assert!(started.elapsed() >= REQUEST_TIMEOUT / 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connections_per_peer_are_limited() {
+        let s = setup(Grant::default()).await;
+        let mut open = Vec::new();
+        for _ in 0..MAX_CONNECTIONS_PER_PEER {
+            let conn = s.ep.connect(s.addr(), crate::protocol::ALPN).await.unwrap();
+            // A request on each, so the host has accepted it.
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            let req = Request {
+                repo: "repo".into(),
+                op: Op::Status,
+            };
+            send.write_all(&encode(&req)).await.unwrap();
+            send.finish().unwrap();
+            let _: Response = read_msg(&mut recv, MAX_RESPONSE_LEN).await.unwrap();
+            open.push(conn);
+        }
+        let extra = s.ep.connect(s.addr(), crate::protocol::ALPN).await.unwrap();
+        let reason = tokio::time::timeout(Duration::from_secs(5), extra.closed())
+            .await
+            .expect("the extra connection is closed");
+        assert!(format!("{reason:?}").contains("too many"), "{reason:?}");
+        // Closing one makes room.
+        open.pop().unwrap().close(0u32.into(), b"done");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let again = s.ep.connect(s.addr(), crate::protocol::ALPN).await.unwrap();
+        let (mut send, mut recv) = again.open_bi().await.unwrap();
+        let req = Request {
+            repo: "repo".into(),
+            op: Op::Status,
+        };
+        send.write_all(&encode(&req)).await.unwrap();
+        send.finish().unwrap();
+        let resp: Response = read_msg(&mut recv, MAX_RESPONSE_LEN).await.unwrap();
+        assert!(matches!(resp, Response::Status { .. }), "{resp:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stalled_upload_gives_back_its_slot_and_reservation() {
+        let s = setup(Grant {
+            quota_bytes: Some(10_000),
+            ..Default::default()
+        })
+        .await;
+        let id = PackId([7; 32]);
+        let (_conn, _send, mut recv) = stall(&s, Op::PutPack { id, len: 5000 }, &[1; 10]).await;
+        let uploads = s.receiver.peer_uploads(&s.ep.id());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(*uploads.reserved.lock().await, 5000);
+        assert_eq!(uploads.slots.available_permits(), UPLOADS_PER_PEER - 1);
+
+        let resp: Response = read_msg(&mut recv, MAX_RESPONSE_LEN).await.unwrap();
+        assert!(is_error(&resp, ErrorCode::BadRequest), "{resp:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(*uploads.reserved.lock().await, 0);
+        assert_eq!(uploads.slots.available_permits(), UPLOADS_PER_PEER);
+        assert_eq!(
+            s.receiver.inner.upload_slots.available_permits(),
+            UPLOADS_TOTAL
+        );
+        // Nothing half-received is left behind.
+        let incoming = s.peer_dir().join("repo").join("incoming");
+        assert_eq!(fs::read_dir(incoming).unwrap().count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn downloads_wait_for_a_slot() {
+        let s = setup(Grant::default()).await;
+        let data = vec![3u8; 8 * 1024 * 1024];
+        let id = PackId(*blake3::hash(&data).as_bytes());
+        let r = s.remote("repo");
+        blocking_call(&r, move |r| r.put_pack(&id, &data))
+            .await
+            .unwrap();
+        // Readers that don't read: each download blocks on flow control.
+        let mut stalled = Vec::new();
+        for _ in 0..=DOWNLOADS_PER_PEER {
+            stalled.push(stall(&s, Op::GetPack { id }, &[]).await);
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let downloads = s.receiver.peer_uploads(&s.ep.id()).downloads.clone();
+        assert_eq!(downloads.available_permits(), 0);
+        // The extra one waits without taking one of everyone's slots.
+        assert_eq!(
+            s.receiver.inner.download_slots.available_permits(),
+            DOWNLOADS_TOTAL - DOWNLOADS_PER_PEER
+        );
+        // They give up once nothing is taken for a while, freeing the slots.
+        tokio::time::sleep(crate::protocol::PAYLOAD_IDLE_TIMEOUT * 3).await;
+        assert_eq!(downloads.available_permits(), DOWNLOADS_PER_PEER);
+        assert_eq!(
+            s.receiver.inner.download_slots.available_permits(),
+            DOWNLOADS_TOTAL
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mismatched_upload_leaves_nothing_behind() {
+        let s = setup(Grant::default()).await;
+        let r = s.remote("repo");
+        let err = blocking_call(&r, |r| r.put_pack(&PackId([9; 32]), b"not that"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("does not match"), "{err}");
+        let incoming = s.peer_dir().join("repo").join("incoming");
+        assert_eq!(fs::read_dir(incoming).unwrap().count(), 0);
+        assert!(
+            blocking_call(&r, |r| r.list_packs())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_uploads_create_repositories() {
+        let s = setup(Grant::default()).await;
+        let r = s.remote("new");
+        blocking_call(&r, |r| r.list_packs()).await.unwrap();
+        blocking_call(&r, |r| r.list_snapshots()).await.unwrap();
+        for op in [
+            Op::Status,
+            Op::GetPack {
+                id: PackId([0; 32]),
+            },
+            Op::DeletePack {
+                id: PackId([0; 32]),
+            },
+            Op::GetSnapshot {
+                id: SnapshotId([0; 32]),
+            },
+        ] {
+            s.raw("new", op, &[]).await;
+        }
+        let resp = s
+            .raw(
+                "other",
+                Op::GetPack {
+                    id: PackId([0; 32]),
+                },
+                &[],
+            )
+            .await;
+        assert!(is_error(&resp, ErrorCode::NotFound), "{resp:?}");
+        assert!(!s.peer_dir().join("new").exists());
+        assert!(!s.peer_dir().join("other").exists());
+
+        let data = b"pack".to_vec();
+        let id = PackId(*blake3::hash(&data).as_bytes());
+        blocking_call(&r, move |r| r.put_pack(&id, &data))
+            .await
+            .unwrap();
+        assert!(s.peer_dir().join("new").join("packs").is_dir());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repositories_per_peer_are_limited() {
+        let s = setup(Grant::default()).await;
+        // Most of them deleted but not yet erased: they still count.
+        for i in 0..MAX_REPOS_PER_PEER - 1 {
+            let dir = if i % 2 == 0 {
+                s.peer_dir().join(format!("r{i}"))
+            } else {
+                s.peer_dir().join(DELETED_DIR).join(format!("1-r{i}"))
+            };
+            fs::create_dir_all(dir).unwrap();
+        }
+        let put = |repo: &str| {
+            let r = s.remote(repo);
+            let data = repo.as_bytes().to_vec();
+            let id = PackId(*blake3::hash(&data).as_bytes());
+            async move { blocking_call(&r, move |r| r.put_pack(&id, &data)).await }
+        };
+        put("last").await.unwrap();
+        let err = put("one-too-many").await.unwrap_err();
+        assert!(err.to_string().contains("repositories"), "{err}");
+        assert!(!s.peer_dir().join("one-too-many").exists());
+        // Existing ones still take uploads.
+        put("last").await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forwarding_needs_the_hosts_permission() {
+        let s = setup(Grant::default()).await;
+        s.receiver.set_identity(s.addr().id);
+        s.receiver
+            .enable_forwarding(ForwardQueue::new(s.root.join("forwarding")));
+        let other = iroh::SecretKey::generate().public();
+        let order = ForwardOrder {
+            id: "o".into(),
+            place: "p".into(),
+            delegation: crate::protocol::Delegation::sign(
+                s.ep.secret_key(),
+                s.addr().id,
+                other,
+                "repo",
+                i64::MAX,
+            ),
+            addrs: Vec::new(),
+            hosts: Vec::new(),
+            packs: Vec::new(),
+            snapshots: Vec::new(),
+            upload_limit: None,
+            window: None,
+            deletions: Vec::new(),
+        };
+        let r = s.remote("repo");
+        let err = r.forward(&order).await.unwrap_err();
+        assert!(matches!(err, NetError::Denied(_)), "{err:?}");
+
+        s.receiver.allow(
+            s.ep.id(),
+            Grant {
+                forwarding: true,
+                ..Default::default()
+            },
+        );
+        r.forward(&order).await.unwrap();
+        let mut too_long = order.clone();
+        too_long.id = "o2".into();
+        too_long.addrs = vec!["192.0.2.1:1".parse().unwrap(); 100];
+        let err = r.forward(&too_long).await.unwrap_err();
+        assert!(matches!(err, NetError::BadRequest(_)), "{err:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pairing_codes_are_agreed_with_a_commitment() {
+        let s = setup(Grant::default()).await;
+        let err = crate::client::pair_check(&s.ep, s.addr())
+            .await
+            .unwrap_err();
+        assert!(matches!(err.error, NetError::Denied(_)), "{err:?}");
+        assert!(!err.answered);
+
+        let checks = Arc::new(TestChecks {
+            host: Some(s.addr().id),
+            ..Default::default()
+        });
+        s.receiver.set_pair_check_handler(checks.clone());
+        let code = crate::client::pair_check(&s.ep, s.addr()).await.unwrap();
+        assert_eq!(checks.codes.lock().unwrap()[&s.ep.id()], code);
+
+        // A sender that reveals a different nonce than it committed to (to
+        // choose the code after seeing the host's nonce) is refused.
+        let committed = crate::nearby::pair_nonce();
+        let start = Request {
+            repo: "pair".into(),
+            op: Op::PairStart {
+                commitment: crate::nearby::pair_commitment(&committed),
+            },
+        };
+        let resp = raw_call(&s.ep, s.addr(), &encode(&start)).await.unwrap();
+        assert!(matches!(resp, Response::PairNonce { .. }), "{resp:?}");
+        let reveal = Request {
+            repo: "pair".into(),
+            op: Op::PairReveal {
+                nonce: crate::nearby::pair_nonce(),
+            },
+        };
+        let resp = raw_call(&s.ep, s.addr(), &encode(&reveal)).await.unwrap();
+        assert!(is_error(&resp, ErrorCode::Denied), "{resp:?}");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn snapshots_are_stored_listed_and_trashed() {
         let s = setup(Grant::default()).await;
@@ -1551,8 +2195,19 @@ mod tests {
         let r = s.remote("repo");
         assert!(matches!(r.status().await, Err(NetError::Remote(_))));
         assert!(s.receiver.usage(&s.ep.id()).await.is_err());
-        let err = blocking_call(&r, |r| r.list_packs()).await.unwrap_err();
-        assert!(err.to_string().contains("internal storage error"));
+        // Nothing can be listed there, but storing fails.
+        assert!(
+            blocking_call(&r, |r| r.list_packs())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let data = b"pack".to_vec();
+        let id = PackId(*blake3::hash(&data).as_bytes());
+        let err = blocking_call(&r, move |r| r.put_pack(&id, &data))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("internal storage error"), "{err}");
 
         // A file where the host's storage should be.
         let broken = Receiver::new(s.peer_dir());

@@ -13,6 +13,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use zeroize::Zeroizing;
 
 use anyhow::{Context, Result, bail};
 use kinvault_core::{
@@ -154,14 +155,17 @@ pub(crate) fn shared_key(state_dir: &Path) -> Result<MasterKey> {
 }
 
 pub(crate) fn write_key(path: &Path, key: &MasterKey) -> Result<()> {
-    write_private(path, hex::encode(key.to_bytes()).as_bytes())
+    // Copies of the key are wiped once written.
+    let bytes = Zeroizing::new(key.to_bytes());
+    let text = Zeroizing::new(hex::encode(*bytes));
+    write_private(path, text.as_bytes())
 }
 
 fn read_key(path: &Path) -> Result<MasterKey> {
-    let text = fs::read_to_string(path)?;
-    let mut bytes = [0u8; 32];
-    hex::decode_to_slice(text.trim(), &mut bytes).context("key is corrupt")?;
-    Ok(MasterKey::from_bytes(bytes))
+    let text = Zeroizing::new(fs::read_to_string(path)?);
+    let mut bytes = Zeroizing::new([0u8; 32]);
+    hex::decode_to_slice(text.trim(), &mut *bytes).context("key is corrupt")?;
+    Ok(MasterKey::from_bytes(*bytes))
 }
 
 pub(crate) fn peer_addr(id: &str, addrs: &[std::net::SocketAddr]) -> Result<EndpointAddr> {
@@ -995,10 +999,14 @@ impl Worker {
             })
             .await?;
         let (snapshots, packs, cleanup) = plan;
-        let (drop, unused) = match &cleanup {
+        let (drop, mut unused) = match &cleanup {
             Some((_, drop, unused, _)) => (drop.clone(), unused.clone()),
             None => (Vec::new(), Vec::new()),
         };
+        // An order carries only so many deletions; packs left over are
+        // found unused again at the next cleanup.
+        let room = kinvault_net::protocol::MAX_ORDER_DELETIONS * Deletion::MAX_OBJECTS;
+        unused.truncate(room.saturating_sub(drop.len()));
         if snapshots.is_empty() && drop.is_empty() && unused.is_empty() {
             if let Some((kept, ..)) = cleanup {
                 // Nothing to delete: cleaning up is done until it's due again.
