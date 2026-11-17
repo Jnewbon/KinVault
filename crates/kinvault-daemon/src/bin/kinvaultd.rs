@@ -54,7 +54,8 @@ async fn main() -> Result<()> {
             default_state_dir().context("could not determine a data directory; pass --state")?
         }
     };
-    std::fs::create_dir_all(&state_dir)
+    // Private before anything goes in it, the control socket included.
+    kinvault_daemon::config::create_private_dir(&state_dir)
         .with_context(|| format!("creating the state directory {}", state_dir.display()))?;
 
     let listener = ipc::Listener::bind(&ipc::listen_name(&state_dir)?)

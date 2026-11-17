@@ -253,23 +253,104 @@ impl Config {
     }
 }
 
-/// Atomically writes a file readable only by the current user.
+/// Atomically writes a file readable only by the current user. The data
+/// goes to a new temporary file first (never one left over, which could
+/// have wider permissions), then replaces `path`.
 pub fn write_private(path: &Path, data: &[u8]) -> anyhow::Result<()> {
-    let tmp = path.with_extension("tmp");
     let mut opts = fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-    let mut f = opts.open(&tmp)?;
-    f.write_all(data)?;
-    f.sync_all()?;
-    fs::rename(&tmp, path)?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (mut f, tmp) = loop {
+        let suffix = hex::encode(kinvault_core::crypto::random_bytes::<6>()?);
+        let tmp = path.with_file_name(format!("{name}.{suffix}.tmp"));
+        match opts.open(&tmp) {
+            Ok(f) => break (f, tmp),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    };
+    let written = f.write_all(data).and_then(|()| f.sync_all());
+    drop(f);
+    if let Err(e) = written.and_then(|()| fs::rename(&tmp, path)) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(())
+}
+
+/// Creates a directory (and its parents) and makes it readable only by
+/// the current user.
+pub fn create_private_dir(path: &Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Only the owner may change permissions. A directory we can write to
+        // but don't own (e.g. a NAS dataset shared through an ACL) keeps the
+        // access its owner gave it.
+        match fs::set_permissions(path, fs::Permissions::from_mode(0o700)) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => tracing::warn!(
+                "couldn't make {} private ({e}); make sure only KinVault's user can read it",
+                path.display()
+            ),
+            other => other.with_context(|| format!("making {} private", path.display()))?,
+        }
+    }
+    Ok(())
+}
+
+/// Like [`create_private_dir`], but leaves an existing directory as it is.
+pub fn create_dir_private_if_new(path: &Path) -> anyhow::Result<()> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    create_private_dir(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn private_files_and_dirs_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("secret");
+        // A file (or leftover temporary file) with wider permissions isn't reused.
+        fs::write(&path, b"old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(tmp.path().join("secret.tmp"), b"").unwrap();
+        fs::set_permissions(
+            tmp.path().join("secret.tmp"),
+            fs::Permissions::from_mode(0o666),
+        )
+        .unwrap();
+        write_private(&path, b"new").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 2);
+
+        let dir = tmp.path().join("state/sets/x");
+        create_private_dir(&dir).unwrap();
+        assert_eq!(mode(&dir), 0o700);
+        // An existing folder the user chose keeps its permissions.
+        let chosen = tmp.path().join("chosen");
+        fs::create_dir(&chosen).unwrap();
+        fs::set_permissions(&chosen, fs::Permissions::from_mode(0o750)).unwrap();
+        create_dir_private_if_new(&chosen).unwrap();
+        assert_eq!(mode(&chosen), 0o750);
+        let new = tmp.path().join("hosted");
+        create_dir_private_if_new(&new).unwrap();
+        assert_eq!(mode(&new), 0o700);
+    }
 
     #[test]
     fn deleted_data_is_kept_for_30_days_by_default() {

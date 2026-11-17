@@ -244,8 +244,22 @@ impl Listener {
             }
             std::fs::remove_file(path)?;
         }
-        let inner = tokio::net::UnixListener::bind(path)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        // Bound under a random name, made private, then moved into place, so
+        // nobody can connect while it still has the umask's permissions.
+        let suffix =
+            hex::encode(kinvault_core::crypto::random_bytes::<6>().map_err(io::Error::other)?);
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let tmp = path.with_file_name(format!(".{name}.{suffix}"));
+        let inner = tokio::net::UnixListener::bind(&tmp)?;
+        let placed = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+            .and_then(|()| std::fs::rename(&tmp, path));
+        if let Err(e) = placed {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
         Ok(Self {
             inner,
             path: path.to_path_buf(),
@@ -362,6 +376,25 @@ impl Client {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_socket_appears_already_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("kinvaultd.sock");
+        let listener = Listener::bind(&path).await.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        // Still answers at its final name, and nothing else is left.
+        tokio::net::UnixStream::connect(&path).await.unwrap();
+        let files: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(files, vec![std::ffi::OsString::from("kinvaultd.sock")]);
+        drop(listener);
+    }
 
     #[test]
     fn short_state_dirs_keep_their_socket_inside() {

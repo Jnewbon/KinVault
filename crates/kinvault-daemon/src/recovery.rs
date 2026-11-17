@@ -7,7 +7,6 @@
 //! machine; imported sets start paused so nothing is overwritten until the
 //! user has restored what they need and resumes them.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -142,7 +141,7 @@ pub fn import_offline(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    fs::create_dir_all(state_dir)?;
+    crate::config::create_private_dir(state_dir)?;
     let config_path = state_dir.join("config.json");
     let mut config = Config::load(&config_path)?;
     if !force && (!config.sets.is_empty() || !config.peers.is_empty()) {
@@ -169,7 +168,7 @@ pub fn import_offline(
         }
         let id = hex::encode(kinvault_core::crypto::random_bytes::<8>()?);
         let set_dir = state_dir.join("sets").join(&id);
-        fs::create_dir_all(&set_dir)?;
+        crate::config::create_private_dir(&set_dir)?;
         write_master_key(&set_dir, key)?;
         config.sets.push(SetConfig {
             id,

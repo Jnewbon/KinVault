@@ -18,7 +18,10 @@ use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::api::{self, Event, GrantSpec, HostOffer, Reply, Request};
-use crate::config::{Config, PendingDeletion, PendingInvite, SetConfig, StoppedSet, StoredTarget};
+use crate::config::{
+    Config, PendingDeletion, PendingInvite, SetConfig, StoppedSet, StoredTarget,
+    create_dir_private_if_new, create_private_dir,
+};
 use crate::reachability::{HostTarget, Hosts, ReachabilityOptions};
 mod deletion;
 mod nearby;
@@ -111,7 +114,8 @@ impl Daemon {
             .hosting_store
             .clone()
             .unwrap_or_else(|| state_dir.join("hosted"));
-        fs::create_dir_all(&hosting_store)?;
+        // Private unless it's an existing folder the user chose.
+        create_dir_private_if_new(&hosting_store)?;
         let receiver = Receiver::new(&hosting_store);
         receiver.set_identity(endpoint.id());
         // Peers storing backups here may have them forwarded to other hosts.
@@ -1577,25 +1581,6 @@ fn canonical_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
 
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
     tokio::task::spawn_blocking(f).await?
-}
-
-fn create_private_dir(path: &std::path::Path) -> Result<()> {
-    fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // Only the owner may change permissions. A directory we can write to
-        // but don't own (e.g. a NAS dataset shared through an ACL) keeps the
-        // access its owner gave it.
-        match fs::set_permissions(path, fs::Permissions::from_mode(0o700)) {
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => tracing::warn!(
-                "couldn't make {} private ({e}); make sure only KinVault's user can read it",
-                path.display()
-            ),
-            other => other.with_context(|| format!("making {} private", path.display()))?,
-        }
-    }
-    Ok(())
 }
 
 /// Trims patterns, drops blank ones and checks the rest are valid.

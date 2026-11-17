@@ -117,7 +117,10 @@ newer versions.
 **Your state folder.** It holds each backup's key (readable only by your user
 account), your instance's identity, and your settings. Anyone who can read it
 can decrypt your backups and act as your instance. Use full-disk encryption on
-your computer.
+your computer. On Linux and macOS KinVault makes the folder (and a hosted
+folder it creates) readable only by its own user; on Windows it relies on
+your user profile's permissions, so keep the state folder inside your
+profile.
 
 **Your recovery kit and its passphrase.** Together they can decrypt all your
 backups. Keep them apart from each other and from your computer, and choose a
