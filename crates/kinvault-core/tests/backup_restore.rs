@@ -628,3 +628,47 @@ fn snapshots_copy_to_a_second_store_with_only_what_it_lacks() {
         .map(|r| assert!(r.is_ok(), "{r:?}"))
         .unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn restore_drops_setuid_and_never_writes_through_symlinks() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    fs::create_dir_all(src.join("dir")).unwrap();
+    fs::write(src.join("tool"), b"#!/bin/sh").unwrap();
+    fs::set_permissions(src.join("tool"), fs::Permissions::from_mode(0o4755)).unwrap();
+    fs::write(src.join("dir/secret"), b"key").unwrap();
+    fs::set_permissions(src.join("dir/secret"), fs::Permissions::from_mode(0o600)).unwrap();
+    let mut repo = Repository::open(
+        LocalDirBackend::create(tmp.path().join("store")).unwrap(),
+        &MasterKey::generate().unwrap(),
+        Index::open_in_memory().unwrap(),
+    );
+    let (id, _) = repo.backup(std::slice::from_ref(&src), "h").unwrap();
+    let rel = src.strip_prefix("/").unwrap();
+
+    let out = tmp.path().join("out");
+    repo.restore(&id, &out, None).unwrap();
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode(&out.join(rel).join("tool")), 0o755);
+    assert_eq!(mode(&out.join(rel).join("dir/secret")), 0o600);
+
+    // Someone plants symlinks in the target: one where a file goes, and
+    // one where a directory goes. Neither is written through.
+    let elsewhere = tmp.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    fs::write(elsewhere.join("victim"), b"untouched").unwrap();
+    let out2 = tmp.path().join("out2");
+    fs::create_dir_all(out2.join(rel)).unwrap();
+    std::os::unix::fs::symlink(elsewhere.join("victim"), out2.join(rel).join("tool")).unwrap();
+    repo.restore(&id, &out2, None).unwrap();
+    assert_eq!(fs::read(elsewhere.join("victim")).unwrap(), b"untouched");
+    assert_eq!(fs::read(out2.join(rel).join("tool")).unwrap(), b"#!/bin/sh");
+
+    let out3 = tmp.path().join("out3");
+    fs::create_dir_all(out3.join(rel)).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, out3.join(rel).join("dir")).unwrap();
+    assert!(repo.restore(&id, &out3, None).is_err());
+    assert!(!elsewhere.join("secret").exists());
+}

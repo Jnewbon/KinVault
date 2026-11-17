@@ -65,6 +65,14 @@ need a [[Recovery Kit]].
 
 - File contents, folders and symbolic links (as links, not what they point
   to).
-- Permissions (on Linux and macOS) and modification times.
+- Permissions (on Linux and macOS) and modification times, except the
+  setuid and setgid bits: since ownership isn't restored, they'd give the
+  restored program the rights of whoever runs KinVault.
 - **Not** file ownership, extended attributes or ACLs. Files are owned by
   whoever runs KinVault.
+
+Each file is written privately (readable only by KinVault's user) and moved
+into place once complete, with its permissions. A restore never writes
+through a symbolic link already in the folder you restore into: a link
+where a file goes is replaced, and a link where a folder goes stops the
+restore with an error.
